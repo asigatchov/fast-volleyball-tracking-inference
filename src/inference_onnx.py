@@ -2,7 +2,6 @@ import argparse
 import cv2
 import numpy as np
 import pandas as pd
-import onnx
 import onnxruntime as ort
 from collections import deque
 import os
@@ -53,8 +52,6 @@ def load_model(model_path):
     if not model_path.endswith(".onnx"):
         raise ValueError("Model file must be in ONNX format (.onnx)")
 
-    model = onnx.load(model_path)
-    onnx.checker.check_model(model)
     session = ort.InferenceSession(model_path)
     return session
 
