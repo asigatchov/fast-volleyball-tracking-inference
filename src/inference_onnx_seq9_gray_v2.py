@@ -189,7 +189,7 @@ def main():
     reader_thread.start()
 
     pbar = tqdm(total=total_frames, desc="Processing video", unit="frame")
-
+    exit_flag = False
     while True:
         start_time = time.time()
 
@@ -253,9 +253,12 @@ def main():
                     cv2.namedWindow("Ball Tracking", cv2.WINDOW_NORMAL)
                     cv2.imshow("Ball Tracking", vis_frame)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
+                        exit_flag = True  # Set flag to exit
                         break
                 if out_writer is not None:
                     out_writer.write(vis_frame)
+        if exit_flag:
+            break
 
         end_time = time.time()
         batch_time = end_time - start_time
