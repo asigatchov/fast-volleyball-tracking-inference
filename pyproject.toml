@@ -5,9 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "matplotlib>=3.10.5",
     "onnxruntime>=1.22.0",
     "opencv-python>=4.12.0.88",
     "pandas>=2.3.1",
     "scipy>=1.16.0",
+    "seaborn>=0.13.2",
     "tqdm>=4.67.1",
 ]
