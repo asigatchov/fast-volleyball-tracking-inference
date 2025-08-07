@@ -6,18 +6,29 @@ High-speed volleyball ball detection and tracking using an optimized ONNX model,
 <img alt="backline" weight="512" src="https://raw.githubusercontent.com/asigatchov/fast-volleyball-tracking-inference/refs/heads/master/examples/output.gif">
    </td><td>
       <img weight="512" src="https://raw.githubusercontent.com/asigatchov/fast-volleyball-tracking-inference/refs/heads/master/examples/sideline.gif" alt="sideline">
-</td></tr>   
+</td></tr>
 </table>
 
 
+## Model Comparison
+| Model                                    | F1    | Precision | Recall | Accuracy | Detection Rate |
+|------------------------------------------|-------|-----------|--------|----------|----------------|
+| VballNetFastV1_seq9_grayscale_233_h288_w512.onnx | 0.772 | 0.832     | 0.720  | 0.662    | 0.689          |
+| VballNetV1b_seq9_grayscale_best.onnx     | 0.855 | 0.818     | 0.896  | 0.767    | 0.840          |
+| VballNetV1c_seq9_grayscale_best.onnx     | 0.847 | 0.793     | 0.908  | 0.754    | 0.857          |
+| VballNetV1_seq9_grayscale_148_h288_w512.onnx | 0.872 | 0.867     | 0.878  | 0.791    | 0.821          |
+| VballNetV1_seq9_grayscale_204_h288_w512.onnx | 0.870 | 0.867     | 0.872  | 0.788    | 0.815          |
+| VballNetV1_seq9_grayscale_330_h288_w512.onnx | 0.874 | 0.882     | 0.867  | 0.795    | 0.807          |
+| VballNetV2_seq9_grayscale_320_h288_w512.onnx | 0.874 | 0.880     | 0.869  | 0.795    | 0.810          |
+| VballNetV2_seq9_grayscale_350_h288_w512.onnx | 0.874 | 0.880     | 0.868  | 0.794    | 0.809          |
+
 
 ## Features
-- **High Performance**: 200 FPS on modest CPU hardware (Intel Core i5-10400F @ 2.90GHz).
+- **High Performance**: 200 FPS on modest CPU hardware (Intel Core i5-10400F @ 2.90GHz).(VballNetFastV1_seq9_grayscale_233_h288_w512)
 - **Optimized for CPU**: Lightweight ONNX model designed for grayscale video input.
 - **Flexible Output**: Saves ball coordinates to CSV for analysis; optional video visualization.
 - **Customizable**: Adjustable track length for visualization.
 - **Easy to Use**: Simple command-line interface with clear options.
-
 
 [For training used - vball-net](https://github.com/asigatchov/vball-net)
 
@@ -52,12 +63,11 @@ Run the inference script to detect and track a volleyball ball in a video:
 uv run src/inference_onnx_seq9_gray_v2.py --video_path  examples/beach_st_lenina_20250622_g1_005.mp4 --model_path  models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx --output_dir output/
 ```
 
-#### Run the inference script to detect and track a volleyball ball  Realtime visualize:
+#### Run the inference script to detect and track a volleyball ball Realtime visualize:
 
 ```bash
 uv run src/inference_onnx_seq9_gray_v2.py --video_path  examples/beach_st_lenina_20250622_g1_005.mp4 --model_path  models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx --visualize
 ```
-
 
 ### Command-Line Options
 ```
@@ -100,28 +110,6 @@ Frame,Visibility,X,Y
 ```
 - **Video (Optional)**: Visualized output with tracked ball path, saved to `output/`.
 
-## Repository Structure
-```
-fast-volleyball-tracking-inference/
-├── examples
-│   ├── beach_st_lenina_20250622_g1_005.mp4
-│   ├── beach_st_lenina_20250622_g1_005_predict_ball.csv
-│   ├── gtu_20250316_002.mp4
-│   ├── gtu_20250316_002_predict_ball.csv
-│   └── output.gif
-├── main.py
-├── models
-│   ├── VballNetFastV1_155_h288_w512.onnx
-│   ├── VballNetFastV1_seq9_grayscale_233_h288_w512.onnx
-│   └── VballNetV1_150_h288_w512.onnx
-├── pyproject.toml
-├── README.md
-├── src
-│   ├── inference_onnx.py
-│   └── inference_onnx_seq9_gray_v2.py
-└── uv.lock
-```
-
 ## Requirements
 - Python >= 3.12
 - Dependencies (listed in `pyproject.toml`):
@@ -153,9 +141,7 @@ uv sync
 - **Weights**: Available at [link to weights](#) <!-- Replace with actual link -->.
 
 ## Training model
-
 [For training used - vball-net](https://github.com/asigatchov/vball-net)
-
 
 ## License
 [MIT License](LICENSE)

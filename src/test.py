@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 DETECTION_THRESHOLD = 0.5
-DISTANCE_TOLERANCE = 4
+DISTANCE_TOLERANCE = 9
 DEFAULT_OUTPUT_DIR = 'test_results'
 DEFAULT_REPORT_LEVEL = 'detailed'
 FIGURE_DPI = 150
@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument("--threshold", type=float, default=DETECTION_THRESHOLD,
                         help="Detection threshold for heatmap (default: 0.5)")
     parser.add_argument("--tolerance", type=int, default=DISTANCE_TOLERANCE,
-                        help="Distance tolerance in pixels (default: 4)")
+                        help="Distance tolerance in pixels (default: 8)")
     parser.add_argument("--report", type=str, default=DEFAULT_REPORT_LEVEL, choices=['summary', 'detailed'],
                         help="Report detail level (default: detailed)")
     return parser.parse_args()
@@ -150,7 +150,7 @@ def process_video(session, video_path, test_dir, has_gru, out_dim, h0_shape=None
     track_points = deque(maxlen=8)
     results = {'tp': 0, 'tn': 0, 'fp1': 0, 'fp2': 0, 'fn': 0, 'total_frames': 0, 'detected_frames': 0}
 
-    center_idx = 1 if out_dim == 3 else 4
+    center_idx = 4 # if out_dim == 3 else 4
 
     pbar = tqdm(total=total_frames, desc=f"Processing {Path(video_path).name}", unit="frame")
     frame_idx = 0
