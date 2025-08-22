@@ -51,39 +51,69 @@ class TrackAnalyzer:
         return start1 <= end2 and start2 <= end1
 
     def _filter_short_tracks(self, episodes: List[Dict]) -> List[Dict]:
-        # Фильтруем треки по минимальной длительности
-        long_tracks = [
-            ep for ep in episodes if ep.duration_sec() >= self.min_duration_sec
-        ]
+        # Расширяем эпизоды на 1 секунду в обе стороны
+        frames_to_extend = int(self.fps)  # Количество кадров за 1 секунду
+        extended_episodes = []
+        for ep in episodes:
+            ep.start_frame = max(0, ep.start_frame - frames_to_extend)
+            ep.last_frame = ep.last_frame + frames_to_extend
+            extended_episodes.append(ep)
 
-        # Список для хранения треков, которые нужно оставить
-        filtered_episodes = []
+        # Объединяем пересекающиеся эпизоды
+        merged_episodes = []
         used_indices = set()
+        sorted_episodes = sorted(extended_episodes, key=lambda x: x.start_frame)
 
-        # Сортируем треки по длительности (от большего к меньшему)
-        sorted_tracks = sorted(long_tracks, key=lambda x: x.duration_sec(), reverse=True)
-
-        for i, track1 in enumerate(sorted_tracks):
+        for i, track1 in enumerate(sorted_episodes):
             if i in used_indices:
                 continue
 
-            # Добавляем текущий трек в результат
-            filtered_episodes.append(track1)
+            # Создаём новый объединённый трек
+            merged_track = track1
+            merged_positions = list(merged_track.positions)
+            merged_track_ids = [merged_track.track_id]
             used_indices.add(i)
 
-            # Проверяем пересечения с другими треками
-            for j, track2 in enumerate(sorted_tracks):
+            for j, track2 in enumerate(sorted_episodes):
                 if j <= i or j in used_indices:
                     continue
 
-                # Проверяем, пересекаются ли треки по кадрам
-                if self._is_overlapping(track1, track2):
-                    # Если треки пересекаются, исключаем более короткий (track2)
+                if self._is_overlapping(merged_track, track2):
+                    # Обновляем границы объединённого трека
+                    merged_track.start_frame = min(
+                        merged_track.start_frame, track2.start_frame
+                    )
+                    merged_track.last_frame = max(
+                        merged_track.last_frame, track2.last_frame
+                    )
+                    # Объединяем позиции
+                    merged_positions.extend(track2.positions)
+                    merged_track_ids.append(track2.track_id)
                     used_indices.add(j)
-                    print(f"Удалён трек {track2.track_id} (пересекается с треком {track1.track_id})")
+                    print(
+                        f"Объединён трек {track2.track_id} с треком {merged_track.track_id}"
+                    )
+
+            # Обновляем позиции и длительность объединённого трека
+            merged_track.positions = sorted(
+                merged_positions, key=lambda x: x[1]
+            )  # Сортировка по кадрам
+            duration_frames = merged_track.last_frame - merged_track.start_frame + 1
+            merged_track.duration_sec = (
+                lambda: duration_frames / self.fps
+            )  # Обновляем метод duration_sec
+            self.track_distances[merged_track.track_id] = (
+                f"Merged tracks: {', '.join(map(str, merged_track_ids))}"
+            )
+            merged_episodes.append(merged_track)
+
+        # Фильтруем по минимальной длительности
+        long_tracks = [
+            ep for ep in merged_episodes if ep.duration_sec() >= self.min_duration_sec
+        ]
 
         # Сортируем по начальным кадрам для корректной визуализации
-        return sorted(filtered_episodes, key=lambda x: x.start_frame)
+        return sorted(long_tracks, key=lambda x: x.start_frame)
 
     def _process_detections(self, df: pd.DataFrame) -> None:
         tracker = BallTracker(
@@ -122,9 +152,7 @@ class TrackAnalyzer:
             end_frame = track.last_frame.item()
             duration_frames = end_frame - start_frame + 1
             duration_sec = duration_frames / self.fps
-            episodes.append(
-              track
-            )
+            episodes.append(track)
         self.tracks = self._filter_short_tracks(episodes)
 
     def _print_track_info(self) -> None:
@@ -151,7 +179,7 @@ class TrackAnalyzer:
         fps = cap.get(cv2.CAP_PROP_FPS) or self.fps
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        #out = cv2.VideoWriter(self.output_video_path, fourcc, fps, (width, height))
+        # out = cv2.VideoWriter(self.output_video_path, fourcc, fps, (width, height))
 
         # Для каждого трека показываем только нужный отрывок
         for track in self.tracks:
@@ -170,11 +198,7 @@ class TrackAnalyzer:
 
                 # Нарисовать только для текущего трека
                 for _pos in track.positions:
-                    pos = {
-                        'x': _pos[0][0],
-                        'y': _pos[0][1],
-                        'frame_num': _pos[1]
-                    }
+                    pos = {"x": _pos[0][0], "y": _pos[0][1], "frame_num": _pos[1]}
                     if pos["frame_num"] == frame_num:
                         x, y = int(pos["x"]), int(pos["y"])
                         cv2.circle(frame, (x, y), 10, (0, 255, 255), -1)
@@ -190,9 +214,7 @@ class TrackAnalyzer:
                             1,
                             cv2.LINE_AA,
                         )
-                debug_info = (
-                    f"Frame: {frame_num}/{total_frames}, Track ID: {track_id}"
-                )
+                debug_info = f"Frame: {frame_num}/{total_frames}, Track ID: {track_id}"
                 cv2.putText(
                     frame,
                     debug_info,
@@ -209,11 +231,11 @@ class TrackAnalyzer:
                     cv2.destroyAllWindows()
                     print(f"Видео сохранено: {self.output_video_path}")
                     return
-                #out.write(frame)
+                # out.write(frame)
                 frame_num += 1
 
         cap.release()
-        #out.release()
+        # out.release()
         cv2.destroyAllWindows()
         print(f"Видео сохранено: {self.output_video_path}")
 
