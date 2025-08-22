@@ -58,9 +58,6 @@ def main(csv_path):
     file_tracks = csv_path.replace("predict_ball.csv", ".txt")
 
     # Remove existing track file if it exists
-    if os.path.exists(file_tracks):
-        os.remove(file_tracks)
-
     # Read detections
     detections = read_csv_detections(csv_path)
 
