@@ -58,6 +58,45 @@ def load_model(model_path, input_height=288, input_width=512):
     out_dim = 9 if "seq9_grayscale" in model_path else 3
     return session, out_dim
 
+def load_onnx_model(model_path):
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model not found: {model_path}")
+    session = ort.InferenceSession(
+        model_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+    )
+    input_names = [inp.name for inp in session.get_inputs()]
+    has_gru = "h0" in input_names
+    h0_shape = None
+    if has_gru:
+        for inp in session.get_inputs():
+            if inp.name == "h0":
+                h0_shape = inp.shape
+                break
+        if h0_shape is None:
+            raise ValueError("Could not determine h0 shape for GRU model.")
+        resolved_shape = []
+        for dim in h0_shape:
+            if isinstance(dim, str) or dim is None:
+                if dim in ["batch", "batch_size", None]:
+                    resolved_shape.append(1)
+                elif "hidden" in str(dim).lower():
+                    resolved_shape.append(512)
+                else:
+                    raise ValueError(
+                        f"Unknown symbolic dimension '{dim}' in h0_shape: {h0_shape}"
+                    )
+            else:
+                resolved_shape.append(dim)
+        h0_shape = tuple(resolved_shape)
+    out_dim = 9 if "seq9" in model_path.lower() else 3
+    print(f"✅ Model loaded: {model_path}")
+    print(
+        f"   Has GRU state: {has_gru}, Output heatmaps: {out_dim}, h0 shape: {h0_shape if has_gru else 'N/A'}"
+    )
+    return session, has_gru, out_dim, h0_shape
+
+
+
 
 def initialize_video(video_path):
     cap = cv2.VideoCapture(video_path)
@@ -165,7 +204,10 @@ def main():
     input_width, input_height = 512, 288
     batch_size = 9
 
-    model_session, out_dim = load_model(args.model_path, input_height, input_width)
+    #model_session, out_dim = load_model(args.model_path, input_height, input_width)
+    
+    model_session, has_gru, out_dim, h0_shape = load_onnx_model(args.model_path)
+
     cap, frame_width, frame_height, fps, total_frames = initialize_video(
         args.video_path
     )
