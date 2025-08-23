@@ -3,8 +3,169 @@ import numpy as np
 import os
 import argparse
 import cv2
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from ball_tracker import BallTracker
+from scipy.signal import find_peaks
+
+
+def find_cyclic_sequences(
+    positions: List[List],
+    min_cycle_amplitude: float = 50.0,  # Минимальная амплитуда одного цикла (размах)
+    max_amplitude_variation: float = 40.0,  # Макс. отличие амплитуд между циклами (если больше — не одинаковые)
+) -> List[Tuple[int, int]]:
+    """Находит участки с регулярными циклическими движениями мяча (≥2 цикла),
+    где амплитуды колебаний отличаются не более чем на max_amplitude_variation.
+
+    Args:
+        positions: Список позиций в формате [[x, y], frame].
+        min_cycle_amplitude: Минимальный размах Y для признания цикла значимым.
+        max_amplitude_variation: Максимальное различие между амплитудами циклов.
+                               Если амплитуды отличаются сильнее — это не регулярные прыжки.
+
+    Returns:
+        Список кортежей (start_frame, end_frame) для стабильных циклических участков.
+    """
+    if not positions or len(positions) < 10:
+        return []
+
+    # Преобразуем в массив
+    pos_array = np.array(
+        [(pos[0][0], pos[0][1], pos[1]) for pos in positions], dtype=np.float64
+    )
+    x_values = pos_array[:, 0]
+    y_values = pos_array[:, 1]
+    frames = pos_array[:, 2].astype(int)
+
+    sequences = []
+    i = 0
+    n = len(pos_array)
+
+    while i < n - 10:
+        start_idx = i
+        j = i + 1
+
+        # Ищем участок с малым изменением X
+        while j < n:
+            x_range = np.max(x_values[i : j + 1]) - np.min(x_values[i : j + 1])
+            if x_range > 150:
+                break
+            j += 1
+
+        if j - i < 100:  # слишком короткий участок
+            i = j
+            continue
+
+        y_segment = y_values[i:j]
+        total_y_range = np.max(y_segment) - np.min(y_segment)
+        if total_y_range < min_cycle_amplitude:
+            i = j
+            continue
+
+        # Находим пики и впадины
+        peaks, _ = find_peaks(y_segment, prominence=10)
+        troughs, _ = find_peaks(-y_segment, prominence=10)
+
+        if len(peaks) < 2 or len(troughs) < 2:
+            i = j
+            continue
+
+        # Сортируем события по времени
+        events = sorted(
+            [(p, "peak") for p in peaks] + [(t, "trough") for t in troughs],
+            key=lambda x: x[0],
+        )
+        types = [t for _, t in events]
+
+        # Ищем хотя бы 2 полных цикла: например, trough→peak→trough→peak или peak→trough→peak→trough
+        found = False
+        for k in range(len(types) - 3):
+            if types[k : k + 4] in (
+                ["trough", "peak", "trough", "peak"],
+                ["peak", "trough", "peak", "trough"],
+            ):
+                found = True
+                break
+        if not found:
+            i = j
+            continue
+
+        # Извлекаем амплитуды циклов (разница между пиком и впадиной)
+        amplitudes = []
+        for k in range(1, len(events)):
+            prev_idx, prev_type = events[k - 1]
+            curr_idx, curr_type = events[k]
+            if prev_type != curr_type:  # переход между пиком и впадиной
+                amplitude = abs(y_segment[curr_idx] - y_segment[prev_idx])
+                if amplitude >= min_cycle_amplitude:
+                    amplitudes.append(amplitude)
+
+        if len(amplitudes) < 4:  # нужно хотя бы 2 цикла × 2 фазы = 4 амплитуды
+            i = j
+            continue
+
+        # Проверяем, что амплитуды не слишком отличаются
+        amplitudes = np.array(amplitudes)
+        if np.max(amplitudes) - np.min(amplitudes) > max_amplitude_variation:
+            i = j
+            continue  # слишком разные прыжки — это не регулярный цикл
+
+        # Успешно: записываем участок
+        sequences.append((frames[i], frames[j - 1]))
+        i = j  # переходим к следующему сегменту
+
+    return sequences
+
+
+def find_juggling_sequences(positions: List[List]) -> List[Tuple[int, int]]:
+    """Находит последовательности кадров, где мяч движется вверх-вниз по Y с ограниченным перемещением по X.
+
+    Args:
+        positions: Список позиций в формате [[x, y], frame].
+
+    Returns:
+        Список кортежей (start_frame, end_frame) для последовательностей набивания.
+    """
+    # Преобразуем данные в массив NumPy: [x, y, frame]
+    pos_array = np.array(
+        [(pos[0][0], pos[0][1], pos[1]) for pos in positions], dtype=np.float64
+    )
+
+    sequences = []
+    i = 0
+    n = len(pos_array)
+
+    while i < n:
+        start_idx = i
+        x_values = pos_array[i:, 0]
+        y_values = pos_array[i:, 1]
+        frame_numbers = pos_array[i:, 2].astype(int)
+
+        # Находим индекс, где перемещение по X превышает 50 пикселей
+        j = i + 1
+        while j < n:
+            x_range = np.max(x_values[: j - i + 1]) - np.min(x_values[: j - i + 1])
+            if x_range > 30:
+                break
+            j += 1
+
+        # Проверяем последовательность
+        sequence_length = j - start_idx
+        if sequence_length >= 5:  # Минимальная длина последовательности
+            y_range = np.max(y_values[:sequence_length]) - np.min(
+                y_values[:sequence_length]
+            )
+            if y_range > 30:  # Значительное изменение по Y
+                # Ищем пики и впадины в Y
+                peaks, _ = find_peaks(y_values[:sequence_length])
+                troughs, _ = find_peaks(-y_values[:sequence_length])
+                if len(peaks) >= 1 and len(troughs) >= 1:  # Должны быть пик и впадина
+                    sequences.append(
+                        (frame_numbers[0], frame_numbers[sequence_length - 1])
+                    )
+
+        i = j if j > start_idx else start_idx + 1
+
+    return sequences
 
 
 class TrackAnalyzer:
@@ -14,17 +175,23 @@ class TrackAnalyzer:
         self,
         csv_path: str,
         video_path: str,
-        output_video_path: str = "output_video.mp4",
+        output_path: Optional[str] = None,  # Путь для сохранения видео (AVI)
         fps: float = 30.0,
         max_distance: float = 200,
         min_duration_sec: float = 1.0,
+        max_x_displacement: float = 20.0,  # Порог перемещения по X для навеса
+        min_y_displacement: float = 50.0,  # Порог перемещения по Y для навеса
+        bounce_frames: int = 10,  # Количество кадров для анализа навеса
     ):
         self.csv_path = csv_path
         self.video_path = video_path
-        self.output_video_path = output_video_path
+        self.output_path = output_path
         self.fps = fps
         self.max_distance = max_distance
         self.min_duration_sec = min_duration_sec
+        self.max_x_displacement = max_x_displacement
+        self.min_y_displacement = min_y_displacement
+        self.bounce_frames = bounce_frames
         self.tracks: List[Dict] = []
         self.track_durations: Dict[int, float] = {}
         self.track_distances: Dict[int, str] = {}
@@ -50,43 +217,129 @@ class TrackAnalyzer:
         start2, end2 = track2.start_frame, track2.last_frame
         return start1 <= end2 and start2 <= end1
 
+    def _trim_bounce_start(self, track: Dict) -> Dict:
+        """Подрезает начало трека, убирая кадры с движением мяча вверх-вниз."""
+        if not track.positions:
+            return track
+
+        # Сортируем позиции по кадрам
+        positions = sorted(track.positions, key=lambda x: x[1])
+        new_positions = []
+        trim_frame = track.start_frame
+
+        # Проверяем последовательные группы из bounce_frames кадров
+        for i in range(len(positions) - self.bounce_frames + 1):
+            window = positions[i : i + self.bounce_frames]
+            x_coords = [pos[0][0] for pos in window]
+            y_coords = [pos[0][1] for pos in window]
+            frames = [pos[1] for pos in window]
+
+            # Проверяем, что окно покрывает последовательные кадры
+            if max(frames) - min(frames) + 1 > self.bounce_frames:
+                continue
+
+            # Вычисляем перемещения по X и Y
+            x_displacement = max(x_coords) - min(x_coords)
+            y_displacement = max(y_coords) - min(y_coords)
+
+            # Если мяч движется вверх-вниз (большое Y, малое X), продолжаем искать
+            if (
+                x_displacement <= self.max_x_displacement
+                and y_displacement >= self.min_y_displacement
+            ):
+                continue
+            else:
+                # Нашли момент, где мяч начинает двигаться по X
+                trim_frame = frames[0]
+                new_positions = positions[i:]
+                break
+
+        if not new_positions:
+            new_positions = (
+                positions  # Если не нашли подходящее окно, оставляем как есть
+            )
+
+        # Обновляем трек
+        track.positions = new_positions
+        track.start_frame = (
+            min([pos[1] for pos in new_positions])
+            if new_positions
+            else track.start_frame
+        )
+        track.last_frame = (
+            max([pos[1] for pos in new_positions])
+            if new_positions
+            else track.last_frame
+        )
+        duration_frames = track.last_frame - track.start_frame + 1
+        track.duration_sec = lambda: duration_frames / self.fps
+        if new_positions != positions:
+            self.track_distances[track.track_id] = (
+                f"Trimmed bounce until frame {trim_frame}"
+            )
+
+        return track
+
     def _filter_short_tracks(self, episodes: List[Dict]) -> List[Dict]:
-        # Расширяем эпизоды на 1 секунду в обе стороны
+
+        # Шаг 2: Фильтрация коротких и пересекающихся треков
+        filtered_episodes = []
+        used_indices = set()
+
+        # Фильтруем треки по минимальной длительности
+        long_tracks = [
+            ep for ep in episodes if ep.duration_sec() >= self.min_duration_sec
+        ]
+        # Сортируем треки по длительности (от большего к меньшему) для фильтрации пересечений
+        sorted_tracks = sorted(
+            long_tracks, key=lambda x: x.duration_sec(), reverse=True
+        )
+
+        for i, track1 in enumerate(sorted_tracks):
+            if i in used_indices:
+                continue
+            filtered_episodes.append(track1)
+            used_indices.add(i)
+            for j, track2 in enumerate(sorted_tracks):
+                if j <= i or j in used_indices:
+                    continue
+                if self._is_overlapping(track1, track2):
+                    used_indices.add(j)
+                    print(
+                        f"Удалён трек {track2.track_id} (пересекается с треком {track1.track_id})"
+                    )
+
+        # Шаг 3: Расширение треков на 1 секунду в обе стороны
         frames_to_extend = int(self.fps)  # Количество кадров за 1 секунду
         extended_episodes = []
-        for ep in episodes:
+        for ep in filtered_episodes:
             ep.start_frame = max(0, ep.start_frame - frames_to_extend)
             ep.last_frame = ep.last_frame + frames_to_extend
             extended_episodes.append(ep)
 
-        # Объединяем пересекающиеся эпизоды
+        # Шаг 4: Объединение пересекающихся треков после расширения
         merged_episodes = []
         used_indices = set()
-        sorted_episodes = sorted(extended_episodes, key=lambda x: x.start_frame)
+        sorted_extended = sorted(extended_episodes, key=lambda x: x.start_frame)
 
-        for i, track1 in enumerate(sorted_episodes):
+        for i, track1 in enumerate(sorted_extended):
             if i in used_indices:
                 continue
-
-            # Создаём новый объединённый трек
             merged_track = track1
             merged_positions = list(merged_track.positions)
             merged_track_ids = [merged_track.track_id]
             used_indices.add(i)
 
-            for j, track2 in enumerate(sorted_episodes):
+            for j, track2 in enumerate(sorted_extended):
                 if j <= i or j in used_indices:
                     continue
-
                 if self._is_overlapping(merged_track, track2):
-                    # Обновляем границы объединённого трека
                     merged_track.start_frame = min(
                         merged_track.start_frame, track2.start_frame
                     )
                     merged_track.last_frame = max(
                         merged_track.last_frame, track2.last_frame
                     )
-                    # Объединяем позиции
                     merged_positions.extend(track2.positions)
                     merged_track_ids.append(track2.track_id)
                     used_indices.add(j)
@@ -104,20 +357,20 @@ class TrackAnalyzer:
             )  # Обновляем метод duration_sec
             self.track_distances[merged_track.track_id] = (
                 f"Merged tracks: {', '.join(map(str, merged_track_ids))}"
+                if len(merged_track_ids) > 1
+                else self.track_distances.get(merged_track.track_id, "Unknown")
             )
             merged_episodes.append(merged_track)
 
-        # Фильтруем по минимальной длительности
-        long_tracks = [
-            ep for ep in merged_episodes if ep.duration_sec() >= self.min_duration_sec
-        ]
+        # Шаг 1: Подрезка треков с навесом мяча
+        #merged_episodes = [self._trim_bounce_start(ep) for ep in merged_episodes]
 
         # Сортируем по начальным кадрам для корректной визуализации
-        return sorted(long_tracks, key=lambda x: x.start_frame)
+        return sorted(merged_episodes, key=lambda x: x.start_frame)
 
     def _process_detections(self, df: pd.DataFrame) -> None:
         tracker = BallTracker(
-            buffer_size=1500, max_disappeared=40, max_distance=self.max_distance
+            buffer_size=2500, max_disappeared=40, max_distance=self.max_distance, fps=self.fps
         )
         close_tracks = []
         for frame_num in sorted(df["Frame"].dropna().astype(int).unique()):
@@ -170,6 +423,13 @@ class TrackAnalyzer:
         if not self.tracks:
             print("Нет треков, удовлетворяющих критериям.")
 
+    def _save_tacks_to_file(self, track) -> None:
+        import json
+        file_path =  f'track_json/track_{track.track_id:04d}.json'
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, "w") as f:
+            f.write(json.dumps(track.to_dict()) + "\n")
+
     def visualize_tracks(self) -> None:
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
@@ -178,15 +438,32 @@ class TrackAnalyzer:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS) or self.fps
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        # out = cv2.VideoWriter(self.output_video_path, fourcc, fps, (width, height))
+
+        # Инициализация VideoWriter для AVI, если output_path задан
+        out = None
+        if self.output_path:
+            fourcc = cv2.VideoWriter_fourcc(*"XVID")
+            out = cv2.VideoWriter(self.output_path, fourcc, fps, (width, height))
 
         # Для каждого трека показываем только нужный отрывок
         for track in self.tracks:
             track_id = track.track_id
             start_frame = track.start_frame
             end_frame = track.last_frame
+            self._save_tacks_to_file(track)
+            sequences = find_cyclic_sequences(track.positions)
+            if sequences:
+                print("Найдены последовательности набивания мяча:")
+                for start, end in sequences:
+                    print(f"Начало: кадр {start}, Конец: кадр {end}")
 
+                    track.start_frame = end
+                    duration_frames = track.last_frame - track.start_frame + 1
+                    track.duration_sec = lambda: duration_frames / self.fps
+                    start_frame = track.start_frame
+
+            else:
+                print("Последовательности набивания мяча не найдены.")
             # Перемотать к start_frame
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
             frame_num = start_frame
@@ -196,14 +473,18 @@ class TrackAnalyzer:
                 if not ret:
                     break
 
-                # Нарисовать только для текущего трека
+                clean_frame = (
+                    frame.copy()
+                )  # Копия кадра без отладочной информации для сохранения
                 for _pos in track.positions:
-                    pos = {"x": _pos[0][0], "y": _pos[0][1], "frame_num": _pos[1]}
+                    pos = {"x": int(_pos[0][0]), "y": int(_pos[0][1]), "frame_num": _pos[1]}
                     if pos["frame_num"] == frame_num:
                         x, y = int(pos["x"]), int(pos["y"])
+                        # Рисуем на обоих кадрах
                         cv2.circle(frame, (x, y), 10, (0, 255, 255), -1)
+                        # cv2.circle(clean_frame, (x, y), 10, (0, 255, 255), -1)
                         time_from_start = (frame_num - start_frame) / fps
-                        text = f"ID: {track_id}, Time: {time_from_start:.2f}s"
+                        text = f"ID: {track_id}, {pos['x']},{pos['y']} Time: {time_from_start:.2f}s"
                         cv2.putText(
                             frame,
                             text,
@@ -214,30 +495,50 @@ class TrackAnalyzer:
                             1,
                             cv2.LINE_AA,
                         )
-                debug_info = f"Frame: {frame_num}/{total_frames}, Track ID: {track_id}"
-                cv2.putText(
-                    frame,
-                    debug_info,
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.imshow("Track Visualization", frame)
-                if cv2.waitKey(10) & 0xFF == ord("q"):
-                    cap.release()
-                    cv2.destroyAllWindows()
-                    print(f"Видео сохранено: {self.output_video_path}")
-                    return
-                # out.write(frame)
+                        # --- NEW: draw PRESERV if frame_num in any sequence ---
+                        if any(start <= frame_num <= end for start, end in sequences):
+                            cv2.putText(
+                                frame,
+                                "PRESERV",
+                                (x, y - 20),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.8,
+                                (0, 255, 0),
+                                2,
+                                cv2.LINE_AA,
+                            )
+                # Добавляем отладочную информацию только для отображения
+                if not self.output_path:
+                    debug_info = (
+                        f"Frame: {frame_num}/{total_frames}, Track ID: {track_id}"
+                    )
+                    cv2.putText(
+                        frame,
+                        debug_info,
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 0, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    cv2.imshow("Track Visualization", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+
+                # Сохраняем кадр без отладочной информации, если output_path задан
+                if out:
+                    out.write(clean_frame)
                 frame_num += 1
 
         cap.release()
-        # out.release()
+        if out:
+            out.release()
         cv2.destroyAllWindows()
-        print(f"Видео сохранено: {self.output_video_path}")
+        if self.output_path:
+            print(f"Видео сохранено: {self.output_path}")
+        else:
+            print("Визуализация завершена")
 
     def run(self) -> None:
         self._validate_files()
@@ -254,10 +555,10 @@ def main():
     parser.add_argument("--csv_path", type=str, required=True, help="Путь к ball.csv")
     parser.add_argument("--video_path", type=str, required=True, help="Путь к видео")
     parser.add_argument(
-        "--output_video",
+        "--output_path",
         type=str,
-        default="output_video.mp4",
-        help="Путь к выходному видео",
+        default=None,
+        help="Путь для сохранения выходного видео в формате AVI",
     )
     parser.add_argument(
         "--fps", type=float, default=30, help="FPS видео (по умолчанию 30)"
@@ -274,14 +575,35 @@ def main():
         default=1.0,
         help="Минимальная длительность трека (сек)",
     )
+    parser.add_argument(
+        "--max_x_displacement",
+        type=float,
+        default=20.0,
+        help="Максимальное перемещение по X для определения навеса (пиксели)",
+    )
+    parser.add_argument(
+        "--min_y_displacement",
+        type=float,
+        default=50.0,
+        help="Минимальное перемещение по Y для определения навеса (пиксели)",
+    )
+    parser.add_argument(
+        "--bounce_frames",
+        type=int,
+        default=10,
+        help="Количество кадров для анализа навеса",
+    )
     args = parser.parse_args()
     analyzer = TrackAnalyzer(
         csv_path=args.csv_path,
         video_path=args.video_path,
-        output_video_path=args.output_video,
+        output_path=args.output_path,
         fps=args.fps,
         max_distance=args.max_distance,
         min_duration_sec=args.min_duration_sec,
+        max_x_displacement=args.max_x_displacement,
+        min_y_displacement=args.min_y_displacement,
+        bounce_frames=args.bounce_frames,
     )
     analyzer.run()
 

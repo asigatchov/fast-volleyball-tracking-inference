@@ -19,13 +19,31 @@ class Track:
     fps: float = 30.0
 
     def to_dict(self) -> Dict[str, Any]:
+        """Преобразует объект Track в словарь, пригодный для сериализации в JSON."""
+
+        def convert_numpy(obj):
+            """Конвертирует numpy-типы в стандартные Python-типы."""
+            if isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, list):
+                return [convert_numpy(item) for item in obj]
+            elif isinstance(obj, tuple):
+                return tuple(convert_numpy(item) for item in obj)
+            return obj
+
         return {
-            "positions": list(self.positions),
-            "prediction": self.prediction,
-            "last_frame": self.last_frame,
-            "start_frame": self.start_frame,
-            "ball_sizes": list(self.ball_sizes),
+            "positions": [
+                (convert_numpy(pos[0]), convert_numpy(pos[1])) for pos in self.positions
+            ],
+            "prediction": [convert_numpy(p) for p in self.prediction],
+            "last_frame": convert_numpy(self.last_frame),
+            "start_frame": convert_numpy(self.start_frame),
+            "ball_sizes": [convert_numpy(size) for size in self.ball_sizes],
             "track_id": self.track_id,
+            "reason": self.reason,
+            "fps": self.fps,
         }
 
     def size(self) -> int:
@@ -56,6 +74,7 @@ class BallTracker:
         max_disappeared=40,
         max_distance=200,
         ball_diameter_cm=21.0,
+        fps=30.0,
     ):
         self.next_id = 0
         self.tracks: Dict[int, Track] = {}
@@ -63,6 +82,7 @@ class BallTracker:
         self.max_disappeared = max_disappeared
         self.max_distance = max_distance
         self.ball_diameter_cm = ball_diameter_cm
+
 
     def box_to_position(self, box):
         x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
