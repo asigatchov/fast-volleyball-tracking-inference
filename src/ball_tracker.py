@@ -9,11 +9,11 @@ import dataclasses
 
 @dataclass
 class Track:
-    positions: deque = field(default_factory=lambda: deque(maxlen=1500))
+    positions: deque = field(default_factory=lambda: deque(maxlen=3000))
     prediction: List[float] = field(default_factory=list)
     last_frame: int = 0
     start_frame: int = 0
-    ball_sizes: deque = field(default_factory=lambda: deque(maxlen=1500))
+    ball_sizes: deque = field(default_factory=lambda: deque(maxlen=3000))
     track_id: int = 0
     reason: str = "Unknown"
     fps: float = 30.0
@@ -54,6 +54,20 @@ class Track:
         # Возвращает длительность трека в секундах
         sz = self.size()
         return sz / self.fps if self.fps > 0 else 0.0
+
+    def get_x_range(self) -> float:
+        """Возвращает разницу между максимальным и минимальным значением x из истории positions."""
+        if not self.positions:
+            return 0.0
+        x_values = [pos[0][0] for pos in self.positions]
+        return float(max(x_values) - min(x_values))
+
+    def get_y_range(self) -> float:
+        """Возвращает разницу между максимальным и минимальным значением y из истории positions."""
+        if not self.positions:
+            return 0.0
+        y_values = [pos[0][1] for pos in self.positions]
+        return float(max(y_values) - min(y_values))
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], buffer_size: int = 1500) -> "Track":

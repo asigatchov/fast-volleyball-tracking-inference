@@ -4,206 +4,8 @@ import os
 import argparse
 import cv2
 from typing import List, Dict, Optional, Tuple
-from ball_tracker import BallTracker
-from scipy.signal import find_peaks
-
-
-def merge_cyclic_sequences(
-    sequences: List[Tuple[int, int]], max_frame_gap: int = 10
-) -> List[Tuple[int, int]]:
-    """Объединяет циклические участки, если расстояние между ними не превышает max_frame_gap кадров.
-
-    Args:
-        sequences: Список кортежей (start_frame, end_frame) для циклических участков.
-        max_frame_gap: Максимальное расстояние между участками (в кадрах) для их объединения.
-
-    Returns:
-        Список объединенных кортежей (start_frame, end_frame).
-    """
-    if not sequences:
-        return []
-
-    # Сортируем по началу
-    sequences = sorted(sequences, key=lambda x: x[0])
-    merged = []
-    current_start, current_end = sequences[0]
-
-    for start, end in sequences[1:]:
-        if start <= current_end + max_frame_gap:
-            # Участки пересекаются или находятся в пределах max_frame_gap, обновляем конец
-            current_end = max(current_end, end)
-        else:
-            # Новый участок, добавляем предыдущий и начинаем новый
-            merged.append((current_start, current_end))
-            current_start, current_end = start, end
-
-    # Добавляем последний объединенный участок
-    merged.append((current_start, current_end))
-    return merged
-
-
-def find_cyclic_sequences(
-    positions: List[List],
-    min_cycle_amplitude: float = 30.0,  # Минимальная амплитуда одного цикла (размах)
-    max_amplitude_variation: float = 50.0,  # Макс. отличие амплитуд между циклами
-    min_num_amplitudes: int = 4,  # Мин. число амплитуд для последовательности (~2 цикла)
-) -> List[Tuple[int, int]]:
-    """Находит участки с регулярными циклическими движениями мяча (≥2 цикла),
-    где амплитуды колебаний отличаются не более чем на max_amplitude_variation.
-    Доработано для детекции локальных стабильных циклов (например, набивка мяча перед подачей),
-    даже если общая вариация амплитуд большая — ищем подпоследовательности.
-
-    Args:
-        positions: Список позиций в формате [[x, y], frame].
-        min_cycle_amplitude: Минимальный размах Y для признания цикла значимым.
-        max_amplitude_variation: Максимальное различие между амплитудами циклов.
-        min_num_amplitudes: Минимальное количество consecutive амплитуд для последовательности.
-
-    Returns:
-        Список кортежей (start_frame, end_frame) для стабильных циклических участков.
-    """
-    if not positions or len(positions) < 10:
-        return []
-
-    # Преобразуем в массив
-    pos_array = np.array(
-        [(pos[0][0], pos[0][1], pos[1]) for pos in positions], dtype=np.float64
-    )
-    x_values = pos_array[:, 0]
-    y_values = pos_array[:, 1]
-    frames = pos_array[:, 2].astype(int)
-
-    sequences = []
-    i = 0
-    n = len(pos_array)
-
-    while i < n - 10:
-        start_idx = i
-        j = i + 1
-
-        # Ищем участок с малым изменением X
-        while j < n:
-            x_range = np.max(x_values[i : j + 1]) - np.min(x_values[i : j + 1])
-            if x_range > 150:
-                break
-            j += 1
-
-        if j - i < 100:  # слишком короткий участок
-            i = j
-            continue
-
-        y_segment = y_values[i:j]
-        total_y_range = np.max(y_segment) - np.min(y_segment)
-        if total_y_range < min_cycle_amplitude:
-            i = j
-            continue
-
-        # Находим пики и впадины
-        peaks, _ = find_peaks(y_segment, prominence=10)
-        troughs, _ = find_peaks(-y_segment, prominence=10)
-
-        if len(peaks) < 2 or len(troughs) < 2:
-            i = j
-            continue
-
-        # Сортируем события по индексу
-        events = sorted(
-            [(p, "peak") for p in peaks] + [(t, "trough") for t in troughs],
-            key=lambda x: x[0],
-        )
-
-        # Извлекаем амплитуды (все, без фильтра пока)
-        amplitudes = []
-        for k in range(1, len(events)):
-            prev_idx, _ = events[k - 1]
-            curr_idx, _ = events[k]
-            amplitude = abs(y_segment[curr_idx] - y_segment[prev_idx])
-            amplitudes.append(amplitude)
-
-        if len(amplitudes) < min_num_amplitudes:
-            i = j
-            continue
-
-        # Шаг 1: Находим "хорошие" сегменты амплитуд, где все >= min_cycle_amplitude (без малых переходов)
-        good_segments = []
-        amp_idx = 0
-        while amp_idx < len(amplitudes):
-            if amplitudes[amp_idx] < min_cycle_amplitude:
-                amp_idx += 1
-                continue
-            amp_j = amp_idx
-            while amp_j < len(amplitudes) and amplitudes[amp_j] >= min_cycle_amplitude:
-                amp_j += 1
-            if amp_j - amp_idx >= min_num_amplitudes:
-                good_segments.append((amp_idx, amp_j))
-            amp_idx = amp_j
-
-        # Шаг 2: Для каждого хорошего сегмента ищем подпоследовательности с похожими амплитудами (range <= var)
-        for amp_start, amp_end in good_segments:
-            left = amp_start
-            for right in range(amp_start, amp_end):
-                sub = amplitudes[left : right + 1]
-                sub_min = min(sub)
-                sub_max = max(sub)
-                while (sub_max - sub_min > max_amplitude_variation) and left <= right:
-                    left += 1
-                    sub = amplitudes[left : right + 1]
-                    if sub:
-                        sub_min = min(sub)
-                        sub_max = max(sub)
-                if right - left + 1 >= min_num_amplitudes:
-                    # Добавляем участок (от события left до события right+1)
-                    event_left = events[left][0]
-                    event_right = events[right + 1][0]
-                    f_start = int(frames[i + event_left])
-                    f_end = int(frames[i + event_right])
-                    sequences.append((f_start, f_end))
-                    # Переходим к следующему непересекающемуся
-                    left = right + 1
-
-        i = j  # переходим к следующему сегменту
-    sequences = merge_cyclic_sequences(sequences)
-
-    return sequences
-
-
-def find_rolling_sequences(
-    positions: List[List],
-    max_y_range: float = 40.0,  # Уменьшено для трека 0005
-    min_x_range: float = 50.0,
-    min_length: int = 70,  # Уменьшено для коротких участков
-) -> List[Tuple[int, int]]:
-    """Находит участки, где мяч катится по полу (малый размах Y, большой размах X)."""
-    if not positions or len(positions) < min_length:
-        return []
-
-    pos_array = np.array(
-        [(pos[0][0], pos[0][1], pos[1]) for pos in positions], dtype=np.float64
-    )
-    x_values = pos_array[:, 0]
-    y_values = pos_array[:, 1]
-    frames = pos_array[:, 2].astype(int)
-
-    sequences = []
-    i = 0
-    n = len(pos_array)
-
-    while i < n - min_length + 1:
-        j = i + min_length - 1
-        while j < n:
-            y_range = np.max(y_values[i : j + 1]) - np.min(y_values[i : j + 1])
-            x_range = np.max(x_values[i : j + 1]) - np.min(x_values[i : j + 1])
-            if y_range <= max_y_range and x_range >= min_x_range:
-                j += 1
-            else:
-                break
-        if j - i >= min_length:
-            sequences.append((int(frames[i]), int(frames[j - 1])))
-        i += 1
-
-    sequences = merge_cyclic_sequences(sequences, max_frame_gap=30)
-
-    return sequences
+from ball_tracker import BallTracker, Track
+from track_utils import find_cyclic_sequences, find_rolling_sequences
 
 
 class TrackAnalyzer:
@@ -250,7 +52,7 @@ class TrackAnalyzer:
         df.loc[(df["X"] == -1) | (df["Visibility"] == 0), ["X", "Y"]] = np.nan
         return df
 
-    def _is_overlapping(self, track1: Dict, track2: Dict) -> bool:
+    def _is_overlapping(self, track1: Track, track2: Track) -> bool:
         start1, end1 = track1.start_frame, track1.last_frame
         start2, end2 = track2.start_frame, track2.last_frame
         return start1 <= end2 and start2 <= end1
@@ -260,61 +62,37 @@ class TrackAnalyzer:
         if not track.positions:
             return track
 
-        # Сортируем позиции по кадрам
-        positions = sorted(track.positions, key=lambda x: x[1])
-        new_positions = []
-        trim_frame = track.start_frame
+        orig_start = track.start_frame
+        orig_end = track.last_frame
 
-        # Проверяем последовательные группы из bounce_frames кадров
-        for i in range(len(positions) - self.bounce_frames + 1):
-            window = positions[i : i + self.bounce_frames]
-            x_coords = [pos[0][0] for pos in window]
-            y_coords = [pos[0][1] for pos in window]
-            frames = [pos[1] for pos in window]
+        sequences = find_cyclic_sequences(track.positions)
+        if sequences:
+            print("Найдены последовательности набивания мяча:")
+            for start, end in sequences:
+                print(f"Начало: кадр {start}, Конец: кадр {end}")
+                track.start_frame = end
+                duration_frames = track.last_frame - track.start_frame + 1
+                track.duration_sec = lambda: duration_frames / self.fps
 
-            # Проверяем, что окно покрывает последовательные кадры
-            if max(frames) - min(frames) + 1 > self.bounce_frames:
-                continue
+        else:
+            print("Последовательности набивания мяча не найдены.")
 
-            # Вычисляем перемещения по X и Y
-            x_displacement = max(x_coords) - min(x_coords)
-            y_displacement = max(y_coords) - min(y_coords)
-
-            # Если мяч движется вверх-вниз (большое Y, малое X), продолжаем искать
-            if (
-                x_displacement <= self.max_x_displacement
-                and y_displacement >= self.min_y_displacement
-            ):
-                continue
-            else:
-                # Нашли момент, где мяч начинает двигаться по X
-                trim_frame = frames[0]
-                new_positions = positions[i:]
+        sequences = find_rolling_sequences(track.positions)
+        if sequences:
+            print("Найдены последовательности качения мяча:")
+            for start, end in sequences:
+                print(f"Начало: кадр {start}, Конец: кадр {end}")
+                track.last_frame = start
+                duration_frames = track.last_frame - track.start_frame + 1
+                track.duration_sec = lambda: duration_frames / self.fps
                 break
 
-        if not new_positions:
-            new_positions = (
-                positions  # Если не нашли подходящее окно, оставляем как есть
-            )
-
-        # Обновляем трек
-        track.positions = new_positions
-        track.start_frame = (
-            min([pos[1] for pos in new_positions])
-            if new_positions
-            else track.start_frame
-        )
-        track.last_frame = (
-            max([pos[1] for pos in new_positions])
-            if new_positions
-            else track.last_frame
-        )
-        duration_frames = track.last_frame - track.start_frame + 1
-        track.duration_sec = lambda: duration_frames / self.fps
-        if new_positions != positions:
-            self.track_distances[track.track_id] = (
-                f"Trimmed bounce until frame {trim_frame}"
-            )
+        # --- Обрезаем positions по новым start_frame и last_frame ---
+        if track.start_frame != orig_start or track.last_frame != orig_end:
+            track.positions = [
+                pos for pos in track.positions
+                if track.start_frame <= pos[1] <= track.last_frame
+            ]
 
         return track
 
@@ -324,6 +102,11 @@ class TrackAnalyzer:
         filtered_episodes = []
         used_indices = set()
 
+        episodes = [
+            ep for ep in episodes if ep.get_x_range() >= 1920  / 4.0
+        ]
+
+        episodes = [self._trim_bounce_start(ep) for ep in episodes]
         # Фильтруем треки по минимальной длительности
         long_tracks = [
             ep for ep in episodes if ep.duration_sec() >= self.min_duration_sec
@@ -401,7 +184,7 @@ class TrackAnalyzer:
             merged_episodes.append(merged_track)
 
         # Шаг 1: Подрезка треков с навесом мяча
-        #merged_episodes = [self._trim_bounce_start(ep) for ep in merged_episodes]
+        merged_episodes = [self._trim_bounce_start(ep) for ep in merged_episodes]
 
         # Сортируем по начальным кадрам для корректной визуализации
         return sorted(merged_episodes, key=lambda x: x.start_frame)
@@ -489,30 +272,9 @@ class TrackAnalyzer:
             start_frame = track.start_frame
             end_frame = track.last_frame
             self._save_tacks_to_file(track)
-            sequences = find_cyclic_sequences(track.positions)
-            if sequences:
-                print("Найдены последовательности набивания мяча:")
-                for start, end in sequences:
-                    print(f"Начало: кадр {start}, Конец: кадр {end}")
 
-                    track.start_frame = end
-                    duration_frames = track.last_frame - track.start_frame + 1
-                    track.duration_sec = lambda: duration_frames / self.fps
-                    start_frame = track.start_frame
-
-            else:
-                print("Последовательности набивания мяча не найдены.")
-
-            sequences = find_rolling_sequences(track.positions)
-            if sequences:
-                print("Найдены последовательности качения мяча:")
-                for start, end in sequences:
-                    print(f"Начало: кадр {start}, Конец: кадр {end}")
-                    track.last_frame = start
-                    duration_frames = track.last_frame - track.start_frame + 1
-                    track.duration_sec = lambda: duration_frames / self.fps
-                    end_frame = track.last_frame
-                    break
+            # Длительность fade-out в кадрах (например, 0.5 сек при 30 FPS)
+            fade_duration_frames = int(fps * 0.5)  # можно изменить на нужную длительность
 
             # Перемотать к start_frame
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -545,18 +307,7 @@ class TrackAnalyzer:
                             1,
                             cv2.LINE_AA,
                         )
-                        # --- NEW: draw PRESERV if frame_num in any sequence ---
-                        if any(start <= frame_num <= end for start, end in sequences):
-                            cv2.putText(
-                                frame,
-                                "PRESERV",
-                                (x, y - 20),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.8,
-                                (0, 255, 0),
-                                2,
-                                cv2.LINE_AA,
-                            )
+
                 # Добавляем отладочную информацию только для отображения
                 if not self.output_path:
                     debug_info = (
@@ -580,6 +331,14 @@ class TrackAnalyzer:
                 if out:
                     out.write(clean_frame)
                 frame_num += 1
+                # === Плавное затемнение после трека ===
+            if out and fade_duration_frames > 0:
+                # Берём последний кадр как основу
+                last_frame = clean_frame.copy()
+                for fade_step in range(fade_duration_frames):
+                    alpha = 1.0 - (fade_step / fade_duration_frames)  # от 1.0 до 0.0
+                    faded_frame = cv2.convertScaleAbs(last_frame, alpha=alpha, beta=0)
+                    out.write(faded_frame)
 
         cap.release()
         if out:
