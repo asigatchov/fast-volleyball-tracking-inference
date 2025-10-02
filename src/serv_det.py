@@ -185,7 +185,6 @@ def find_rolling_sequences(
 
     return sequences
 
-
 def plot_2d_trajectory(
     positions: List[List],
     file_name: str,
@@ -203,24 +202,28 @@ def plot_2d_trajectory(
     y = np.array([pos[0][1] for pos in positions])
     frames = np.array([pos[1] for pos in positions])
 
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 12), sharex=False)
+    # Уменьшаем высоту фигуры для лучшего соответствия экрану
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 8), constrained_layout=True)
 
     # График X(frame)
     ax1.plot(frames, x, c="#1E90FF", linewidth=1, label="X (обычный)")
     for start, end in cyclic_sequences:
         mask = (frames >= start) & (frames <= end)
         ax1.plot(frames[mask], x[mask], c="red", linewidth=2, label="X (циклический)")
-        ax1.axvline(start, color="gray", linestyle="--")
-        ax1.axvline(end, color="gray", linestyle="--")
+        ax1.axvline(start, color="gray", linestyle="--", alpha=0.5)
+        ax1.axvline(end, color="gray", linestyle="--", alpha=0.5)
     for start, end in rolling_sequences:
         mask = (frames >= start) & (frames <= end)
         ax1.plot(frames[mask], x[mask], c="green", linewidth=2, label="X (качение)")
-        ax1.axvline(start, color="darkgreen", linestyle="-.")
-        ax1.axvline(end, color="darkgreen", linestyle="-.")
+        ax1.axvline(start, color="darkgreen", linestyle="-.", alpha=0.5)
+        ax1.axvline(end, color="darkgreen", linestyle="-.", alpha=0.5)
     ax1.set_xlabel("Номер кадра")
     ax1.set_ylabel("X (пиксели)")
-    ax1.set_title(f"Координата X по кадрам ({file_name})")
-    ax1.legend()
+    ax1.set_title(f"Координата X ({file_name})")
+    # Удаляем дублирующиеся метки в легенде
+    handles, labels = ax1.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax1.legend(by_label.values(), by_label.keys(), loc="best")
     ax1.grid(True)
 
     # График Y(frame)
@@ -228,18 +231,20 @@ def plot_2d_trajectory(
     for start, end in cyclic_sequences:
         mask = (frames >= start) & (frames <= end)
         ax2.plot(frames[mask], y[mask], c="red", linewidth=2, label="Y (циклический)")
-        ax2.axvline(start, color="gray", linestyle="--")
-        ax2.axvline(end, color="gray", linestyle="--")
+        ax2.axvline(start, color="gray", linestyle="--", alpha=0.5)
+        ax2.axvline(end, color="gray", linestyle="--", alpha=0.5)
     for start, end in rolling_sequences:
         mask = (frames >= start) & (frames <= end)
         ax2.plot(frames[mask], y[mask], c="green", linewidth=2, label="Y (качение)")
-        ax2.axvline(start, color="darkgreen", linestyle="-.")
-        ax2.axvline(end, color="darkgreen", linestyle="-.")
+        ax2.axvline(start, color="darkgreen", linestyle="-.", alpha=0.5)
+        ax2.axvline(end, color="darkgreen", linestyle="-.", alpha=0.5)
     ax2.set_xlabel("Номер кадра")
     ax2.set_ylabel("Y (пиксели)")
-    ax2.set_title(f"Координата Y по кадрам ({file_name})")
+    ax2.set_title(f"Координата Y ({file_name})")
     ax2.invert_yaxis()
-    ax2.legend()
+    handles, labels = ax2.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax2.legend(by_label.values(), by_label.keys(), loc="best")
     ax2.grid(True)
 
     # График X-Y
@@ -256,7 +261,9 @@ def plot_2d_trajectory(
     ax3.set_ylabel("Y (пиксели)")
     ax3.set_title(f"Траектория X-Y ({file_name})")
     ax3.invert_yaxis()
-    ax3.legend()
+    handles, labels = ax3.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax3.legend(by_label.values(), by_label.keys(), loc="best")
     ax3.grid(True)
 
     # Выводим найденные участки
@@ -276,8 +283,8 @@ def plot_2d_trajectory(
         for start, end in rolling_sequences:
             print(f"Участок качения: Начало: кадр {start}, Конец: кадр {end}")
 
-    plt.tight_layout()
     plt.show()
+
 
 
 def main():
