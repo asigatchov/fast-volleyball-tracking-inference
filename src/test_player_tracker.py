@@ -19,7 +19,7 @@ def test_player_tracking(video_path):
     
     # Initialize player tracker with YOLO model
     tracker = PlayerTracker(
-        yolo_model_path="models_yolo/yolo11n.onnx"
+        yolo_model_path="models_yolo/yolo11n_vb.onnx"
     )
     
     # Open video
@@ -37,7 +37,7 @@ def test_player_tracking(video_path):
             
         # Detect players
         player_boxes = tracker.detect_players(frame)
-        
+        print(player_boxes)
         # Draw player positions
         output_frame = tracker.draw_player_positions(frame, player_boxes)
         
