@@ -52,7 +52,7 @@ class TrackAnalyzer:
         df.loc[(df["X"] == -1) | (df["Visibility"] == 0), ["X", "Y"]] = np.nan
         return df
 
-    def _is_overlapping(self, track1: Track, track2: Track) -> bool:
+    def _is_overlapping(self, track1: Track, track2: Dict) -> bool:
         start1, end1 = track1.start_frame, track1.last_frame
         start2, end2 = track2.start_frame, track2.last_frame
         return start1 <= end2 and start2 <= end1
@@ -103,7 +103,7 @@ class TrackAnalyzer:
         used_indices = set()
 
         episodes = [
-            ep for ep in episodes if ep.get_x_range() >= 1920  / 4.0
+            ep for ep in episodes if ep.get_y_range() >= 1080  / 4.0
         ]
 
         episodes = [self._trim_bounce_start(ep) for ep in episodes]
@@ -331,7 +331,7 @@ class TrackAnalyzer:
                 if out:
                     out.write(clean_frame)
                 frame_num += 1
-                # === Плавное затемнение после трека ===
+                        # === Плавное затемнение после трека ===
             if out and fade_duration_frames > 0:
                 # Берём последний кадр как основу
                 last_frame = clean_frame.copy()
