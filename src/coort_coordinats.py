@@ -4,6 +4,10 @@ import argparse
 import json
 import os
 
+# Import our new player tracker module
+from player_tracker import PlayerTracker
+
+
 def select_points(image, title, num_points=4):
     points = []
     def mouse_callback(event, x, y, flags, param):
@@ -59,6 +63,14 @@ def main(video_path, cache_file='court_points_cache.json'):
         # Создание матрицы преобразования
         matrix = cv2.getPerspectiveTransform(video_points, court_points)
         
+        # Initialize player tracker with YOLO model
+        player_tracker = PlayerTracker(
+            yolo_model_path="models_yolo/yolo11n.onnx",
+            court_image_path="images/court.jpg"
+        )
+        # Set transformation matrix for player tracker
+        player_tracker.set_transformation_matrix(video_points, court_points)
+        
         # Основной цикл обработки видео
         current_point = None
         def mouse_callback(event, x, y, flags, param):
@@ -74,8 +86,14 @@ def main(video_path, cache_file='court_points_cache.json'):
             if not ret:
                 break
                 
+            # Detect players using YOLO model
+            player_boxes = player_tracker.detect_players(frame)
+            
+            # Draw player positions on frame
+            output_frame = player_tracker.draw_player_positions(frame, player_boxes)
+            
             # Отображение схемы в правом верхнем углу
-            frame[0:200, -100:] = small_court
+            output_frame[0:200, -100:] = small_court
             
             # Если выбрана точка, преобразуем и отображаем
             if current_point:
@@ -85,12 +103,12 @@ def main(video_path, cache_file='court_points_cache.json'):
                      (matrix[2][0]*current_point[0] + matrix[2][1]*current_point[1] + matrix[2][2])
                 
                 # Отрисовка точек
-                cv2.circle(frame, current_point, 5, (0, 0, 255), -1)
+                cv2.circle(output_frame, current_point, 5, (0, 0, 255), -1)
                 court_point = (int(px), int(py))
                 small_court_point = (int(px * 100 / court_image.shape[1]), int(py * 200 / court_image.shape[0]))
-                cv2.circle(frame, (small_court_point[0] + frame.shape[1] - 100, small_court_point[1]), 3, (0, 0, 255), -1)
+                cv2.circle(output_frame, (small_court_point[0] + output_frame.shape[1] - 100, small_court_point[1]), 3, (0, 0, 255), -1)
             
-            cv2.imshow("Video", frame)
+            cv2.imshow("Video", output_frame)
             
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
