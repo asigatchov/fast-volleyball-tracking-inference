@@ -34,7 +34,7 @@ def save_cached_points(cache_file, points):
     with open(cache_file, 'w') as f:
         json.dump({'court_points': points.tolist()}, f)
 
-def main(video_path, cache_file='court_points_cache.json', output_path=None):
+def main(video_path, cache_file='court_points_cache.json'):
     # Загрузка видео и схемы площадки
     cap = cv2.VideoCapture(video_path)
     court_image = cv2.imread('images/court.jpg')
@@ -43,14 +43,7 @@ def main(video_path, cache_file='court_points_cache.json', output_path=None):
         if not ret:
             print("Ошибка чтения первого кадра")
             return
-
-        # Prepare VideoWriter if output_path is specified
-        video_writer = None
-        if output_path:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            height, width = frame.shape[:2]
-            video_writer = cv2.VideoWriter(output_path, fourcc, cap.get(cv2.CAP_PROP_FPS), (width, height))
-
+        
         # Масштабирование схемы для отображения
         small_court = cv2.resize(court_image, (100, 200))
 
@@ -75,8 +68,9 @@ def main(video_path, cache_file='court_points_cache.json', output_path=None):
             yolo_model_path="models_yolo/yolo11n.onnx",
             court_image_path="images/court.jpg"
         )
-        # Set transformation matrix for player tracker
+        # Set transformation matrix and court boundary for player tracker
         player_tracker.set_transformation_matrix(video_points, court_points)
+        player_tracker.set_court_boundary(court_points)
         
         # Основной цикл обработки видео
         current_point = None
@@ -88,6 +82,8 @@ def main(video_path, cache_file='court_points_cache.json', output_path=None):
         cv2.namedWindow("Video")
         cv2.setMouseCallback("Video", mouse_callback)
         
+        frame_count = 0
+        
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -96,25 +92,12 @@ def main(video_path, cache_file='court_points_cache.json', output_path=None):
             # Detect players using YOLO model
             player_boxes = player_tracker.detect_players(frame)
             
-            # Draw player positions on frame
+            # Draw player positions (without bounding boxes, only points with IDs)
             output_frame = player_tracker.draw_player_positions(frame, player_boxes)
             
             # Отображение схемы в правом верхнем углу
             output_frame[0:200, -100:] = small_court
-
-            # Draw player positions on the small court schematic
-            for bbox in player_boxes:
-                # Get player position (center of bottom edge)
-                player_pos = player_tracker.get_player_position(bbox)
-                # Transform to court coordinates
-                court_pos = player_tracker.transform_to_court(player_pos)
-                if court_pos:
-                    # Scale to small_court size
-                    small_x = int(court_pos[0] * 100 / court_image.shape[1])
-                    small_y = int(court_pos[1] * 200 / court_image.shape[0])
-                    # Draw on output_frame (top-right corner)
-                    cv2.circle(output_frame, (small_x + output_frame.shape[1] - 100, small_y), 4, (255, 0, 0), -1)
-
+            
             # Если выбрана точка, преобразуем и отображаем
             if current_point:
                 px = (matrix[0][0]*current_point[0] + matrix[0][1]*current_point[1] + matrix[0][2]) / \
@@ -129,18 +112,14 @@ def main(video_path, cache_file='court_points_cache.json', output_path=None):
                 cv2.circle(output_frame, (small_court_point[0] + output_frame.shape[1] - 100, small_court_point[1]), 3, (0, 0, 255), -1)
             
             cv2.imshow("Video", output_frame)
-
-            # Save frame to output video if enabled
-            if video_writer:
-                video_writer.write(output_frame)
-
+            
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
-
+                
+            frame_count += 1
+        
         cap.release()
-        if video_writer:
-            video_writer.release()
         cv2.destroyAllWindows()
     else:
         print("Ошибка загрузки видео или изображения площадки")
@@ -148,6 +127,5 @@ def main(video_path, cache_file='court_points_cache.json', output_path=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Volleyball court point transformation with caching')
     parser.add_argument('--video_path', type=str, required=True, help='Path to the video file')
-    parser.add_argument('--output_path', type=str, default=None, help='Path to save the output video')
     args = parser.parse_args()
-    main(args.video_path, output_path=args.output_path)
+    main(args.video_path)

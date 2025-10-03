@@ -2,110 +2,149 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 import os
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
+from scipy.spatial import distance
 
 
-def pad_frame_to_square(frame):
-    h, w, _ = frame.shape
-    if h == w:
-        return frame, 0, 0
-    elif h > w:
-        padding = h - w
-        pad_left = padding // 2
-        pad_right = padding - pad_left
-        padded = cv2.copyMakeBorder(frame, 0, 0, pad_left, pad_right,
-                                    cv2.BORDER_CONSTANT, value=(0, 0, 0))
-        return padded, pad_left, 0
-    else:
-        padding = w - h
-        pad_top = padding // 2
-        pad_bottom = padding - pad_top
-        padded = cv2.copyMakeBorder(frame, pad_top, pad_bottom, 0, 0,
-                                    cv2.BORDER_CONSTANT, value=(0, 0, 0))
-        return padded, 0, pad_top
+class Player:
+    """Represents a tracked player with ID and position."""
+    
+    def __init__(self, player_id: int, position: Tuple[int, int]):
+        self.player_id = player_id
+        self.position = position
+        self.last_seen = 0
+        self.positions_history = [position]
 
-def slice_image_sahi(image, slice_height=640, slice_width=640, overlap_height_ratio=0.2, overlap_width_ratio=0.2):
-    """
-    Slice image into overlapping patches (SAHI approach).
-    Returns list of (patch, x_offset, y_offset).
-    """
-    img_h, img_w = image.shape[:2]
-    step_h = int(slice_height * (1 - overlap_height_ratio))
-    step_w = int(slice_width * (1 - overlap_width_ratio))
-    patches = []
-    for y in range(0, img_h, step_h):
-        for x in range(0, img_w, step_w):
-            patch = image[y:y+slice_height, x:x+slice_width]
-            if patch.shape[0] < slice_height or patch.shape[1] < slice_width:
-                # Pad patch to required size
-                patch = cv2.copyMakeBorder(
-                    patch,
-                    0, slice_height - patch.shape[0],
-                    0, slice_width - patch.shape[1],
-                    cv2.BORDER_CONSTANT, value=(0,0,0)
-                )
-            patches.append((patch, x, y))
-    return patches
 
-def preprocess_yolo_input(image_rgb, input_size=(640, 640)):
-    input_data = image_rgb.astype(np.float32) / 255.0
-    input_data = cv2.resize(input_data, input_size)
-    input_data = np.transpose(input_data, (2, 0, 1))
-    input_data = np.expand_dims(input_data, axis=0)
-    return input_data
+class SimpleTracker:
+    """Simple tracker for player IDs using position proximity."""
+    
+    def __init__(self, max_disappeared: int = 30, max_distance: float = 100):
+        self.next_id = 0
+        self.players: Dict[int, Player] = {}
+        self.max_disappeared = max_disappeared
+        self.max_distance = max_distance
+        self.disappeared_count: Dict[int, int] = {}
+        
+    def update(self, positions: List[Tuple[int, int]], frame_count: int) -> Dict[int, int]:
+        """
+        Update tracker with new player positions.
+        
+        Args:
+            positions: List of player positions (x, y)
+            frame_count: Current frame number
+            
+        Returns:
+            Dictionary mapping position index to player ID
+        """
+        # If no players detected
+        if len(positions) == 0:
+            # Mark all existing players as disappeared
+            for player_id in list(self.players.keys()):
+                self.disappeared_count[player_id] = self.disappeared_count.get(player_id, 0) + 1
+                if self.disappeared_count[player_id] > self.max_disappeared:
+                    del self.players[player_id]
+                    del self.disappeared_count[player_id]
+            return {}
+        
+        # If no existing players, initialize new ones
+        if len(self.players) == 0:
+            for pos in positions:
+                player = Player(self.next_id, pos)
+                player.last_seen = frame_count
+                self.players[self.next_id] = player
+                self.disappeared_count[self.next_id] = 0
+                self.next_id += 1
+            return {i: player_id for i, player_id in enumerate(self.players.keys())}
+        
+        # Match existing players with new positions
+        player_ids = list(self.players.keys())
+        player_positions = [self.players[pid].position for pid in player_ids]
+        
+        # Calculate distance matrix
+        if len(positions) > 0 and len(player_positions) > 0:
+            dist_matrix = distance.cdist(player_positions, positions)
+            
+            # Assign positions to players
+            assigned_positions = set()
+            assigned_players = set()
+            
+            # Greedy assignment based on minimum distance
+            while np.min(dist_matrix) <= self.max_distance:
+                # Find minimum distance
+                min_idx = np.unravel_index(np.argmin(dist_matrix), dist_matrix.shape)
+                player_idx, pos_idx = min_idx
+                
+                # Check if already assigned
+                if player_idx in assigned_players or pos_idx in assigned_positions:
+                    dist_matrix[player_idx, pos_idx] = np.inf
+                    continue
+                
+                # Assign position to player
+                player_id = player_ids[player_idx]
+                new_position = positions[pos_idx]
+                
+                # Update player
+                self.players[player_id].position = new_position
+                self.players[player_id].positions_history.append(new_position)
+                self.players[player_id].last_seen = frame_count
+                self.disappeared_count[player_id] = 0
+                
+                # Mark as assigned
+                assigned_players.add(player_idx)
+                assigned_positions.add(pos_idx)
+                
+                # Set distance to infinity to avoid reassignment
+                dist_matrix[player_idx, :] = np.inf
+                dist_matrix[:, pos_idx] = np.inf
+            
+            # Handle unassigned positions (new players)
+            for pos_idx, pos in enumerate(positions):
+                if pos_idx not in assigned_positions:
+                    player = Player(self.next_id, pos)
+                    player.last_seen = frame_count
+                    self.players[self.next_id] = player
+                    self.disappeared_count[self.next_id] = 0
+                    self.next_id += 1
+            
+            # Handle disappeared players
+            for player_idx, player_id in enumerate(player_ids):
+                if player_idx not in assigned_players:
+                    self.disappeared_count[player_id] = self.disappeared_count.get(player_id, 0) + 1
+                    if self.disappeared_count[player_id] > self.max_disappeared:
+                        del self.players[player_id]
+                        del self.disappeared_count[player_id]
+        else:
+            # No matching possible, treat all as new
+            self.players.clear()
+            self.disappeared_count.clear()
+            for pos in positions:
+                player = Player(self.next_id, pos)
+                player.last_seen = frame_count
+                self.players[self.next_id] = player
+                self.disappeared_count[self.next_id] = 0
+                self.next_id += 1
+        
+        # Create mapping from position index to player ID
+        result = {}
+        assigned_positions = set()
+        
+        if len(positions) > 0 and len(self.players) > 0:
+            player_ids = list(self.players.keys())
+            player_positions = [self.players[pid].position for pid in player_ids]
+            dist_matrix = distance.cdist(player_positions, positions)
+            
+            for pos_idx, pos in enumerate(positions):
+                # Find closest player
+                distances = [distance.euclidean(player_pos, pos) for player_pos in player_positions]
+                min_dist_idx = np.argmin(distances) if distances else -1
+                
+                if min_dist_idx >= 0 and distances[min_dist_idx] <= self.max_distance:
+                    result[pos_idx] = player_ids[min_dist_idx]
+                    assigned_positions.add(pos_idx)
+        
+        return result
 
-def postprocess_yolo_output(output, original_img_shape, input_size=(640, 640),
-                            conf_threshold=0.5, nms_threshold=0.45):
-    output = np.squeeze(output)
-
-    if output.shape[0] < output.shape[1]:
-        output = output.T
-
-    num_features = output.shape[1]
-
-    if num_features == 5:  # ball model (single class)
-        boxes_raw = output[:, :4]
-        scores = output[:, 4]
-        class_ids = np.zeros(len(scores), dtype=int)
-    elif num_features == 84:  # COCO person model
-        boxes_raw = output[:, :4]
-        class_scores = output[:, 4:]
-        scores = np.max(class_scores, axis=1)
-        class_ids = np.argmax(class_scores, axis=1)
-    else:
-        return np.array([]).reshape(0,4), np.array([]), np.array([])
-
-    valid_mask = scores > conf_threshold
-    boxes_filtered = boxes_raw[valid_mask]
-    scores_filtered = scores[valid_mask]
-    class_ids_filtered = class_ids[valid_mask]
-
-    if len(boxes_filtered) == 0:
-        return np.array([]).reshape(0,4), np.array([]), np.array([])
-
-    img_h, img_w = original_img_shape[:2]
-    input_h, input_w = input_size
-
-    scale_x = img_w / input_w
-    scale_y = img_h / input_h
-
-    x_center, y_center, width, height = boxes_filtered[:, 0], boxes_filtered[:, 1], boxes_filtered[:, 2], boxes_filtered[:, 3]
-
-    x1 = (x_center - width / 2) * scale_x
-    y1 = (y_center - height / 2) * scale_y
-    x2 = (x_center + width / 2) * scale_x
-    y2 = (y_center + height / 2) * scale_y
-
-    boxes_final = np.clip(np.stack([x1, y1, x2, y2], axis=1), 0, [img_w, img_h, img_w, img_h]).astype(int)
-
-    # NMS
-    boxes_nms_input = np.array([[b[0], b[1], b[2]-b[0], b[3]-b[1]] for b in boxes_final])
-    indices = cv2.dnn.NMSBoxes(boxes_nms_input.tolist(), scores_filtered.tolist(), conf_threshold, nms_threshold)
-    if len(indices) == 0:
-        return np.array([]).reshape(0,4), np.array([]), np.array([])
-
-    indices = indices.flatten()
-    return boxes_final[indices], scores_filtered[indices], class_ids_filtered[indices]
 
 class PlayerTracker:
     """Class for tracking volleyball players using YOLO model."""
@@ -123,6 +162,11 @@ class PlayerTracker:
         self.session = None
         self.court_image = None
         self.transformation_matrix = None
+        self.court_boundary = None  # Court boundary points for filtering
+        
+        # Initialize tracker
+        self.tracker = SimpleTracker()
+        self.frame_count = 0
         
         # Load the YOLO model
         self._load_model()
@@ -140,60 +184,106 @@ class PlayerTracker:
         
     def detect_players(self, frame: np.ndarray, confidence_threshold: float = 0.5) -> List[Tuple[int, int, int, int]]:
         """
-        Detect players in a frame using YOLO model (SAHI slicing, no resize).
-        Returns bounding boxes in original image coordinates.
+        Detect players in a frame using YOLO model.
+        
+        Args:
+            frame: Input frame (BGR format)
+            confidence_threshold: Minimum confidence for detections
+            
+        Returns:
+            List of bounding boxes (x, y, w, h) for detected players
         """
-        slice_height, slice_width = 640, 640
-        overlap_height_ratio, overlap_width_ratio = 0.2, 0.2
-        patches = slice_image_sahi(frame, slice_height, slice_width, overlap_height_ratio, overlap_width_ratio)
-        all_boxes = []
-        all_class_ids = []
-        for patch, x_offset, y_offset in patches:
-            input_image = preprocess_yolo_input(patch, (slice_width, slice_height))
-            if self.session is None:
-                raise RuntimeError("Model not loaded")
-            input_name = self.session.get_inputs()[0].name
-            outputs = self.session.run(None, {input_name: input_image})
-            boxes, scores, class_ids = postprocess_yolo_output(
-                outputs[0],
-                patch.shape,
-                input_size=(slice_width, slice_height),
-                conf_threshold=confidence_threshold,
-                nms_threshold=0.45
-            )
-            # Map boxes to original image coordinates
-            for box, cid in zip(boxes, class_ids):
-                if cid == 0:
-                    x1, y1, x2, y2 = box
-                    x1 += x_offset
-                    x2 += x_offset
-                    y1 += y_offset
-                    y2 += y_offset
-                    all_boxes.append((x1, y1, x2, y2))
-                    all_class_ids.append(cid)
-        # Optionally: merge overlapping boxes (simple NMS on all_boxes)
-        if all_boxes:
-            boxes_nms_input = np.array([[b[0], b[1], b[2]-b[0], b[3]-b[1]] for b in all_boxes])
-            scores_dummy = [1.0]*len(all_boxes)
-            indices = cv2.dnn.NMSBoxes(boxes_nms_input.tolist(), scores_dummy, 0.1, 0.5)
-            if len(indices) > 0:
-                indices = indices.flatten()
-                all_boxes = [all_boxes[i] for i in indices]
-        return all_boxes
-
+        # Preprocess the frame
+        input_shape = (640, 640)  # Standard YOLO input size
+        resized_frame = cv2.resize(frame, input_shape)
+        input_image = resized_frame.astype(np.float32) / 255.0
+        input_image = np.transpose(input_image, (2, 0, 1))  # HWC to CHW
+        input_image = np.expand_dims(input_image, axis=0)  # Add batch dimension
+        
+        # Run inference
+        if self.session is None:
+            raise RuntimeError("Model not loaded")
+            
+        input_name = self.session.get_inputs()[0].name
+        outputs = self.session.run(None, {input_name: input_image})
+        
+        # Post-process detections
+        player_boxes = self._postprocess_detections(
+            outputs, 
+            frame.shape[1], 
+            frame.shape[0],
+            input_shape[0],
+            input_shape[1],
+            confidence_threshold
+        )
+        
+        return player_boxes
+    
+    def _postprocess_detections(self, outputs: List[np.ndarray], 
+                               orig_width: int, orig_height: int,
+                               input_width: int, input_height: int,
+                               confidence_threshold: float) -> List[Tuple[int, int, int, int]]:
+        """
+        Post-process YOLO detections to extract player bounding boxes.
+        
+        Args:
+            outputs: Model outputs
+            orig_width: Original frame width
+            orig_height: Original frame height
+            input_width: Model input width
+            input_height: Model input height
+            confidence_threshold: Minimum confidence threshold
+            
+        Returns:
+            List of player bounding boxes (x, y, w, h)
+        """
+        # This is a simplified implementation
+        # In practice, you would need to decode the YOLO output properly
+        # based on the specific model architecture
+        
+        player_boxes = []
+        
+        # Assuming outputs[0] contains the detection results
+        # Format: [batch, num_detections, 6] where 6 is [x1, y1, x2, y2, confidence, class_id]
+        if len(outputs) > 0 and outputs[0] is not None:
+            detections = outputs[0][0]  # First batch
+            
+            for detection in detections:
+                if len(detection) >= 6:
+                    x1, y1, x2, y2, conf, class_id = detection[:6]
+                    
+                    # Filter by confidence and class (person class ID is typically 0 in COCO)
+                    if conf > confidence_threshold and int(class_id) == 0:  # Person class
+                        # Convert coordinates to original frame size
+                        x1_orig = int(x1 * orig_width / input_width)
+                        y1_orig = int(y1 * orig_height / input_height)
+                        x2_orig = int(x2 * orig_width / input_width)
+                        y2_orig = int(y2 * orig_height / input_height)
+                        
+                        # Convert to (x, y, w, h) format
+                        x = x1_orig
+                        y = y1_orig
+                        w = x2_orig - x1_orig
+                        h = y2_orig - y1_orig
+                        
+                        player_boxes.append((x, y, w, h))
+                
+        return player_boxes
+    
     def get_player_position(self, bbox: Tuple[int, int, int, int]) -> Tuple[int, int]:
         """
         Get the player position as the center of the bottom edge of the bounding box.
         
         Args:
-            bbox: Bounding box (x1, y1, x2, y2)
+            bbox: Bounding box (x, y, w, h)
             
         Returns:
             Player position (x, y) at the center of bottom edge
         """
-        x1, y1, x2, y2 = bbox
-        player_x = (x1 + x2) // 2
-        player_y = y2
+        x, y, w, h = bbox
+        # Center of the bottom edge
+        player_x = x + w // 2
+        player_y = y + h
         return (player_x, player_y)
     
     def set_transformation_matrix(self, video_points: np.ndarray, court_points: np.ndarray):
@@ -208,6 +298,35 @@ class PlayerTracker:
             video_points.astype(np.float32), 
             court_points.astype(np.float32)
         )
+    
+    def set_court_boundary(self, court_points: np.ndarray):
+        """
+        Set the court boundary points for filtering players within the court.
+        
+        Args:
+            court_points: 4 points defining the court boundary
+        """
+        self.court_boundary = court_points
+    
+    def is_within_court(self, point: Tuple[int, int]) -> bool:
+        """
+        Check if a point is within the court boundary.
+        
+        Args:
+            point: Point coordinates (x, y)
+            
+        Returns:
+            True if point is within court boundary, False otherwise
+        """
+        if self.court_boundary is None:
+            return True  # If no boundary defined, assume all points are valid
+            
+        # Convert point to numpy array
+        pt = np.array([point], dtype=np.float32)
+        
+        # Check if point is inside the polygon defined by court_boundary
+        result = cv2.pointPolygonTest(self.court_boundary, tuple(pt[0]), False)
+        return result >= 0  # >= 0 means point is inside or on the boundary
     
     def transform_to_court(self, point: Tuple[int, int]) -> Optional[Tuple[int, int]]:
         """
@@ -234,7 +353,7 @@ class PlayerTracker:
     
     def draw_player_positions(self, frame: np.ndarray, player_boxes: List[Tuple[int, int, int, int]]) -> np.ndarray:
         """
-        Draw player positions on the frame.
+        Draw player positions on the frame (without bounding boxes).
         
         Args:
             frame: Input frame
@@ -245,26 +364,58 @@ class PlayerTracker:
         """
         output_frame = frame.copy()
         
-        for bbox in player_boxes:
-            position = self.get_player_position(bbox)
-            x1, y1, x2, y2 = bbox
-            cv2.rectangle(output_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.circle(output_frame, position, 5, (0, 0, 255), -1)
-
+        # Get player positions (center of bottom edge)
+        player_positions = [self.get_player_position(bbox) for bbox in player_boxes]
+        
+        # Filter positions to only include players within court
+        valid_positions = []
+        valid_indices = []
+        
+        for i, pos in enumerate(player_positions):
+            if self.is_within_court(pos):
+                valid_positions.append(pos)
+                valid_indices.append(i)
+        
+        # Update tracker with valid positions
+        self.frame_count += 1
+        id_mapping = self.tracker.update(valid_positions, self.frame_count)
+        
+        # Draw player positions with IDs
+        for i, pos in enumerate(valid_positions):
+            # Get player ID
+            player_id = id_mapping.get(i, -1)
+            
+            # Draw player position point
+            cv2.circle(output_frame, pos, 5, (0, 0, 255), -1)
+            
+            # Draw player ID
+            if player_id >= 0:
+                cv2.putText(output_frame, f"ID: {player_id}", 
+                           (pos[0] + 10, pos[1] - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
             # If transformation matrix is available, also draw on court
             if self.transformation_matrix is not None and self.court_image is not None:
-                court_pos = self.transform_to_court(position)
+                court_pos = self.transform_to_court(pos)
                 if court_pos:
+                    # Create overlay of court on frame
                     court_overlay = self.court_image.copy()
                     cv2.circle(court_overlay, court_pos, 5, (0, 0, 255), -1)
+                    cv2.putText(court_overlay, f"ID: {player_id}", 
+                               (court_pos[0] + 10, court_pos[1] - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    
+                    # Resize court overlay to fit in corner of frame
                     court_h, court_w = court_overlay.shape[:2]
                     scale_factor = 0.2
                     new_court_w = int(court_w * scale_factor)
                     new_court_h = int(court_h * scale_factor)
                     resized_court = cv2.resize(court_overlay, (new_court_w, new_court_h))
+                    
+                    # Place court in top-right corner
                     if output_frame.shape[0] > new_court_h + 10 and output_frame.shape[1] > new_court_w + 10:
                         output_frame[10:10+new_court_h, -10-new_court_w:-10] = resized_court
-
+                    
         return output_frame
 
 
@@ -281,9 +432,10 @@ def main():
     court_points = np.array([[50, 50], [50, 350], [450, 350], [450, 50]])
     
     tracker.set_transformation_matrix(video_points, court_points)
+    tracker.set_court_boundary(court_points)
     
     # Process video
-    cap = cv2.VideoCapture("video/bl_transhsmash_volar_woman_g2.mp4")
+    cap = cv2.VideoCapture("path/to/video.mp4")
     
     while cap.isOpened():
         ret, frame = cap.read()
