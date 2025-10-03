@@ -8,6 +8,7 @@ High-speed volleyball ball detection and tracking using an optimized ONNX model,
 - **Optimized for CPU**: Lightweight ONNX model designed for grayscale video input.
 - **Flexible Output**: Saves ball coordinates to CSV for analysis; optional video visualization.
 - **Customizable**: Adjustable track length for visualization.
+- **Pose Detection**: Detect player poses when ball is near using MediaPipe.
 - **Easy to Use**: Simple command-line interface with clear options.
 
 
@@ -38,20 +39,51 @@ High-speed volleyball ball detection and tracking using an optimized ONNX model,
 
 ## Usage
 
+### Ball Tracking
+
 Run the inference script to detect and track a volleyball ball in a video:
 
 ```bash
 uv run src/inference_onnx_seq9_gray_v2.py --video_path  examples/beach_st_lenina_20250622_g1_005.mp4 --model_path  models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx --output_dir output/
 ```
 
-#### Run the inference script to detect and track a volleyball ball  Realtime visualize:
+#### Run the inference script to detect and track a volleyball ball with Realtime visualization:
 
 ```bash
 uv run src/inference_onnx_seq9_gray_v2.py --video_path  examples/beach_st_lenina_20250622_g1_005.mp4 --model_path  models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx --visualize
 ```
 
+### Pose Detection
 
-### Command-Line Options
+Run pose detection on existing track files:
+
+```bash
+uv run main.py --mode pose --track_file track_json/track_0037.json --video_path examples/beach_st_lenina_20250622_g1_005.mp4 --visualize
+```
+
+### Command-Line Options for Main Script
+```
+usage: main.py [-h] [--mode {track,pose,analyze}] [--video_path VIDEO_PATH] [--track_file TRACK_FILE] [--model_path MODEL_PATH]
+               [--output_dir OUTPUT_DIR] [--visualize]
+
+Fast Volleyball Tracking Inference
+
+options:
+  -h, --help            show this help message and exit
+  --mode {track,pose,analyze}
+                        Processing mode
+  --video_path VIDEO_PATH
+                        Path to input video file
+  --track_file TRACK_FILE
+                        Path to track JSON file (for pose mode)
+  --model_path MODEL_PATH
+                        Path to ONNX model file
+  --output_dir OUTPUT_DIR
+                        Directory to save output files
+  --visualize           Enable visualization on display using cv2
+```
+
+### Command-Line Options for Ball Tracking
 ```
 usage: inference_onnx_seq9_gray_v2.py [-h] --video_path VIDEO_PATH [--track_length TRACK_LENGTH] [--output_dir OUTPUT_DIR] --model_path MODEL_PATH
                                       [--visualize] [--only_csv]
@@ -74,10 +106,10 @@ options:
 
 ### Example
 ```bash
-uv run src/inference_onnx_seq9_gray_v2.py --video_path examples/sample_video.mp4 --model_path weights/model.onnx --output_dir output/ --track_length 10 --visualize
+uv run main.py --mode pose --track_file track_json/track_0037.json --video_path examples/beach_st_lenina_20250622_g1_005.mp4 --visualize
 ```
 
-This command processes `sample_video.mp4`, saves ball coordinates to `output/coordinates.csv`, and displays a visualized video with a track length of 10 frames.
+This command processes the track file `track_0037.json` with the video, detects player poses when the ball is near, and displays visualization with both ball position and player poses.
 
 ## Output
 - **CSV File**: Contains frame ID and ball coordinates (x, y).
@@ -91,6 +123,7 @@ Frame,Visibility,X,Y
 1008,1,1065,487
 ```
 - **Video (Optional)**: Visualized output with tracked ball path, saved to `output/`.
+- **Pose Data**: JSON files with pose detection results when ball is near players.
 
 ## Repository Structure
 ```
@@ -110,6 +143,7 @@ fast-volleyball-tracking-inference/
 ├── README.md
 ├── src
 │   ├── inference_onnx.py
+│   ├── pose_detector.py
 │   └── inference_onnx_seq9_gray_v2.py
 └── uv.lock
 ```
@@ -121,6 +155,8 @@ fast-volleyball-tracking-inference/
   - `opencv-python>=4.12.0.88`
   - `pandas>=2.3.1`
   - `tqdm>=4.67.1`
+  - `mediapipe>=0.10.14`
+  - `scipy>=1.14.1`
 
 Install via:
 ```bash

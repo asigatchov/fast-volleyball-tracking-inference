@@ -8,7 +8,8 @@ import numpy as np
 import mediapipe as mp
 import json
 import os
-from typing import List, Tuple, Dict, Optional
+import argparse
+from typing import List, Tuple, Dict, Optional, Union
 from scipy.spatial import distance
 
 
@@ -159,8 +160,26 @@ class PoseDetector:
                     
         return output_frame
 
+    def draw_ball_position(self, frame: np.ndarray, ball_pos: Tuple[int, int]) -> np.ndarray:
+        """
+        Draw ball position on frame.
+        
+        Args:
+            frame: Input frame
+            ball_pos: Ball position (x, y)
+            
+        Returns:
+            Frame with ball position drawn
+        """
+        output_frame = frame.copy()
+        if ball_pos and ball_pos[0] >= 0 and ball_pos[1] >= 0:
+            cv2.circle(output_frame, ball_pos, 8, (255, 0, 0), -1)  # Blue circle for ball
+            cv2.putText(output_frame, "Ball", (ball_pos[0] + 10, ball_pos[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        return output_frame
 
-def add_pose_to_track_json(track_file: str, video_path: str, output_dir: str = "track_json_with_pose"):
+
+def add_pose_to_track_json(track_file: str, video_path: str, output_dir: str = "track_json_with_pose", visualize: bool = False):
     """
     Add pose detection to existing track JSON files.
     
@@ -168,6 +187,7 @@ def add_pose_to_track_json(track_file: str, video_path: str, output_dir: str = "
         track_file: Path to track JSON file
         video_path: Path to video file
         output_dir: Directory to save updated JSON files
+        visualize: Whether to visualize frames with cv2
     """
     # Load track data
     with open(track_file, 'r') as f:
@@ -182,8 +202,18 @@ def add_pose_to_track_json(track_file: str, video_path: str, output_dir: str = "
         raise ValueError(f"Could not open video: {video_path}")
     
     # Process each position in the track
-    for i, (position, frame_num) in enumerate(track_data["positions"]):
-        ball_x, ball_y = position
+    for i, position_data in enumerate(track_data["positions"]):
+        # Handle both old and new format
+        if isinstance(position_data, list) and len(position_data) == 2:
+            # Old format: [position, frame_num]
+            ball_position = position_data[0]
+            frame_num = position_data[1]
+        else:
+            # New format: {"ball_position": [...], "frame_num": ..., ...}
+            ball_position = position_data.get("ball_position", [0, 0]) if isinstance(position_data, dict) else [0, 0]
+            frame_num = position_data.get("frame_num", 0) if isinstance(position_data, dict) else 0
+        
+        ball_x, ball_y = ball_position
         
         # Seek to the correct frame
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
@@ -210,17 +240,37 @@ def add_pose_to_track_json(track_file: str, video_path: str, output_dir: str = "
             
             # Add pose data to track
             track_data["positions"][i] = {
-                "ball_position": position,
+                "ball_position": ball_position,
                 "frame_num": frame_num,
                 "pose_data": pose_data
             }
+            
+            # Visualize if requested
+            if visualize:
+                # Draw ball position
+                vis_frame = pose_detector.draw_ball_position(frame, (int(ball_x), int(ball_y)))
+                
+                # Draw pose if detected
+                vis_frame = pose_detector.draw_pose_landmarks(vis_frame, pose_data)
+                
+                # Show frame
+                cv2.imshow("Pose Detection", vis_frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
         else:
             # No nearby player, just store ball position
             track_data["positions"][i] = {
-                "ball_position": position,
+                "ball_position": ball_position,
                 "frame_num": frame_num,
                 "pose_data": None
             }
+            
+            # Visualize ball position only
+            if visualize:
+                vis_frame = pose_detector.draw_ball_position(frame, (int(ball_x), int(ball_y)))
+                cv2.imshow("Pose Detection", vis_frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
     
     # Save updated track data
     os.makedirs(output_dir, exist_ok=True)
@@ -229,23 +279,40 @@ def add_pose_to_track_json(track_file: str, video_path: str, output_dir: str = "
     with open(output_file, 'w') as f:
         json.dump(track_data, f, indent=2)
     
+    if visualize:
+        cv2.destroyAllWindows()
+        
     cap.release()
     print(f"Saved updated track with pose data to: {output_file}")
 
 
 def main():
     """Example usage of the PoseDetector."""
+    parser = argparse.ArgumentParser(description="Volleyball Pose Detection")
+    parser.add_argument("--track_file", type=str, help="Path to track JSON file")
+    parser.add_argument("--video_path", type=str, help="Path to video file")
+    parser.add_argument("--visualize", action="store_true", help="Enable visualization")
+    
+    args = parser.parse_args()
+    
     # Example usage
     pose_detector = PoseDetector()
     
-    # Process a track file
-    track_file = "track_json/track_0229.json"
-    video_path = "path/to/video.mp4"  # You would provide the actual video path
-    
-    if os.path.exists(track_file):
-        add_pose_to_track_json(track_file, video_path)
+    # Process a track file if provided
+    if args.track_file and args.video_path:
+        if os.path.exists(args.track_file):
+            add_pose_to_track_json(args.track_file, args.video_path, visualize=args.visualize)
+        else:
+            print(f"Track file not found: {args.track_file}")
     else:
-        print(f"Track file not found: {track_file}")
+        # Process a track file
+        track_file = "track_json/track_0229.json"
+        video_path = "path/to/video.mp4"  # You would provide the actual video path
+        
+        if os.path.exists(track_file):
+            add_pose_to_track_json(track_file, video_path)
+        else:
+            print(f"Track file not found: {track_file}")
 
 
 if __name__ == "__main__":
