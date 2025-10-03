@@ -429,13 +429,14 @@ def main():
     
     # Example points for transformation (you would select these interactively)
     video_points = np.array([[100, 100], [100, 400], [500, 400], [500, 100]])
-    court_points = np.array([[50, 50], [50, 350], [450, 350], [450, 50]])
+    
+    court_points = np.array([[[68.0, 575.0], [69.0, 46.0], [333.0, 46.0], [333.0, 576.0]]])
     
     tracker.set_transformation_matrix(video_points, court_points)
     tracker.set_court_boundary(court_points)
     
     # Process video
-    cap = cv2.VideoCapture("path/to/video.mp4")
+    cap = cv2.VideoCapture("video/bl_transhsmash_volar_woman_g2.mp4")
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -444,7 +445,7 @@ def main():
             
         # Detect players
         player_boxes = tracker.detect_players(frame)
-        
+        print(player_boxes)
         # Draw player positions
         output_frame = tracker.draw_player_positions(frame, player_boxes)
         
