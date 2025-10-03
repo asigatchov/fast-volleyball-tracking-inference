@@ -313,9 +313,10 @@ def main(video_path, track_json_path=None):
             player_boxes = player_tracker.detect_players_in_crop(frame, (x1, y1, x2, y2), ball_position)
             print("Detected players in crop region at frame", player_boxes)
         else:
+            pass
             # For non-event frames, we could skip detection or do full frame detection
             # For now, we'll do full frame detection to maintain continuity
-            player_boxes = player_tracker.detect_players(frame)
+            #player_boxes = player_tracker.detect_players(frame)
         
         # Draw player positions, highlighting the nearest player to the ball during events
         output_frame = player_tracker.draw_player_positions(
