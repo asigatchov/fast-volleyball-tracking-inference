@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 import os
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 from scipy.spatial import distance
 
 
@@ -10,20 +10,20 @@ class Player:
     """Represents a tracked player with ID and position."""
     
     def __init__(self, player_id: int, position: Tuple[int, int]):
-        self.player_id = player_id
-        self.position = position
-        self.last_seen = 0
-        self.positions_history = [position]
+        self.player_id: int = player_id
+        self.position: Tuple[int, int] = position
+        self.last_seen: int = 0
+        self.positions_history: List[Tuple[int, int]] = [position]
 
 
 class SimpleTracker:
     """Simple tracker for player IDs using position proximity."""
     
     def __init__(self, max_disappeared: int = 30, max_distance: float = 100):
-        self.next_id = 0
+        self.next_id: int = 0
         self.players: Dict[int, Player] = {}
-        self.max_disappeared = max_disappeared
-        self.max_distance = max_distance
+        self.max_disappeared: int = max_disappeared
+        self.max_distance: float = max_distance
         self.disappeared_count: Dict[int, int] = {}
         
     def update(self, positions: List[Tuple[int, int]], frame_count: int) -> Dict[int, int]:
@@ -62,15 +62,13 @@ class SimpleTracker:
         player_positions = [self.players[pid].position for pid in player_ids]
         
         # Calculate distance matrix
+        # Fix: ensure dist_matrix is not empty before np.min
         if len(positions) > 0 and len(player_positions) > 0:
             dist_matrix = distance.cdist(player_positions, positions)
-            
-            # Assign positions to players
             assigned_positions = set()
             assigned_players = set()
-            
             # Greedy assignment based on minimum distance
-            while np.min(dist_matrix) <= self.max_distance:
+            while dist_matrix.size > 0 and np.min(dist_matrix) <= self.max_distance:
                 # Find minimum distance
                 min_idx = np.unravel_index(np.argmin(dist_matrix), dist_matrix.shape)
                 player_idx, pos_idx = min_idx
@@ -229,7 +227,7 @@ class PlayerTracker:
             input_shape[1],
             confidence_threshold
         )
-        
+        print("Detected players in crop:", player_boxes)
         return player_boxes
     
     def _postprocess_detections_crop(self, outputs: List[np.ndarray], 
@@ -237,57 +235,44 @@ class PlayerTracker:
                                     orig_width: int, orig_height: int,
                                     input_width: int, input_height: int,
                                     confidence_threshold: float) -> List[Tuple[int, int, int, int]]:
-        """
-        Post-process YOLO detections from crop and convert to original frame coordinates.
-        
-        Args:
-            outputs: Model outputs
-            offset_x: X offset of crop in original frame
-            offset_y: Y offset of crop in original frame
-            orig_width: Crop width
-            orig_height: Crop height
-            input_width: Model input width
-            input_height: Model input height
-            confidence_threshold: Minimum confidence threshold
-            
-        Returns:
-            List of player bounding boxes (x, y, w, h) in original frame coordinates
-        """
         player_boxes = []
         
-        # Assuming outputs[0] contains the detection results
-        # Format: [batch, num_detections, 6] where 6 is [x1, y1, x2, y2, confidence, class_id]
+        print("Outputs shape:", [o.shape if isinstance(o, np.ndarray) else "None" for o in outputs])
         if len(outputs) > 0 and outputs[0] is not None:
-            detections = outputs[0][0]  # First batch
+            detections = outputs[0][0]
+            #print("Detections shape:", detections.shape if isinstance(detections, np.ndarray) else len(detections))
+            #print("Sample detection:", detections[0] if len(detections) > 0 else "No detections")
             
             for detection in detections:
                 if len(detection) >= 6:
                     x1, y1, x2, y2, conf, class_id = detection[:6]
-                    
-                    # Filter by confidence and class (person class ID is typically 0 in COCO)
-                    if conf > confidence_threshold and int(class_id) == 0:  # Person class
-                        # Convert coordinates to crop size
+                    if conf > confidence_threshold and int(class_id) == 0:
+                   
                         x1_crop = int(x1 * orig_width / input_width)
                         y1_crop = int(y1 * orig_height / input_height)
                         x2_crop = int(x2 * orig_width / input_width)
                         y2_crop = int(y2 * orig_height / input_height)
                         
-                        # Convert to original frame coordinates
                         x1_orig = x1_crop + offset_x
                         y1_orig = y1_crop + offset_y
                         x2_orig = x2_crop + offset_x
                         y2_orig = y2_crop + offset_y
                         
-                        # Convert to (x, y, w, h) format
                         x = x1_orig
                         y = y1_orig
                         w = x2_orig - x1_orig
                         h = y2_orig - y1_orig
-                        
+                        print(f"Detection in crop: x1={x1_orig}, y1={y1_orig}, x2={x2_orig}, y2={y2_orig}, conf={conf}, class_id={class_id}")
                         player_boxes.append((x, y, w, h))
-                
+
+                else:
+                    print(f"Invalid detection length: {len(detection)}")
+        else:
+            print("No valid outputs from model")
+        
+        print("Final player boxes:", player_boxes)
         return player_boxes
-    
+        
     def detect_players(self, frame: np.ndarray, confidence_threshold: float = 0.5) -> List[Tuple[int, int, int, int]]:
         """
         Detect players in a frame using YOLO model.
@@ -300,36 +285,26 @@ class PlayerTracker:
         Returns:
             List of bounding boxes (x, y, w, h) for detected players
         """
-        # For optimization, we could cache results, but for now we'll process full frame
-        # In a real implementation, we would only detect in crop regions during events
-        
-        # Preprocess the frame
-        input_shape = (640, 640)  # Standard YOLO input size
-        resized_frame = cv2.resize(frame, input_shape)
-        input_image = resized_frame.astype(np.float32) / 255.0
-        input_image = np.transpose(input_image, (2, 0, 1))  # HWC to CHW
-        input_image = np.expand_dims(input_image, axis=0)  # Add batch dimension
-        
-        # Run inference
+        input_shape: Tuple[int, int] = (640, 640)
+        resized_frame: np.ndarray = cv2.resize(frame, input_shape)
+        input_image: np.ndarray = resized_frame.astype(np.float32) / 255.0
+        input_image = np.transpose(input_image, (2, 0, 1))
+        input_image = np.expand_dims(input_image, axis=0)
         if self.session is None:
             raise RuntimeError("Model not loaded")
-            
-        input_name = self.session.get_inputs()[0].name
-        outputs = self.session.run(None, {input_name: input_image})
-        
-        # Post-process detections
-        player_boxes = self._postprocess_detections(
-            outputs, 
-            frame.shape[1], 
+        input_name: str = self.session.get_inputs()[0].name
+        outputs: List[Any] = self.session.run(None, {input_name: input_image})
+        player_boxes: List[Tuple[int, int, int, int]] = self._postprocess_detections(
+            outputs,
+            frame.shape[1],
             frame.shape[0],
             input_shape[0],
             input_shape[1],
             confidence_threshold
         )
-        
         return player_boxes
-    
-    def _postprocess_detections(self, outputs: List[np.ndarray], 
+
+    def _postprocess_detections(self, outputs: List[np.ndarray],
                                orig_width: int, orig_height: int,
                                input_width: int, input_height: int,
                                confidence_threshold: float) -> List[Tuple[int, int, int, int]]:
@@ -347,35 +322,24 @@ class PlayerTracker:
         Returns:
             List of player bounding boxes (x, y, w, h)
         """
-        # This is a simplified implementation
-        # In practice, you would need to decode the YOLO output properly
-        # based on the specific model architecture
-        
-        player_boxes = []
-        
-        # Assuming outputs[0] contains the detection results
-        # Format: [batch, num_detections, 6] where 6 is [x1, y1, x2, y2, confidence, class_id]
+        player_boxes: List[Tuple[int, int, int, int]] = []
         if len(outputs) > 0 and outputs[0] is not None:
-            detections = outputs[0][0]  # First batch
-            
+            detections = outputs[0][0]
             for detection in detections:
-                if len(detection) >= 6:
+                if isinstance(detection, (np.ndarray, list)) and len(detection) >= 6:
                     x1, y1, x2, y2, conf, class_id = detection[:6]
-                    
-                    # Filter by confidence and class (person class ID is typically 0 in COCO)
-                    if conf > confidence_threshold and int(class_id) == 0:  # Person class
-                        # Convert coordinates to original frame size
-                        x1_orig = int(x1 * orig_width / input_width)
-                        y1_orig = int(y1 * orig_height / input_height)
-                        x2_orig = int(x2 * orig_width / input_width)
-                        y2_orig = int(y2 * orig_height / input_height)
-                        
-                        # Convert to (x, y, w, h) format
+                    # Fix: ensure types are correct for comparison
+                    conf = float(conf)
+                    class_id = int(class_id)
+                    if conf > confidence_threshold and class_id == 0:
+                        x1_orig = int(float(x1) * orig_width / input_width)
+                        y1_orig = int(float(y1) * orig_height / input_height)
+                        x2_orig = int(float(x2) * orig_width / input_width)
+                        y2_orig = int(float(y2) * orig_height / input_height)
                         x = x1_orig
                         y = y1_orig
                         w = x2_orig - x1_orig
                         h = y2_orig - y1_orig
-                        
                         player_boxes.append((x, y, w, h))
                 
         return player_boxes
@@ -391,9 +355,8 @@ class PlayerTracker:
             Player position (x, y) at the center of bottom edge
         """
         x, y, w, h = bbox
-        # Center of the bottom edge
-        player_x = x + w // 2
-        player_y = y + h
+        player_x: int = x + w // 2
+        player_y: int = y + h
         return (player_x, player_y)
     
     def calculate_distance(self, point1: Tuple[float, float], point2: Tuple[float, float]) -> float:
