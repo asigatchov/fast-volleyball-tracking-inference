@@ -145,10 +145,11 @@ def initialize_mediapipe():
         mp_drawing = mp.solutions.drawing_utils
         mp_drawing_styles = mp.solutions.drawing_styles
         pose = mp_pose.Pose(
-            static_image_mode=True,
-            model_complexity=1,
+                 static_image_mode=False,          # ← ВАЖНО: False для видео
+            model_complexity=2,               # Лучше использовать 2 для точности
             enable_segmentation=False,
-            min_detection_confidence=0.5
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5       # ← Обязательно в видео-режиме
         )
         return True
     except Exception as e:
