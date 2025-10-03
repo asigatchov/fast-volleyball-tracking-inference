@@ -145,11 +145,10 @@ def initialize_mediapipe():
         mp_drawing = mp.solutions.drawing_utils
         mp_drawing_styles = mp.solutions.drawing_styles
         pose = mp_pose.Pose(
-                 static_image_mode=False,          # ← ВАЖНО: False для видео
-            model_complexity=2,               # Лучше использовать 2 для точности
+            static_image_mode=True,
+            model_complexity=1,
             enable_segmentation=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5       # ← Обязательно в видео-режиме
+            min_detection_confidence=0.5
         )
         return True
     except Exception as e:
@@ -170,7 +169,7 @@ def process_pose_estimation(frame, x1, y1, x2, y2):
     """
     global pose, mp_pose, mp_drawing, mp_drawing_styles
     
-    if not MEDIAPIPE_AVAILABLE or pose is None:
+    if not MEDIAPIPE_AVAILABLE or pose is None or mp_drawing is None or mp_pose is None:
         return frame
     
     # Extract crop region
@@ -183,10 +182,16 @@ def process_pose_estimation(frame, x1, y1, x2, y2):
     results = pose.process(rgb_crop)
     
     # Draw pose landmarks on the crop
-    if results.pose_landmarks and mp_drawing and mp_pose:
+    if results.pose_landmarks:
+        # Use a default drawing spec if mp_drawing_styles is not available
+        if mp_drawing_styles is not None:
+            drawing_spec = mp_drawing_styles.get_default_pose_landmarks_style()
+        else:
+            drawing_spec = None
+            
         mp_drawing.draw_landmarks(
             crop, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
-            landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
+            landmark_drawing_spec=drawing_spec)
     
     # Place the processed crop back into the frame
     frame[y1:y2, x1:x2] = crop
@@ -279,8 +284,42 @@ def main(video_path, track_json_path=None):
         if last_frame != -1 and frame_count > last_frame:
             break
 
-        player_boxes = player_tracker.detect_players(frame)
-        output_frame = player_tracker.draw_player_positions(frame, player_boxes)
+        # Only detect players in crop region during direction change events
+        player_boxes = []
+        ball_position = None
+        if frame_count in frame_to_box:
+            # Get ball position for this frame
+            cx, cy = frame_to_box[frame_count]['center']
+            ball_position = (int(cx), int(cy))
+            
+            # Define crop region for player detection
+            box_cx = cx
+            box_cy = cy + 150  # Shifted down as in original code
+            
+            box_size = 640
+            x1 = int(box_cx - box_size // 2)
+            y1 = int(box_cy - box_size // 2)
+            x2 = x1 + box_size
+            y2 = y1 + box_size
+            
+            # Clip to frame boundaries
+            h, w = frame.shape[:2]
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(w, x2)
+            y2 = min(h, y2)
+            
+            # Detect players only in the crop region
+            player_boxes = player_tracker.detect_players_in_crop(frame, (x1, y1, x2, y2), ball_position)
+        else:
+            # For non-event frames, we could skip detection or do full frame detection
+            # For now, we'll do full frame detection to maintain continuity
+            player_boxes = player_tracker.detect_players(frame)
+        
+        # Draw player positions, highlighting the nearest player to the ball during events
+        output_frame = player_tracker.draw_player_positions(
+            frame, player_boxes, ball_position, highlight_nearest=(frame_count in frame_to_box)
+        )
 
         h, w = output_frame.shape[:2]
 
