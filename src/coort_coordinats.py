@@ -7,6 +7,15 @@ from pathlib import Path
 
 from player_tracker import PlayerTracker
 
+# Add MediaPipe imports
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    MEDIAPIPE_AVAILABLE = False
+    print("Warning: MediaPipe not available. Pose estimation will be disabled.")
+    mp = None
+
 
 def select_points(image, title, num_points=4):
     points = []
@@ -117,7 +126,81 @@ def build_frame_to_box_info(direction_changes, window=10):
     return frame_info
 
 
+# Global variables for MediaPipe pose estimation
+mp_pose = None
+mp_drawing = None
+mp_drawing_styles = None
+pose = None
+
+
+def initialize_mediapipe():
+    """Initialize MediaPipe components for pose estimation."""
+    global mp_pose, mp_drawing, mp_drawing_styles, pose
+    
+    if not MEDIAPIPE_AVAILABLE or mp is None:
+        return False
+        
+    try:
+        mp_pose = mp.solutions.pose
+        mp_drawing = mp.solutions.drawing_utils
+        mp_drawing_styles = mp.solutions.drawing_styles
+        pose = mp_pose.Pose(
+            static_image_mode=True,
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.5
+        )
+        return True
+    except Exception as e:
+        print(f"Error initializing MediaPipe: {e}")
+        return False
+
+
+def process_pose_estimation(frame, x1, y1, x2, y2):
+    """
+    Process pose estimation for a crop region using MediaPipe.
+    
+    Args:
+        frame: Input frame
+        x1, y1, x2, y2: Crop region coordinates
+        
+    Returns:
+        Frame with pose landmarks drawn (if MediaPipe is available)
+    """
+    global pose, mp_pose, mp_drawing, mp_drawing_styles
+    
+    if not MEDIAPIPE_AVAILABLE or pose is None:
+        return frame
+    
+    # Extract crop region
+    crop = frame[y1:y2, x1:x2]
+    
+    # Convert BGR to RGB for MediaPipe
+    rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    
+    # Process with MediaPipe
+    results = pose.process(rgb_crop)
+    
+    # Draw pose landmarks on the crop
+    if results.pose_landmarks and mp_drawing and mp_pose:
+        mp_drawing.draw_landmarks(
+            crop, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+            landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
+    
+    # Place the processed crop back into the frame
+    frame[y1:y2, x1:x2] = crop
+    
+    return frame
+
+
 def main(video_path, track_json_path=None):
+    # Initialize MediaPipe if available
+    if MEDIAPIPE_AVAILABLE:
+        if initialize_mediapipe():
+            print("MediaPipe pose estimation initialized successfully")
+        else:
+            print("Failed to initialize MediaPipe pose estimation")
+    
     cache_file = get_cache_filename(video_path)
     video_points_cache_file = get_video_points_cache_filename(video_path)
 
@@ -225,6 +308,10 @@ def main(video_path, track_json_path=None):
             # Цвет: синий до события, зелёный — в событии и после
             color = (255, 0, 0) if offset < 0 else (0, 255, 0)  # BGR
             cv2.rectangle(output_frame, (x1, y1), (x2, y2), color, 2)
+
+            # Process pose estimation for the crop region when at/after direction change
+            if offset >= 0 and MEDIAPIPE_AVAILABLE and pose is not None:
+                output_frame = process_pose_estimation(output_frame, x1, y1, x2, y2)
 
             # Пауза на 0.5 сек при смене направления (offset == 0)
             if offset == 0:

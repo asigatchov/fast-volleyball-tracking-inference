@@ -9,6 +9,7 @@ High-speed volleyball ball detection and tracking using an optimized ONNX model,
 - **Flexible Output**: Saves ball coordinates to CSV for analysis; optional video visualization.
 - **Customizable**: Adjustable track length for visualization.
 - **Pose Detection**: Detect player poses when ball is near using MediaPipe.
+- **Direction Change Analysis**: Identify and visualize ball direction changes with pose detection.
 - **Easy to Use**: Simple command-line interface with clear options.
 
 
@@ -60,6 +61,16 @@ Run pose detection on existing track files:
 ```bash
 uv run main.py --mode pose --track_file track_json/track_0037.json --video_path examples/beach_st_lenina_20250622_g1_005.mp4 --visualize
 ```
+
+### Direction Change Pose Detection
+
+Detect ball direction changes and visualize poses around these points:
+
+```bash
+uv run test_direction_change_pose.py --video_path examples/beach_st_lenina_20250622_g1_005.mp4 --track_json track_json/track_0037.json --visualize
+```
+
+For more details, see [DIRECTION_CHANGE_POSE_DETECTION.md](DIRECTION_CHANGE_POSE_DETECTION.md)
 
 ### Command-Line Options for Main Script
 ```
@@ -124,6 +135,7 @@ Frame,Visibility,X,Y
 ```
 - **Video (Optional)**: Visualized output with tracked ball path, saved to `output/`.
 - **Pose Data**: JSON files with pose detection results when ball is near players.
+- **Direction Change Data**: Visualization of ball direction changes with pose detection in surrounding frames.
 
 ## Repository Structure
 ```
