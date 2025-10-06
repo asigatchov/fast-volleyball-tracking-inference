@@ -4,11 +4,9 @@ import argparse
 import numpy as np
 from scipy.signal import find_peaks
 import matplotlib
-
-matplotlib.use("Agg")  # Используем бэкенд без GUI
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -22,7 +20,6 @@ def parse_args():
     )
     return parser.parse_args()
 
-
 def load_track(track_path: str):
     with open(track_path, "r") as f:
         track = json.load(f)
@@ -30,7 +27,6 @@ def load_track(track_path: str):
         [[pos[0][0], pos[0][1], pos[1]] for pos in track["positions"]]
     )  # x, y, frame
     return positions, track["start_frame"], track["last_frame"], track["fps"]
-
 
 def detect_serves(
     positions: np.ndarray, min_rise_speed: float = 1.5, min_peak_height: float = 300
@@ -62,17 +58,14 @@ def detect_serves(
             serves.append(f)
     return sorted(serves)
 
-
-def create_graphs(
-    positions: np.ndarray, current_frame: int, serves: list[int], frame_width: int
-):
+def create_graphs(positions: np.ndarray, current_frame: int, serves: list[int], frame_width: int):
     x, y, frames = positions[:, 0], positions[:, 1], positions[:, 2].astype(int)
     speed = np.sqrt(np.gradient(x) ** 2 + np.gradient(y) ** 2)
     speed_smooth = np.convolve(speed, np.ones(5) / 5, mode="same")
 
     dpi = 100
-    fig_width_px = frame_width  # Ширина графика совпадает с шириной кадра
-    fig_height_px = 180  # Фиксированная высота 180px
+    fig_width_px = 1270
+    fig_height_px = 180
     fig_width_inch = fig_width_px / dpi
     fig_height_inch = fig_height_px / dpi
 
@@ -118,12 +111,9 @@ def create_graphs(
     canvas.draw()
 
     graph_image = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
-    graph_image = graph_image.reshape((fig_height_px, fig_width_px, 4))[
-        :, :, :3
-    ]  # Убираем альфа-канал
+    graph_image = graph_image.reshape((fig_height_px, fig_width_px, 4))[:, :, :3]
     plt.close(fig)
     return graph_image
-
 
 def main():
     args = parse_args()
@@ -163,27 +153,21 @@ def main():
                 break
             frame = frame.copy()
 
-        # Создаём графики
-        if show_graphs:
-            graph_img = create_graphs(positions, frame_count, serves, frame.shape[1])
-            # Накладываем графики внизу кадра
-            h, w = frame.shape[:2]
-            graph_h = graph_img.shape[0]  # 180px
-            # Создаём новый кадр с дополнительным пространством снизу
-            display_frame = np.zeros((h + graph_h, w, 3), dtype=np.uint8)
-            display_frame[:h, :] = frame  # Видео в верхней части
-            display_frame[h : h + graph_h, :] = graph_img  # Графики внизу
-        else:
-            display_frame = frame.copy()
+        h, w = frame.shape[:2]
+        target_width = 1270
+        aspect_ratio = h / w
+        target_height = int(target_width * aspect_ratio)
+        frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
-        # Рисуем мяч на видео
         if frame_count in pos_dict:
+
             x, y = pos_dict[frame_count]
-            x, y = int(x), int(y)
-            cv2.circle(display_frame, (x, y), 8, (0, 0, 255), -1)
-            cv2.circle(display_frame, (x, y), 10, (255, 255, 255), 2)
+            x = int(x * target_width / w)
+            y = int(y * target_height / h)
+            cv2.circle(frame, (x, y), 8, (0, 0, 255), -1)
+            cv2.circle(frame, (x, y), 10, (255, 255, 255), 2)
             cv2.putText(
-                display_frame,
+                frame,
                 f"Frame: {frame_count}",
                 (x + 15, y - 10),
                 cv2.FONT_HERSHEY_SIMPLEX,
@@ -192,12 +176,26 @@ def main():
                 2,
             )
 
+
+        if show_graphs:
+            graph_img = create_graphs(positions, frame_count, serves, target_width)
+            h = target_height
+            graph_h = graph_img.shape[0]
+            display_frame = np.zeros((h + graph_h, target_width, 3), dtype=np.uint8)
+            display_frame[:h, :] = frame
+            display_frame[h:h + graph_h, :] = graph_img
+        else:
+            #display_frame = np.zeros((h + graph_h, target_width, 3), dtype=np.uint8)
+
+            display_frame = frame.copy()
+
+
         cv2.imshow("Ball Tracking with Graphs", display_frame)
 
         key = cv2.waitKey(1 if not paused else 0)
         if key == ord("q"):
             break
-        elif key == 32:  # Пробел
+        elif key == 32:
             paused = not paused
         elif key == ord("g"):
             show_graphs = not show_graphs
@@ -207,7 +205,6 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     main()

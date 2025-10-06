@@ -152,9 +152,24 @@ def main():
     args = parser.parse_args()
 
     track = load_single_track(args.track_json)
+
+    # Извлекаем базовое имя видео без расширения
     base_name = os.path.splitext(os.path.basename(args.video_path))[0]
+
+    # Извлекаем номер из имени track_json (например, track_5.json → 5)
+    track_filename = os.path.basename(args.track_json)
+    # Убираем расширение .json
+    track_basename = os.path.splitext(track_filename)[0]
+    # Пытаемся извлечь число после последнего подчёркивания
+    try:
+        track_number = track_basename.split("_")[-1]
+        int(track_number)  # проверка, что это число
+    except (ValueError, IndexError):
+        # Если не получилось — используем всё имя без расширения
+        track_number = track_basename
+
     ensure_reels_dir()
-    output_path = os.path.join("reels", f"reel_{base_name}.mp4")
+    output_path = os.path.join("reels", f"reel_{base_name}_{track_number}.mp4")
 
     crop_and_save_track(args.video_path, track, output_path, visualize=args.visualize)
 
