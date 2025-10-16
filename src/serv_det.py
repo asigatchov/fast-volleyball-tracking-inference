@@ -289,7 +289,16 @@ def plot_2d_trajectory(
 
 def main():
     """Основная функция для обработки всех файлов из каталога track_json и построения графиков."""
-    base_path = "track_json"
+    import argparse
+    parser = argparse.ArgumentParser(description="Анализ треков и построение графиков.")
+    parser.add_argument(
+        "--tracks_dir",
+        type=str,
+        default="track_json",
+        help="Каталог с json-файлами треков (по умолчанию track_json)"
+    )
+    args = parser.parse_args()
+    base_path = args.tracks_dir
     track_files = [f for f in os.listdir(base_path) if f.endswith(".json")]
     track_files.sort()
     for track_file in track_files:
