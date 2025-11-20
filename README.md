@@ -20,6 +20,8 @@ Achieves **~200 FPS** on a regular CPU (Intel i5-10400F) thanks to a lightweight
 </table>
 
 
+<video src="https://github.com/asigatchov/fast-volleyball-tracking-inference/raw/refs/heads/master/examples/reel_g.mp4" controls width="100%"></video>
+
 ## Model Comparison
 | Model                                    | F1    | Precision | Recall | Accuracy | Detection Rate |
 |------------------------------------------|-------|-----------|--------|----------|----------------|
