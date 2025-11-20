@@ -6,8 +6,9 @@ High-speed volleyball ball detection and tracking using an optimized ONNX model,
 ## Features
 - **High Performance**: 200 FPS on modest CPU hardware (Intel Core i5-10400F @ 2.90GHz).
 - **Optimized for CPU**: Lightweight ONNX model designed for grayscale video input.
-- **Flexible Output**: Saves ball coordinates to CSV for analysis; optional video visualization.
-- **Customizable**: Adjustable track length for visualization.
+- **4-Step Processing Pipeline**: Detection → Track calculation → Video assembly → Vertical reels.
+- **Flexible Output**: Saves ball coordinates to CSV, track JSONs, combined videos, and vertical clips.
+- **Customizable**: Adjustable track parameters for analysis and visualization.
 - **Pose Detection**: Detect player poses when ball is near using MediaPipe.
 - **Direction Change Analysis**: Identify and visualize ball direction changes with pose detection.
 - **Easy to Use**: Simple command-line interface with clear options.
@@ -40,18 +41,149 @@ High-speed volleyball ball detection and tracking using an optimized ONNX model,
 
 ## Usage
 
-### Ball Tracking
+### 4-Step Processing Pipeline
 
-Run the inference script to detect and track a volleyball ball in a video:
+This repository provides a complete workflow for volleyball ball tracking and video processing:
+
+#### Step 1: Ball Detection (CSV output)
+
+Detect volleyball ball in video and save coordinates to CSV:
 
 ```bash
-uv run src/inference_onnx_seq9_gray_v2.py --video_path  examples/beach_st_lenina_20250622_g1_005.mp4 --model_path  models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx --output_dir output/
+uv run src/inference_onnx_seq9_gray_v2.py \
+  --video_path examples/beach_st_lenina_20250622_g1_005.mp4 \
+  --model_path models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx \
+  --output_dir output \
+  --only_csv
 ```
 
-#### Run the inference script to detect and track a volleyball ball with Realtime visualization:
+**Output:** `output/beach_st_lenina_20250622_g1_005/ball.csv`
+
+**With visualization video:**
+```bash
+uv run src/inference_onnx_seq9_gray_v2.py \
+  --video_path examples/beach_st_lenina_20250622_g1_005.mp4 \
+  --model_path models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx \
+  --output_dir output
+```
+
+**Output:** `output/beach_st_lenina_20250622_g1_005/ball.csv` + `output/beach_st_lenina_20250622_g1_005/predict.mp4`
+
+**Real-time visualization (no file output):**
+```bash
+uv run src/inference_onnx_seq9_gray_v2.py \
+  --video_path examples/beach_st_lenina_20250622_g1_005.mp4 \
+  --model_path models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx \
+  --visualize
+```
+
+#### Step 2: Track Calculation (JSON tracks)
+
+Calculate tracks from ball detections and save as JSON files:
 
 ```bash
-uv run src/inference_onnx_seq9_gray_v2.py --video_path  examples/beach_st_lenina_20250622_g1_005.mp4 --model_path  models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx --visualize
+uv run src/track_calculator.py \
+  --csv_path output/beach_st_lenina_20250622_g1_005/ball.csv \
+  --output_dir output \
+  --fps 30
+```
+
+**Output:** `output/beach_st_lenina_20250622_g1_005/tracks/track_*.json`
+
+#### Step 3: Video Assembly (skip game pauses)
+
+Create combined video or individual clips from tracks:
+
+**Combined video (all tracks concatenated):**
+```bash
+uv run src/track_processor.py \
+  --video_path examples/beach_st_lenina_20250622_g1_005.mp4 \
+  --output_dir output
+```
+
+**Output:** `output/beach_st_lenina_20250622_g1_005/combined.mp4`
+
+**Individual clip per track:**
+```bash
+uv run src/track_processor.py \
+  --video_path examples/beach_st_lenina_20250622_g1_005.mp4 \
+  --json_dir output/beach_st_lenina_20250622_g1_005/tracks \
+  --split_dir output/beach_st_lenina_20250622_g1_005/clips
+```
+
+**Output:** `output/beach_st_lenina_20250622_g1_005/clips/track_*.mp4`
+
+#### Step 4: Vertical Reels (9:16 format)
+
+Create vertical video clips (reels) with ball-centered cropping:
+
+![Reel Demo](examples/reel_g.mp4)
+
+**Single track reel:**
+```bash
+uv run src/make_reels.py \
+  --video_path examples/beach_st_lenina_20250622_g1_005.mp4 \
+  --track_json output/beach_st_lenina_20250622_g1_005/tracks/track_0001.json \
+  --output_dir output
+```
+
+**Output:** `output/beach_st_lenina_20250622_g1_005/reels/reel_beach_st_lenina_20250622_g1_005_0001.mp4`
+
+**All tracks as reels:**
+```bash
+uv run src/make_reels.py \
+  --video_path examples/beach_st_lenina_20250622_g1_005.mp4 \
+  --json_dir output/beach_st_lenina_20250622_g1_005/tracks \
+  --output_dir output
+```
+
+**Output:** `output/beach_st_lenina_20250622_g1_005/reels/reel_*.mp4` (one per track)
+
+### Complete Pipeline Example
+
+Run all steps sequentially:
+
+```bash
+# Step 1: Detect ball
+uv run src/inference_onnx_seq9_gray_v2.py \
+  --video_path examples/beach_st_lenina_20250622_g1_005.mp4 \
+  --model_path models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx \
+  --output_dir output \
+  --only_csv
+
+# Step 2: Calculate tracks
+uv run src/track_calculator.py \
+  --csv_path output/beach_st_lenina_20250622_g1_005/ball.csv \
+  --output_dir output
+
+# Step 3: Create combined video
+uv run src/track_processor.py \
+  --video_path examples/beach_st_lenina_20250622_g1_005.mp4 \
+  --output_dir output
+
+# Step 4: Generate vertical reels
+uv run src/make_reels.py \
+  --video_path examples/beach_st_lenina_20250622_g1_005.mp4 \
+  --json_dir output/beach_st_lenina_20250622_g1_005/tracks \
+  --output_dir output
+```
+
+**Final output structure:**
+```
+output/beach_st_lenina_20250622_g1_005/
+├── ball.csv                  # Raw detections
+├── predict.mp4               # Detection visualization (optional)
+├── tracks/
+│   ├── track_0001.json
+│   ├── track_0002.json
+│   └── ...
+├── combined.mp4              # All tracks concatenated
+├── clips/                    # Individual track clips (optional)
+│   ├── track_0001.mp4
+│   └── ...
+└── reels/                    # Vertical 9:16 crops
+    ├── reel_beach_st_lenina_20250622_g1_005_0001.mp4
+    └── ...
 ```
 
 ### Pose Detection
@@ -72,47 +204,83 @@ uv run test_direction_change_pose.py --video_path examples/beach_st_lenina_20250
 
 For more details, see [DIRECTION_CHANGE_POSE_DETECTION.md](DIRECTION_CHANGE_POSE_DETECTION.md)
 
-### Command-Line Options for Main Script
-```
-usage: main.py [-h] [--mode {track,pose,analyze}] [--video_path VIDEO_PATH] [--track_file TRACK_FILE] [--model_path MODEL_PATH]
-               [--output_dir OUTPUT_DIR] [--visualize]
+### Command-Line Options
 
-Fast Volleyball Tracking Inference
-
-options:
-  -h, --help            show this help message and exit
-  --mode {track,pose,analyze}
-                        Processing mode
-  --video_path VIDEO_PATH
-                        Path to input video file
-  --track_file TRACK_FILE
-                        Path to track JSON file (for pose mode)
-  --model_path MODEL_PATH
-                        Path to ONNX model file
-  --output_dir OUTPUT_DIR
-                        Directory to save output files
-  --visualize           Enable visualization on display using cv2
+#### Step 1: Ball Detection
 ```
-
-### Command-Line Options for Ball Tracking
-```
-usage: inference_onnx_seq9_gray_v2.py [-h] --video_path VIDEO_PATH [--track_length TRACK_LENGTH] [--output_dir OUTPUT_DIR] --model_path MODEL_PATH
+usage: inference_onnx_seq9_gray_v2.py [-h] --video_path VIDEO_PATH [--track_length TRACK_LENGTH]
+                                      [--output_dir OUTPUT_DIR] --model_path MODEL_PATH
                                       [--visualize] [--only_csv]
-
-Volleyball ball detection and tracking with ONNX
 
 options:
   -h, --help            show this help message and exit
   --video_path VIDEO_PATH
                         Path to input video file
   --track_length TRACK_LENGTH
-                        Length of the ball track
+                        Length of the ball track (default: 8)
   --output_dir OUTPUT_DIR
-                        Directory to save output video and CSV
+                        Root output directory (default: None)
   --model_path MODEL_PATH
                         Path to ONNX model file
-  --visualize           Enable visualization on display
+  --visualize           Enable real-time visualization on display
   --only_csv            Save only CSV, skip video output
+```
+
+#### Step 2: Track Calculation
+```
+usage: track_calculator.py [-h] --csv_path CSV_PATH [--output_dir OUTPUT_DIR] [--fps FPS]
+                           [--max_distance MAX_DISTANCE] [--min_duration_sec MIN_DURATION_SEC]
+
+options:
+  -h, --help            show this help message and exit
+  --csv_path CSV_PATH   Path to ball.csv file
+  --output_dir OUTPUT_DIR
+                        Root output directory (default: output)
+  --fps FPS             Frames per second (default: 30.0)
+  --max_distance MAX_DISTANCE
+                        Max tracking distance (default: 200.0)
+  --min_duration_sec MIN_DURATION_SEC
+                        Minimum track duration in seconds (default: 1.0)
+```
+
+#### Step 3: Video Assembly
+```
+usage: track_processor.py [-h] [--json_dir JSON_DIR] --video_path VIDEO_PATH
+                          [--output_path OUTPUT_PATH] [--split_dir SPLIT_DIR]
+                          [--output_dir OUTPUT_DIR] [--fps FPS]
+
+options:
+  -h, --help            show this help message and exit
+  --json_dir JSON_DIR   Directory with track_*.json files
+  --video_path VIDEO_PATH
+                        Path to source video
+  --output_path OUTPUT_PATH
+                        Combined output video path (AVI)
+  --split_dir SPLIT_DIR
+                        Directory for individual track videos (MP4)
+  --output_dir OUTPUT_DIR
+                        Root output directory (auto-derives paths)
+  --fps FPS             Output FPS if video has none (default: 30.0)
+```
+
+#### Step 4: Vertical Reels
+```
+usage: make_reels.py [-h] --video_path VIDEO_PATH [--track_json TRACK_JSON]
+                     [--track_jsons TRACK_JSONS [TRACK_JSONS ...]]
+                     [--json_dir JSON_DIR] [--output_dir OUTPUT_DIR] [--visualize]
+
+options:
+  -h, --help            show this help message and exit
+  --video_path VIDEO_PATH
+                        Path to video file
+  --track_json TRACK_JSON
+                        Path to a single track JSON file
+  --track_jsons TRACK_JSONS [TRACK_JSONS ...]
+                        Paths to multiple track JSON files
+  --json_dir JSON_DIR   Directory with track_*.json files
+  --output_dir OUTPUT_DIR
+                        Root output directory
+  --visualize           Show real-time cropped video
 ```
 
 ### Example
@@ -123,7 +291,8 @@ uv run main.py --mode pose --track_file track_json/track_0037.json --video_path 
 This command processes the track file `track_0037.json` with the video, detects player poses when the ball is near, and displays visualization with both ball position and player poses.
 
 ## Output
-- **CSV File**: Contains frame ID and ball coordinates (x, y).
+
+### Step 1: Ball Detection CSV
 ```csv
 Frame,Visibility,X,Y
 0,0,-1,-1
@@ -133,9 +302,28 @@ Frame,Visibility,X,Y
 ...
 1008,1,1065,487
 ```
-- **Video (Optional)**: Visualized output with tracked ball path, saved to `output/`.
-- **Pose Data**: JSON files with pose detection results when ball is near players.
-- **Direction Change Data**: Visualization of ball direction changes with pose detection in surrounding frames.
+
+### Step 2: Track JSON
+```json
+{
+  "track_id": 1,
+  "start_frame": 100,
+  "last_frame": 250,
+  "positions": [
+    [[1068, 536], 100],
+    [[1068, 532], 101],
+    ...
+  ]
+}
+```
+
+### Step 3: Video Outputs
+- **combined.mp4**: All tracks concatenated with fade transitions
+- **clips/track_*.mp4**: Individual rally clips (optional)
+
+### Step 4: Vertical Reels
+- **reels/reel_*.mp4**: 9:16 vertical videos with ball-centered cropping
+- Example: [examples/reel_g.mp4](examples/reel_g.mp4)
 
 ## Repository Structure
 ```

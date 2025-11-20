@@ -276,7 +276,7 @@ def main():
         description="Visualize or export ball tracking data with FPS monitoring"
     )
     parser.add_argument(
-        "--json_dir", type=str, required=True, help="Directory with track_*.json files"
+        "--json_dir", type=str, default=None, help="Directory with track_*.json files"
     )
     parser.add_argument(
         "--video_path", type=str, required=True, help="Path to source video"
@@ -291,9 +291,20 @@ def main():
         help="Directory for individual track videos (MP4)",
     )
     parser.add_argument(
+        "--output_dir", type=str, default=None, help="Root output directory"
+    )
+    parser.add_argument(
         "--fps", type=float, default=30.0, help="Output FPS if video has none"
     )
     args = parser.parse_args()
+
+    base_name = os.path.splitext(os.path.basename(args.video_path))[0]
+
+    if args.json_dir is None and args.output_dir:
+        args.json_dir = os.path.join(args.output_dir, base_name, "tracks")
+    if args.output_path is None and args.output_dir and not args.split_dir:
+        args.output_path = os.path.join(args.output_dir, base_name, "combined.mp4")
+    # If split_dir is provided, use it as-is; otherwise keep combined mode when output_dir is set.
 
     mode = "Interactive visualization"
     if args.split_dir:

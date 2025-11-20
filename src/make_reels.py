@@ -3,11 +3,11 @@ import cv2
 import numpy as np
 import argparse
 import os
-from tqdm import tqdm  # <-- добавлен импорт
+from tqdm import tqdm  # <-- added import
 
 
-def ensure_reels_dir():
-    os.makedirs("reels", exist_ok=True)
+def ensure_reels_dir(path):
+    os.makedirs(path, exist_ok=True)
 
 
 def load_single_track(track_json_path):
@@ -31,7 +31,7 @@ def load_single_track(track_json_path):
 def crop_and_save_track(video_path, track, output_path, visualize=False):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise ValueError(f"Не удалось открыть видео: {video_path}")
+        raise ValueError(f"Failed to open video: {video_path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
@@ -41,7 +41,7 @@ def crop_and_save_track(video_path, track, output_path, visualize=False):
     ret, frame = cap.read()
     if not ret:
         cap.release()
-        raise ValueError("Не удалось прочитать первый кадр видео")
+        raise ValueError("Failed to read first video frame")
 
     frame_height, frame_width = frame.shape[:2]
     aspect_ratio = 9 / 16
@@ -61,7 +61,7 @@ def crop_and_save_track(video_path, track, output_path, visualize=False):
     end_frame = track["last_frame"]
 
     if not all_frames:
-        raise ValueError("Трек не содержит позиций мяча")
+        raise ValueError("Track contains no ball positions")
 
     first_known_x = frame_to_pos[all_frames[0]][0]
 
@@ -93,12 +93,12 @@ def crop_and_save_track(video_path, track, output_path, visualize=False):
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)  # Перемотка к началу трека
 
     for i, frame_idx in enumerate(tqdm(range(start_frame, end_frame + 1),
-                                       desc="Сохранение кадров",
+                                       desc="Saving frames",
                                        total=total_frames,
-                                       unit="кадр")):
+                                       unit="frame")):
         ret, frame = cap.read()
         if not ret:
-            print(f"\n⚠️ Кадр {frame_idx} не прочитан — видео закончилось раньше времени.")
+            print(f"Frame {frame_idx} not read — video ended early.")
             break
 
         # Определяем центр кропа по сглаженной траектории
@@ -138,44 +138,66 @@ def crop_and_save_track(video_path, track, output_path, visualize=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Визуализация одного розыгрыша с кадрированием по мячу."
+        description="Visualize rally clips with ball-centered cropping."
     )
-    parser.add_argument("--video_path", required=True, help="Путь к видеофайлу")
+    parser.add_argument("--video_path", required=True, help="Path to video file")
     parser.add_argument(
-        "--track_json", required=True, help="Путь к JSON-файлу с одним треком"
+        "--track_json", help="Path to a single track JSON file"
+    )
+    parser.add_argument(
+        "--track_jsons", nargs="+", help="Paths to multiple track JSON files"
+    )
+    parser.add_argument(
+        "--json_dir", help="Directory with track_*.json files"
+    )
+    parser.add_argument(
+        "--output_dir", default=None, help="Root output directory"
     )
     parser.add_argument(
         "--visualize",
         action="store_true",
-        help="Показывать видео в реальном времени с кадрированием",
+        help="Show real-time cropped video",
     )
     args = parser.parse_args()
 
-    track = load_single_track(args.track_json)
-
-    # Извлекаем базовое имя видео без расширения
     base_name = os.path.splitext(os.path.basename(args.video_path))[0]
 
-    # Извлекаем номер из имени track_json (например, track_5.json → 5)
-    track_filename = os.path.basename(args.track_json)
-    # Убираем расширение .json
-    track_basename = os.path.splitext(track_filename)[0]
-    # Пытаемся извлечь число после последнего подчёркивания
-    try:
-        track_number = track_basename.split("_")[-1]
-        int(track_number)  # проверка, что это число
-    except (ValueError, IndexError):
-        # Если не получилось — используем всё имя без расширения
-        track_number = track_basename
+    if args.track_jsons:
+        json_paths = args.track_jsons
+    elif args.track_json:
+        json_paths = [args.track_json]
+    elif args.json_dir:
+        json_paths = sorted([
+            os.path.join(args.json_dir, f)
+            for f in os.listdir(args.json_dir)
+            if f.startswith("track_") and f.endswith(".json")
+        ])
+    else:
+        raise ValueError("Specify --track_json, --track_jsons, or --json_dir")
 
-    ensure_reels_dir()
-    output_path = os.path.join("reels", f"reel_{base_name}_{track_number}.mp4")
+    reels_dir = (
+        os.path.join(args.output_dir, base_name, "reels") if args.output_dir else "reels"
+    )
+    ensure_reels_dir(reels_dir)
 
-    crop_and_save_track(args.video_path, track, output_path, visualize=args.visualize)
+    for track_json_path in json_paths:
+        track = load_single_track(track_json_path)
 
-    if not args.visualize:
-        print(f"✅ Сохранено: {output_path}")
+        track_filename = os.path.basename(track_json_path)
+        track_basename = os.path.splitext(track_filename)[0]
+        try:
+            track_number = track_basename.split("_")[-1]
+            int(track_number)  # check that it is a number
+        except (ValueError, IndexError):
+            track_number = track_basename
 
+        output_path = os.path.join(reels_dir, f"reel_{base_name}_{track_number}.mp4")
 
+        crop_and_save_track(args.video_path, track, output_path, visualize=args.visualize)
+
+        if not args.visualize:
+            print(f"Saved: {output_path}")
+
+    
 if __name__ == "__main__":
     main()

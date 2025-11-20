@@ -13,7 +13,7 @@ class TrackCalculator:
     def __init__(
         self,
         csv_path: str,
-        output_dir: str = "track_json",
+        output_dir: str = "output",
         fps: float = 30.0,
         max_distance: float = 200.0,
         min_duration_sec: float = 1.0,
@@ -203,14 +203,15 @@ class TrackCalculator:
     def _save_tracks_to_json(self) -> None:
         """Save each track to a separate JSON file."""
         csv_name = os.path.splitext(os.path.basename(self.csv_path))[0]
-        video_dir = os.path.join(self.output_dir, csv_name)
-        os.makedirs(video_dir, exist_ok=True)
+        video_basename = os.path.basename(os.path.dirname(self.csv_path)) or csv_name.replace("_predict_ball", "")
+        tracks_dir = os.path.join(self.output_dir, video_basename, "tracks")
+        os.makedirs(tracks_dir, exist_ok=True)
 
         for track in self.tracks:
-            file_path = os.path.join(video_dir, f"track_{track.track_id:04d}.json")
+            file_path = os.path.join(tracks_dir, f"track_{track.track_id:04d}.json")
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(track.to_dict(), f, indent=2, ensure_ascii=False)
-        print(f"Saved {len(self.tracks)} tracks to: {video_dir}")
+        print(f"Saved {len(self.tracks)} tracks to: {tracks_dir}")
 
     def run(self) -> None:
         """Main execution flow."""
@@ -225,7 +226,7 @@ def main():
     parser = argparse.ArgumentParser(description="Calculate tracks from CSV to JSON")
     parser.add_argument("--csv_path", type=str, required=True, help="Path to ball.csv")
     parser.add_argument(
-        "--output_dir", type=str, default="track_json", help="Output directory for JSON"
+        "--output_dir", type=str, default="output", help="Root output directory for JSON"
     )
     parser.add_argument("--fps", type=float, default=30.0, help="Frames per second")
     parser.add_argument(
