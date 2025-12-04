@@ -114,9 +114,9 @@ def setup_output_writer(
 ):
     if output_dir is None or only_csv:
         return None, None
-    output_path = os.path.join(output_dir, f"{video_basename}_predict.mp4")
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    video_dir = os.path.join(output_dir, video_basename)
+    os.makedirs(video_dir, exist_ok=True)
+    output_path = os.path.join(video_dir, "predict.mp4")
     out_writer = cv2.VideoWriter(
         output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame_width, frame_height)
     )
@@ -126,9 +126,9 @@ def setup_output_writer(
 def setup_csv_file(video_basename, output_dir):
     if output_dir is None:
         return None
-    csv_path = os.path.join(output_dir, f"{video_basename}_predict_ball.csv")
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    video_dir = os.path.join(output_dir, video_basename)
+    os.makedirs(video_dir, exist_ok=True)
+    csv_path = os.path.join(video_dir, "ball.csv")
     pd.DataFrame(columns=["Frame", "Visibility", "X", "Y"]).to_csv(
         csv_path, index=False
     )
