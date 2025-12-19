@@ -45,7 +45,6 @@ def parse_args():
     return parser.parse_args()
 
 
-
 def load_onnx_model(model_path):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
@@ -53,6 +52,8 @@ def load_onnx_model(model_path):
         model_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
     )
     input_names = [inp.name for inp in session.get_inputs()]
+    output_names = [out.name for out in session.get_outputs()]
+    
     has_gru = "h0" in input_names
     h0_shape = None
     if has_gru:
@@ -68,7 +69,7 @@ def load_onnx_model(model_path):
                 if dim in ["batch", "batch_size", None]:
                     resolved_shape.append(1)
                 elif "hidden" in str(dim).lower():
-                    resolved_shape.append(512)
+                    resolved_shape.append(512)  # Адаптируй под твою модель, если hidden size другой
                 else:
                     raise ValueError(
                         f"Unknown symbolic dimension '{dim}' in h0_shape: {h0_shape}"
@@ -92,9 +93,7 @@ def load_onnx_model(model_path):
     print(
         f"   Has GRU state: {has_gru}, Sequence length: {batch_size}, Output heatmaps: {out_dim}, h0 shape: {h0_shape if has_gru else 'N/A'}"
     )
-    return session, has_gru, out_dim, h0_shape, batch_size
-
-
+    return session, has_gru, out_dim, h0_shape, batch_size, input_names, output_names
 
 
 def initialize_video(video_path):
@@ -185,6 +184,25 @@ def draw_track(
     return frame
 
 
+def run_inference(session, input_tensor, has_gru, h0, input_names, output_names):
+    """Helper для инференса с поддержкой GRU."""
+    inputs = {input_names[0]: input_tensor}  # Основной инпут (кадры)
+    if has_gru:
+        if len(input_names) < 2:
+            raise ValueError("GRU model expects at least 2 inputs: images and h0")
+        inputs[input_names[1]] = h0  # Добавляем h0
+    
+    outputs = session.run(output_names, inputs)
+    
+    heatmaps = outputs[0]  # Первый аутпут — heatmaps
+    new_h0 = None
+    if has_gru:
+        if len(outputs) < 2:
+            raise ValueError("GRU model should output at least 2 values: heatmaps and hn")
+        new_h0 = outputs[1]  # Второе — новое скрытое состояние
+    return heatmaps, new_h0
+
+
 def read_frames(cap, frame_queue, max_frames):
     frames = []
     while len(frames) < max_frames:
@@ -201,11 +219,8 @@ def read_frames(cap, frame_queue, max_frames):
 def main():
     args = parse_args()
     input_width, input_height = 512, 288
-    # batch_size is now determined dynamically from the model
-
-    #model_session, out_dim = load_model(args.model_path, input_height, input_width)
     
-    model_session, has_gru, out_dim, h0_shape, batch_size = load_onnx_model(args.model_path)
+    model_session, has_gru, out_dim, h0_shape, batch_size, input_names, output_names = load_onnx_model(args.model_path)
 
     cap, frame_width, frame_height, fps, total_frames = initialize_video(
         args.video_path
@@ -220,6 +235,9 @@ def main():
     track_points = deque(maxlen=args.track_length)
     frame_index = 0
     frame_queue = queue.Queue(maxsize=2)
+    
+    # Инициализация скрытого состояния для GRU
+    h0 = np.zeros(h0_shape, dtype=np.float32) if has_gru and h0_shape else None
 
     # Start frame reading thread
     def frame_reader():
@@ -259,9 +277,10 @@ def main():
         input_tensor = np.expand_dims(input_tensor, axis=0)  # (1, height, width, seq_len)
         input_tensor = np.transpose(input_tensor, (0, 3, 1, 2))  # (1, seq_len, 288, 512)
 
-        # Run inference
-        inputs = {model_session.get_inputs()[0].name: input_tensor}
-        output = model_session.run(None, inputs)[0]
+        # Run inference with GRU support
+        output, new_h0 = run_inference(model_session, input_tensor, has_gru, h0, input_names, output_names)
+        if has_gru and new_h0 is not None:
+            h0 = new_h0  # Обновляем состояние для следующего батча
 
         # Process predictions for all frames
         predictions = postprocess_output(
