@@ -1,5 +1,5 @@
-# [Live demo Tracking - ball](https://demo.vb-ai.ru/)
-
+## VPS [Live demo Tracking - ball](https://demo.vb-ai.ru/)
+## HF [Live demo Tracking - ball](https://huggingface.co/spaces/asigatchov/volleyball-tracking)
 
 # Fast Volleyball Ball Tracking → Vertical Reels
 
