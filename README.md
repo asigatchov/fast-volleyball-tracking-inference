@@ -1,7 +1,11 @@
+## VPS [Live demo Tracking - ball](https://demo.vb-ai.ru/)
+## HF [Live demo Tracking - ball](https://huggingface.co/spaces/asigatchov/volleyball-tracking)
+
 # Fast Volleyball Ball Tracking → Vertical Reels
 
+
 A complete high-speed pipeline for volleyball ball detection, tracking, and automatic generation of **9:16 vertical reels** with the ball always centered.
-Achieves **~200 FPS** on a regular CPU (Intel i5-10400F) thanks to a lightweight grayscale seq-9 ONNX model.
+Achieves **~100 FPS** on a regular CPU (Intel i5-10400F) thanks to a lightweight grayscale seq-9 ONNX model.
 
 ## Features (fully implemented)
 
