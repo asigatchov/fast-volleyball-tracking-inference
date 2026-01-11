@@ -10,6 +10,10 @@ from tqdm import tqdm
 import threading
 import queue
 
+import os
+os.environ['LD_LIBRARY_PATH'] = './.venv/lib/python3.12/site-packages/nvidia/cublas/lib:' + os.environ.get('LD_LIBRARY_PATH', '')
+import onnxruntime as ort
+ort.preload_dlls()
 
 def parse_args():
     parser = argparse.ArgumentParser(
