@@ -3,8 +3,8 @@ import numpy as np
 
 
 def merge_sequences(
-    sequences: list[tuple[int, int]], max_frame_gap: int = 10
-) -> list[tuple[int, int]]:
+    sequences, max_frame_gap=10
+):
     """Объединяет циклические участки, если расстояние между ними не превышает max_frame_gap кадров.
 
     Args:
@@ -37,11 +37,11 @@ def merge_sequences(
 
 
 def find_cyclic_sequences(
-    positions: list[list],
-    min_cycle_amplitude: float = 30.0,  # Минимальная амплитуда одного цикла (размах)
-    max_amplitude_variation: float = 50.0,  # Макс. отличие амплитуд между циклами
-    min_num_amplitudes: int = 4,  # Мин. число амплитуд для последовательности (~2 цикла)
-) -> list[tuple[int, int]]:
+    positions,
+    min_cycle_amplitude=30.0,  # Минимальная амплитуда одного цикла (размах)
+    max_amplitude_variation=50.0,  # Макс. отличие амплитуд между циклами
+    min_num_amplitudes=4,  # Мин. число амплитуд для последовательности (~2 цикла)
+):
     """Находит участки с регулярными циклическими движениями мяча (≥2 цикла),
     где амплитуды колебаний отличаются не более чем на max_amplitude_variation.
     Доработано для детекции локальных стабильных циклов (например, набивка мяча перед подачей),
@@ -162,11 +162,11 @@ def find_cyclic_sequences(
 
 
 def find_rolling_sequences(
-    positions: list[list],
-    max_y_range: float = 40.0,  # Уменьшено для трека 0005
-    min_x_range: float = 50.0,
-    min_length: int = 70,  # Уменьшено для коротких участков
-) -> list[tuple[int, int]]:
+    positions,
+    max_y_range=40.0,  # Уменьшено для трека 0005
+    min_x_range=50.0,
+    min_length=70,  # Уменьшено для коротких участков
+):
     """Находит участки, где мяч катится по полу (малый размах Y, большой размах X)."""
     if not positions or len(positions) < min_length:
         return []

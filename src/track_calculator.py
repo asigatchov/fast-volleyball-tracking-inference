@@ -4,7 +4,8 @@ import numpy as np
 import os
 import argparse
 import json
-from typing import List
+import cv2
+from typing import List, Optional, Tuple, Dict
 from ball_tracker import BallTracker, Track
 from track_utils import find_cyclic_sequences, find_rolling_sequences
 
@@ -13,6 +14,7 @@ class TrackCalculator:
     def __init__(
         self,
         csv_path: str,
+        court_json_path: Optional[str] = None,
         output_dir: str = "output",
         fps: float = 30.0,
         max_distance: float = 200.0,
@@ -21,6 +23,11 @@ class TrackCalculator:
         min_y_displacement: float = 50.0,
         bounce_frames: int = 10,
     ):
+        self.court_json_path = court_json_path
+        self.court_points = None
+        self.image_width = None
+        self.image_height = None
+        self.court_transform_matrix = None
         self.csv_path = csv_path
         self.output_dir = output_dir
         self.fps = fps
@@ -31,11 +38,111 @@ class TrackCalculator:
         self.bounce_frames = bounce_frames
         self.tracks: List[Track] = []
         self.track_distances: dict[int, str] = {}
+        
+        # Load court coordinates if provided
+        if self.court_json_path:
+            self._load_court_coordinates()
 
     def _validate_csv(self) -> None:
         """Check if the CSV file exists."""
         if not os.path.exists(self.csv_path):
             raise FileNotFoundError(f"CSV not found: {self.csv_path}")
+    
+    def _load_court_coordinates(self) -> None:
+        """Load volleyball court coordinates from JSON file and calculate transformation matrix."""
+        if not self.court_json_path or not os.path.exists(self.court_json_path):
+            print("Warning: Court JSON file not provided or not found. Using pixel coordinates.")
+            return
+        
+        try:
+            with open(self.court_json_path, 'r') as f:
+                court_data = json.load(f)
+            
+            # Extract image dimensions
+            images = court_data.get('images', [])
+            if images:
+                self.image_width = images[0].get('width', 1280)
+                self.image_height = images[0].get('height', 720)
+            
+            # Extract court keypoints
+            annotations = court_data.get('annotations', [])
+            if not annotations:
+                print("Warning: No annotations found in court JSON")
+                return
+            
+            keypoints = annotations[0].get('keypoints', [])
+            if len(keypoints) < 24:  # 8 points × 3 (x,y,visibility)
+                print(f"Warning: Insufficient keypoints found ({len(keypoints)}), need at least 24")
+                return
+            
+            # Parse keypoints: [x1,y1,v1,x2,y2,v2,...]
+            self.court_points = []
+            for i in range(0, len(keypoints), 3):
+                if i + 2 < len(keypoints):
+                    x, y, visibility = keypoints[i], keypoints[i+1], keypoints[i+2]
+                    if visibility > 0:  # Only use visible points
+                        self.court_points.append([x, y])
+            
+            print(f"Loaded {len(self.court_points)} court keypoints")
+            
+            # Calculate court coordinate system
+            # Points mapping:
+            # 0,1: back corners (left, right)
+            # 4,5: center line points
+            # 6,7: net top edge points
+            
+            if len(self.court_points) >= 8:
+                self._calculate_court_transform()
+            
+        except Exception as e:
+            print(f"Warning: Failed to load court coordinates: {e}")
+    
+    def _calculate_court_transform(self) -> None:
+        """Calculate transformation matrix from image coordinates to court coordinates."""
+        if not self.court_points or len(self.court_points) < 8:
+            return
+        
+        # Define court dimensions (standard volleyball court)
+        # Court is 18m long × 9m wide
+        COURT_LENGTH = 18.0  # meters
+        COURT_WIDTH = 9.0    # meters
+        NET_HEIGHT = 2.43    # meters (men's)
+        
+        # Image points (from court keypoints)
+        img_points = np.array([
+            self.court_points[0],  # back left
+            self.court_points[1],  # back right
+            self.court_points[2],  # front right
+            self.court_points[3],  # front left
+        ], dtype=np.float32)
+        
+        # Court points in meters (assuming origin at center back line)
+        court_points = np.array([
+            [-COURT_LENGTH/2, -COURT_WIDTH/2],  # back left
+            [COURT_LENGTH/2, -COURT_WIDTH/2],   # back right
+            [COURT_LENGTH/2, COURT_WIDTH/2],    # front right
+            [-COURT_LENGTH/2, COURT_WIDTH/2],   # front left
+        ], dtype=np.float32)
+        
+        # Calculate perspective transform
+        try:
+            self.court_transform_matrix = cv2.getPerspectiveTransform(img_points, court_points)
+            print("Court coordinate transformation calculated successfully")
+        except Exception as e:
+            print(f"Warning: Could not calculate court transform: {e}")
+    
+    def _transform_point_to_court(self, x: float, y: float) -> Tuple[float, float]:
+        """Transform image coordinates to court coordinates (meters)."""
+        if self.court_transform_matrix is None:
+            # Return normalized coordinates if no transform available
+            norm_x = x / (self.image_width or 1280)
+            norm_y = y / (self.image_height or 720)
+            return (norm_x * 18.0 - 9.0, norm_y * 9.0 - 4.5)  # Scale to court dimensions
+        
+        # Apply perspective transform
+        point = np.array([[x, y]], dtype=np.float32)
+        transformed = cv2.perspectiveTransform(point.reshape(-1, 1, 2), self.court_transform_matrix)
+        return (float(transformed[0][0][0]), float(transformed[0][0][1]))
 
     def _load_and_process_csv(self) -> pd.DataFrame:
         """Load CSV and preprocess columns."""
@@ -169,7 +276,8 @@ class TrackCalculator:
         )
         close_tracks = []
 
-        for frame_num in sorted(df["Frame"].dropna().astype(int).unique()):
+        all_frames = sorted(df["Frame"].dropna().astype(int).unique())
+        for frame_num in all_frames:
             frame_rows = df[df["Frame"] == frame_num]
             detections = []
             for _, row in frame_rows.iterrows():
@@ -187,6 +295,13 @@ class TrackCalculator:
             _, _, close_track = tracker.update(detections, frame_num)
             close_tracks.extend(close_track)
 
+        # Force closure of remaining active tracks at the end
+        final_frame = max(all_frames) if all_frames else 0
+        for track_id in list(tracker.tracks.keys()):
+            # Move all remaining tracks to close_tracks regardless of disappearance
+            close_tracks.append(tracker.tracks[track_id])
+            del tracker.tracks[track_id]
+
         episodes = []
         for track in close_tracks:
             if not track.positions:
@@ -201,16 +316,34 @@ class TrackCalculator:
         self.tracks = self._filter_short_tracks(episodes)
 
     def _save_tracks_to_json(self) -> None:
-        """Save each track to a separate JSON file."""
+        """Save each track to a separate JSON file with court coordinates."""
         csv_name = os.path.splitext(os.path.basename(self.csv_path))[0]
         video_basename = os.path.basename(os.path.dirname(self.csv_path)) or csv_name.replace("_predict_ball", "")
         tracks_dir = os.path.join(self.output_dir, video_basename, "tracks")
         os.makedirs(tracks_dir, exist_ok=True)
 
         for track in self.tracks:
+            # Add court coordinates to track data
+            track_dict = track.to_dict()
+            
+            # Transform positions to court coordinates
+            court_positions = []
+            for pos in track_dict['positions']:
+                img_x, img_y = pos[0]
+                court_x, court_y = self._transform_point_to_court(img_x, img_y)
+                court_positions.append([[court_x, court_y], pos[1]])
+            
+            track_dict['court_positions'] = court_positions
+            track_dict['court_info'] = {
+                'image_width': self.image_width,
+                'image_height': self.image_height,
+                'court_points_count': len(self.court_points) if self.court_points else 0,
+                'has_court_transform': self.court_transform_matrix is not None
+            }
+            
             file_path = os.path.join(tracks_dir, f"track_{track.track_id:04d}.json")
             with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(track.to_dict(), f, indent=2, ensure_ascii=False)
+                json.dump(track_dict, f, indent=2, ensure_ascii=False)
         print(f"Saved {len(self.tracks)} tracks to: {tracks_dir}")
 
     def run(self) -> None:
@@ -223,8 +356,9 @@ class TrackCalculator:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Calculate tracks from CSV to JSON")
+    parser = argparse.ArgumentParser(description="Calculate tracks from CSV to JSON with court coordinates")
     parser.add_argument("--csv_path", type=str, required=True, help="Path to ball.csv")
+    parser.add_argument("--court_json_path", type=str, help="Path to court coordinates JSON file")
     parser.add_argument(
         "--output_dir", type=str, default="output", help="Root output directory for JSON"
     )
@@ -248,6 +382,7 @@ def main():
 
     calculator = TrackCalculator(
         csv_path=args.csv_path,
+        court_json_path=args.court_json_path,
         output_dir=args.output_dir,
         fps=args.fps,
         max_distance=args.max_distance,
