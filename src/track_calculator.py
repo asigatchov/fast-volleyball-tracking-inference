@@ -192,21 +192,53 @@ class TrackCalculator:
             ]
         return track
 
+
+    def _over_net_level(self, track: Track) -> bool:
+        """Check if the ball rises above the net level during the track.
+        
+        Args:
+            track: Track object containing ball positions
+            
+        Returns:
+            bool: True if ball reaches above net level, False otherwise
+        """
+        if not self.court_points or len(self.court_points) < 8:
+            # If no court points available, use a default threshold
+            # Net is typically around y=160-162 in the image coordinates
+            y_positions = [pos[0][1] for pos in track.positions]
+            min_y = min(y_positions)  # Lower y = higher position
+            return min_y < 200  # Threshold for tracks that go reasonably high
+        
+        # Get net top points (points 6 and 7)
+        net_left_y = self.court_points[6][1]   # [313, 162]
+        net_right_y = self.court_points[7][1]  # [861, 160]
+        net_top_y = min(net_left_y, net_right_y)  # Use the higher point (lower y-value)
+        
+        # Check if any ball position is above the net
+        y_positions = [pos[0][1] for pos in track.positions]
+        min_ball_y = min(y_positions)  # Minimum y = highest position
+        
+        # Return True if ball goes above net level
+        return min_ball_y < net_top_y
     def _filter_short_tracks(self, episodes: List[Track]) -> List[Track]:
         """Filter, extend, merge, and clean up tracks."""
         # 1. Filter by vertical range
-        episodes = [ep for ep in episodes if ep.get_y_range() >= 1080 / 4.0]
+        #episodes = [ep for ep in episodes if ep.get_y_range() >= 1080 / 4.0]
         episodes = [self._trim_bounce_start(ep) for ep in episodes]
 
-        # 2. Keep only tracks longer than minimum duration
+       
+        # 3. Keep only tracks longer than minimum duration
         long_tracks = [
             ep for ep in episodes if ep.duration_sec() >= self.min_duration_sec
         ]
+       
+
+
         sorted_tracks = sorted(
             long_tracks, key=lambda x: x.duration_sec(), reverse=True
         )
 
-        # 3. Remove overlapping tracks (keep longest)
+        # 4. Remove overlapping tracks (keep longest)
         filtered = []
         used = set()
         for i, track1 in enumerate(sorted_tracks):
@@ -220,7 +252,7 @@ class TrackCalculator:
                 if self._is_overlapping(track1, track2):
                     used.add(j)
 
-        # 4. Extend each track by 1 second on both sides
+        # 5. Extend each track by 1 second on both sides
         frames_to_extend = int(self.fps)
         extended = []
         for ep in filtered:
@@ -228,7 +260,7 @@ class TrackCalculator:
             ep.last_frame = ep.last_frame + frames_to_extend
             extended.append(ep)
 
-        # 5. Merge overlapping extended tracks
+        # 6. Merge overlapping extended tracks
         merged = []
         used = set()
         sorted_ext = sorted(extended, key=lambda x: x.start_frame)
@@ -262,8 +294,10 @@ class TrackCalculator:
             )
             merged.append(merged_track)
 
-        # 6. Final trim after merging
+        # 7. Final trim after merging
         merged = [self._trim_bounce_start(ep) for ep in merged]
+        # merged = [ep for ep in merged if self._over_net_level(ep)]
+
         return sorted(merged, key=lambda x: x.start_frame)
 
     def _process_detections(self, df: pd.DataFrame) -> None:
@@ -284,10 +318,10 @@ class TrackCalculator:
                 if not np.isnan(row["X"]) and not np.isnan(row["Y"]):
                     detections.append(
                         {
-                            "x1": row["X"] - 20,
-                            "y1": row["Y"] - 20,
-                            "x2": row["X"] + 20,
-                            "y2": row["Y"] + 20,
+                            "x1": row["X"] - 10,
+                            "y1": row["Y"] - 10,
+                            "x2": row["X"] + 10,
+                            "y2": row["Y"] + 10,
                             "confidence": row["Visibility"],
                             "cls_id": 0,
                         }
