@@ -6,6 +6,8 @@
 
 High-speed pipeline for volleyball ball detection, rally extraction, and automatic generation of 9:16 reels.
 
+[![src/ball_tracker.py](https://img.youtube.com/vi/TBDrTMFMoFA/hqdefault.jpg)](https://www.youtube.com/watch?v=TBDrTMFMoFA)
+
 ## Pipeline
 1. `src/inference_onnx_seq_gray_v2.py` -> detects ball and writes `ball.csv` (and optional `predict.mp4`).
 2. `src/track_calculator.py` -> converts `ball.csv` to rally tracks (`track_*.json`).
