@@ -1,19 +1,36 @@
 import argparse
+import logging
+import os
+import queue
+import threading
+import time
+from typing import List, Optional, Tuple
+
 import cv2
 import numpy as np
+import onnxruntime as ort
 import pandas as pd
-import onnxruntime as ort
-from collections import deque
-import os
-import time
 from tqdm import tqdm
-import threading
-import queue
 
-import os
-os.environ['LD_LIBRARY_PATH'] = './.venv/lib/python3.12/site-packages/nvidia/cublas/lib:' + os.environ.get('LD_LIBRARY_PATH', '')
-import onnxruntime as ort
+from constants import (
+    DEFAULT_HEATMAP_THRESHOLD,
+    DEFAULT_INPUT_HEIGHT,
+    DEFAULT_INPUT_WIDTH,
+)
+from models import BallTrack
+
+os.environ["LD_LIBRARY_PATH"] = "./.venv/lib/python3.12/site-packages/nvidia/cublas/lib:" + os.environ.get(
+    "LD_LIBRARY_PATH", ""
+)
 ort.preload_dlls()
+
+LOG = logging.getLogger(__name__)
+
+
+def setup_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -46,6 +63,13 @@ def parse_args():
         default=False,
         help="Save only CSV, skip video output",
     )
+    parser.add_argument(
+        "--confidence_threshold",
+        type=float,
+        default=DEFAULT_HEATMAP_THRESHOLD,
+        help="Heatmap confidence threshold",
+    )
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     return parser.parse_args()
 
 
@@ -57,7 +81,7 @@ def load_onnx_model(model_path):
     )
     input_names = [inp.name for inp in session.get_inputs()]
     output_names = [out.name for out in session.get_outputs()]
-    
+
     has_gru = "h0" in input_names
     h0_shape = None
     if has_gru:
@@ -73,7 +97,7 @@ def load_onnx_model(model_path):
                 if dim in ["batch", "batch_size", None]:
                     resolved_shape.append(1)
                 elif "hidden" in str(dim).lower():
-                    resolved_shape.append(512)  # Адаптируй под твою модель, если hidden size другой
+                    resolved_shape.append(512)
                 else:
                     raise ValueError(
                         f"Unknown symbolic dimension '{dim}' in h0_shape: {h0_shape}"
@@ -81,8 +105,7 @@ def load_onnx_model(model_path):
             else:
                 resolved_shape.append(dim)
         h0_shape = tuple(resolved_shape)
-    
-    # Determine sequence length from model filename
+
     if "seq15" in model_path.lower():
         out_dim = 15
         batch_size = 15
@@ -92,10 +115,14 @@ def load_onnx_model(model_path):
     else:
         out_dim = 3
         batch_size = 3
-        
-    print(f"✅ Model loaded: {model_path}")
-    print(
-        f"   Has GRU state: {has_gru}, Sequence length: {batch_size}, Output heatmaps: {out_dim}, h0 shape: {h0_shape if has_gru else 'N/A'}"
+
+    LOG.info("Model loaded: %s", model_path)
+    LOG.info(
+        "GRU: %s | Sequence length: %s | Output heatmaps: %s | h0 shape: %s",
+        has_gru,
+        batch_size,
+        out_dim,
+        h0_shape if has_gru else "N/A",
     )
     return session, has_gru, out_dim, h0_shape, batch_size, input_names, output_names
 
@@ -143,7 +170,7 @@ def append_to_csv(result, csv_path):
     pd.DataFrame([result]).to_csv(csv_path, mode="a", header=False, index=False)
 
 
-def preprocess_frames(frames, input_height=288, input_width=512):
+def preprocess_frames(frames, input_height=DEFAULT_INPUT_HEIGHT, input_width=DEFAULT_INPUT_WIDTH):
     processed = []
     for frame in frames:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -154,10 +181,10 @@ def preprocess_frames(frames, input_height=288, input_width=512):
 
 
 def postprocess_output(
-    output, threshold=0.5, input_height=288, input_width=512, out_dim=9
+    output, threshold=DEFAULT_HEATMAP_THRESHOLD, input_height=DEFAULT_INPUT_HEIGHT, input_width=DEFAULT_INPUT_WIDTH, out_dim=9
 ):
     results = []
-    for frame_idx in range(out_dim):  # Process all heatmaps
+    for frame_idx in range(out_dim):
         heatmap = output[0, frame_idx, :, :]
         _, binary = cv2.threshold(heatmap, threshold, 1.0, cv2.THRESH_BINARY)
         contours, _ = cv2.findContours(
@@ -165,10 +192,10 @@ def postprocess_output(
         )
         if contours:
             largest_contour = max(contours, key=cv2.contourArea)
-            M = cv2.moments(largest_contour)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
+            moments = cv2.moments(largest_contour)
+            if moments["m00"] != 0:
+                cx = int(moments["m10"] / moments["m00"])
+                cy = int(moments["m01"] / moments["m00"])
                 results.append((1, cx, cy))
             else:
                 results.append((0, 0, 0))
@@ -178,53 +205,93 @@ def postprocess_output(
 
 
 def draw_track(
-    frame, track_points, current_color=(0, 0, 255), history_color=(255, 0, 0)
+    frame, points: List[Tuple[int, int]], current_color=(0, 0, 255), history_color=(255, 0, 0)
 ):
-    for point in list(track_points)[:-1]:
-        if point is not None:
-            cv2.circle(frame, point, 5, history_color, -1)
-    if track_points and track_points[-1] is not None:
-        cv2.circle(frame, track_points[-1], 5, current_color, -1)
+    for point in points[:-1]:
+        cv2.circle(frame, point, 5, history_color, -1)
+    if points:
+        cv2.circle(frame, points[-1], 5, current_color, -1)
     return frame
 
 
 def run_inference(session, input_tensor, has_gru, h0, input_names, output_names):
-    """Helper для инференса с поддержкой GRU."""
-    inputs = {input_names[0]: input_tensor}  # Основной инпут (кадры)
+    inputs = {input_names[0]: input_tensor}
     if has_gru:
         if len(input_names) < 2:
             raise ValueError("GRU model expects at least 2 inputs: images and h0")
-        inputs[input_names[1]] = h0  # Добавляем h0
-    
+        inputs[input_names[1]] = h0
+
     outputs = session.run(output_names, inputs)
-    
-    heatmaps = outputs[0]  # Первый аутпут — heatmaps
+
+    heatmaps = outputs[0]
     new_h0 = None
     if has_gru:
         if len(outputs) < 2:
             raise ValueError("GRU model should output at least 2 values: heatmaps and hn")
-        new_h0 = outputs[1]  # Второе — новое скрытое состояние
+        new_h0 = outputs[1]
     return heatmaps, new_h0
 
 
-def read_frames(cap, frame_queue, max_frames):
-    frames = []
-    while len(frames) < max_frames:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(frame)
-    if frames:
-        frame_queue.put(frames)
-    else:
-        frame_queue.put(None)
+class BallTrackState:
+    def __init__(self, maxlen: int, max_missing: int) -> None:
+        self._track = BallTrack(maxlen)
+        self._missing = 0
+        self._max_missing = max_missing
+
+    def update(self, point: Optional[Tuple[int, int]]) -> None:
+        self._track.update(point)
+        if point is None:
+            self._missing += 1
+        else:
+            self._missing = 0
+
+    def is_lost(self) -> bool:
+        return self._missing >= self._max_missing
+
+    def reset(self) -> None:
+        self._track.reset()
+        self._missing = 0
+
+    def points(self) -> List[Tuple[int, int]]:
+        return list(self._track.points())
+
+
+def frame_reader(cap, frame_queue, batch_size, stop_event, error_queue):
+    try:
+        while not stop_event.is_set():
+            frames = []
+            for _ in range(batch_size):
+                if stop_event.is_set():
+                    break
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frames.append(frame)
+            if frames:
+                frame_queue.put(frames, timeout=1.0)
+            else:
+                frame_queue.put(None, timeout=1.0)
+                break
+    except Exception as exc:  # pragma: no cover - thread safety
+        error_queue.put(exc)
+        stop_event.set()
 
 
 def main():
     args = parse_args()
-    input_width, input_height = 512, 288
-    
-    model_session, has_gru, out_dim, h0_shape, batch_size, input_names, output_names = load_onnx_model(args.model_path)
+    setup_logging(args.verbose)
+
+    input_width, input_height = DEFAULT_INPUT_WIDTH, DEFAULT_INPUT_HEIGHT
+
+    (
+        model_session,
+        has_gru,
+        out_dim,
+        h0_shape,
+        batch_size,
+        input_names,
+        output_names,
+    ) = load_onnx_model(args.model_path)
 
     cap, frame_width, frame_height, fps, total_frames = initialize_video(
         args.video_path
@@ -235,107 +302,119 @@ def main():
     )
     csv_path = setup_csv_file(video_basename, args.output_dir)
 
-    frame_buffer = deque(maxlen=batch_size)
-    track_points = deque(maxlen=args.track_length)
+    frame_buffer = []
+    track_state = BallTrackState(maxlen=args.track_length, max_missing=args.track_length)
     frame_index = 0
     frame_queue = queue.Queue(maxsize=2)
-    
-    # Инициализация скрытого состояния для GRU
+    error_queue = queue.Queue()
+    stop_event = threading.Event()
+
     h0 = np.zeros(h0_shape, dtype=np.float32) if has_gru and h0_shape else None
 
-    # Start frame reading thread
-    def frame_reader():
-        while cap.isOpened():
-            read_frames(cap, frame_queue, batch_size)
-
-    reader_thread = threading.Thread(target=frame_reader, daemon=True)
+    reader_thread = threading.Thread(
+        target=frame_reader,
+        args=(cap, frame_queue, batch_size, stop_event, error_queue),
+        daemon=True,
+    )
     reader_thread.start()
 
     pbar = tqdm(total=total_frames, desc="Processing video", unit="frame")
+
     exit_flag = False
-    while True:
-        start_time = time.time()
+    try:
+        while not stop_event.is_set():
+            if not error_queue.empty():
+                raise error_queue.get()
 
-        # Get batch of frames
-        frames = frame_queue.get()
-        if frames is None:
-            break
+            try:
+                frames = frame_queue.get(timeout=0.5)
+            except queue.Empty:
+                if not reader_thread.is_alive():
+                    break
+                continue
 
-        # Preprocess frames in batch
-        processed_frames = preprocess_frames(frames, input_height, input_width)
+            if frames is None:
+                break
 
-        # Fill buffer if not enough frames
-        while len(frame_buffer) < batch_size:
-            frame_buffer.append(
-                processed_frames[0]
-                if processed_frames
-                else np.zeros((input_height, input_width), dtype=np.float32)
+            processed_frames = preprocess_frames(frames, input_height, input_width)
+
+            while len(frame_buffer) < batch_size:
+                frame_buffer.append(
+                    processed_frames[0]
+                    if processed_frames
+                    else np.zeros((input_height, input_width), dtype=np.float32)
+                )
+
+            for pf in processed_frames:
+                frame_buffer.append(pf)
+            frame_buffer = frame_buffer[-batch_size:]
+
+            input_tensor = np.stack(frame_buffer, axis=2)
+            input_tensor = np.expand_dims(input_tensor, axis=0)
+            input_tensor = np.transpose(input_tensor, (0, 3, 1, 2))
+
+            output, new_h0 = run_inference(
+                model_session, input_tensor, has_gru, h0, input_names, output_names
+            )
+            if has_gru and new_h0 is not None:
+                h0 = new_h0
+
+            predictions = postprocess_output(
+                output,
+                threshold=args.confidence_threshold,
+                input_height=input_height,
+                input_width=input_width,
+                out_dim=out_dim,
             )
 
-        # Update buffer with new frames
-        for pf in processed_frames:
-            frame_buffer.append(pf)
+            for i, (visibility, x, y) in enumerate(predictions[: len(frames)]):
+                x_orig = x * frame_width / input_width if visibility else -1
+                y_orig = y * frame_height / input_height if visibility else -1
 
-        # Prepare input tensor
-        input_tensor = np.stack(frame_buffer, axis=2)  # (height, width, seq_len)
-        input_tensor = np.expand_dims(input_tensor, axis=0)  # (1, height, width, seq_len)
-        input_tensor = np.transpose(input_tensor, (0, 3, 1, 2))  # (1, seq_len, 288, 512)
+                if visibility:
+                    point = (int(x_orig), int(y_orig))
+                    track_state.update(point)
+                else:
+                    track_state.update(None)
 
-        # Run inference with GRU support
-        output, new_h0 = run_inference(model_session, input_tensor, has_gru, h0, input_names, output_names)
-        if has_gru and new_h0 is not None:
-            h0 = new_h0  # Обновляем состояние для следующего батча
+                if track_state.is_lost():
+                    track_state.reset()
 
-        # Process predictions for all frames
-        predictions = postprocess_output(
-            output, input_height=input_height, input_width=input_width, out_dim=out_dim
-        )
+                result = {
+                    "Frame": frame_index + i,
+                    "Visibility": visibility,
+                    "X": int(x_orig),
+                    "Y": int(y_orig),
+                }
+                append_to_csv(result, csv_path)
 
-        # Save results and visualize for each frame in the batch
-        for i, (visibility, x, y) in enumerate(predictions[: len(frames)]):
-            x_orig = x * frame_width / input_width if visibility else -1
-            y_orig = y * frame_height / input_height if visibility else -1
+                if args.visualize or out_writer is not None:
+                    vis_frame = frames[i].copy()
+                    vis_frame = draw_track(vis_frame, track_state.points())
+                    if args.visualize:
+                        cv2.namedWindow("Ball Tracking", cv2.WINDOW_NORMAL)
+                        cv2.imshow("Ball Tracking", vis_frame)
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            exit_flag = True
+                            stop_event.set()
+                            break
+                    if out_writer is not None:
+                        out_writer.write(vis_frame)
 
-            if visibility:
-                track_points.append((int(x_orig), int(y_orig)))
-            else:
-                if track_points:
-                    track_points.popleft()
+            if exit_flag:
+                break
 
-            result = {
-                "Frame": frame_index + i,
-                "Visibility": visibility,
-                "X": int(x_orig),
-                "Y": int(y_orig),
-            }
-            append_to_csv(result, csv_path)
-
-            if args.visualize or out_writer is not None:
-                vis_frame = frames[i].copy()
-                vis_frame = draw_track(vis_frame, track_points)
-                if args.visualize:
-                    cv2.namedWindow("Ball Tracking", cv2.WINDOW_NORMAL)
-                    cv2.imshow("Ball Tracking", vis_frame)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        exit_flag = True  # Set flag to exit
-                        break
-                if out_writer is not None:
-                    out_writer.write(vis_frame)
-        if exit_flag:
-            break
-
-        end_time = time.time()
-        batch_time = end_time - start_time
-        batch_fps = len(frames) / batch_time if batch_time > 0 else 0
-        pbar.update(len(frames))
-        frame_index += len(frames)
-
-    pbar.close()
-    cap.release()
-    if out_writer is not None:
-        out_writer.release()
-    if args.visualize:
-        cv2.destroyAllWindows()
+            pbar.update(len(frames))
+            frame_index += len(frames)
+    finally:
+        stop_event.set()
+        reader_thread.join(timeout=2.0)
+        pbar.close()
+        cap.release()
+        if out_writer is not None:
+            out_writer.release()
+        if args.visualize:
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
