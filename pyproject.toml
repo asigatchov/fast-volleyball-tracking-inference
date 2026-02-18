@@ -1,24 +1,43 @@
 [project]
 name = "fast-volleyball-tracking-inference"
 version = "0.1.0"
-description = "Add your description here"
+description = "Volleyball tracking inference (headless, Docker-friendly)"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
+
 dependencies = [
+    "ffmpeg-python>=0.2.0",
     "filterpy>=1.4.5",
-    "onnxruntime>=1.22.0",
-    "opencv-contrib-python>=4.12.0.88",
-    "opencv-python>=4.12.0.88",
+    "openvino>=2025.3.0",               # основной inference-движок
+    "onnxruntime>=1.22.0",              # fallback / альтернативный runtime
+    "opencv-python-headless>=4.10.0",   # ← headless версия без GUI (экономия 300–600 МБ в Docker)
     "pandas>=2.3.1",
-    "pyqt5>=5.15.11",
     "scipy>=1.16.0",
-    "seaborn>=0.13.2",
+    "seaborn>=0.13.2",                  # для графиков без GUI (matplotlib backend agg)
     "tabulate>=0.9.0",
     "tqdm>=4.67.1",
 ]
 
-
 [project.optional-dependencies]
+# Для случаев, когда нужен GPU-фallback через ONNX (CUDA)
 gpu = [
-    "onnxruntime-gpu>=1.22.0",  # GPU-версия ONNX
+    "onnxruntime-gpu>=1.22.0",
 ]
+
+# Только для локальной разработки / отладки / визуализации (GUI, notebooks и т.д.)
+dev = [
+    "opencv-contrib-python>=4.12.0.88",  # полная версия с contrib-модулями и GUI (если нужно SIFT и т.п.)
+    "opencv-python>=4.12.0.88",          # или просто opencv-python, если contrib не нужен
+    "pyqt5>=5.15.11",                    # ← GUI-библиотека перемещена сюда
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "matplotlib>=3.9",                   # иногда полезен вместо/вместе с seaborn
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = false
