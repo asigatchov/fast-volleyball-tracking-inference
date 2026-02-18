@@ -21,6 +21,11 @@ cd fast-volleyball-tracking-inference
 uv sync
 ```
 
+For visualization (using `--visualize` parameter):
+```bash
+uv sync --extra dev
+```
+
 ## Quick start (tested)
 Example input:
 - video: `examples/gtu_20250316_002.mp4`
@@ -87,6 +92,14 @@ output/gtu_20250316_002/
 - `--interpolation {hold,linear}`
 - `--margin` - lead offset in movement direction.
 - `--padding {none,mirror,black}`
+
+
+## OpenVino runtime
+### `uv run src/inference_openvino_seq_gray_v2.py`
+- `--model_xml ./ov/VballNetV2_seq9_grayscale_ov.xml`
+- `--video_path ./examples/gtu_20250316_002.mp4`
+- `--only_csv`
+- `--output_dir ./demo-result/`
 
 ## Available ONNX models
 ```text
