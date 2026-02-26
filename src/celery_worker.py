@@ -4,8 +4,14 @@ import shutil
 import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
+import json
 
 from celery import Celery
+
+try:
+    from .make_reels import crop_and_save_track_payload
+except ImportError:
+    from make_reels import crop_and_save_track_payload
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +29,7 @@ celery_app.conf.update(
 )
 API_IMPORT_TASK_NAME = os.getenv("API_IMPORT_TASK_NAME", "api.import_rallies_from_tracks")
 API_SET_STATUS_TASK_NAME = os.getenv("API_SET_STATUS_TASK_NAME", "api.set_project_status")
+API_UPDATE_REEL_TASK_NAME = os.getenv("API_UPDATE_REEL_TASK_NAME", "api.update_reel_result")
 API_IMPORT_TASK_QUEUE = os.getenv("API_IMPORT_TASK_QUEUE", "api-import")
 API_IMPORT_REPLACE_EXISTING = os.getenv("API_IMPORT_REPLACE_EXISTING", "true").lower() in {"1", "true", "yes", "on"}
 
@@ -160,4 +167,85 @@ def process_uploaded_video(project_id: str, user_id: str, file_path: str, file_u
         "ball_csv": str(normalized_csv),
         "tracks_dir": str(tracks_dir),
         "tracks_exists": tracks_dir.exists(),
+    }
+
+
+@celery_app.task(name="inference.make_reels")
+def make_reels_task(
+    project_id: str,
+    user_id: str,
+    file_path: str,
+    file_url: str,
+    reels: list[dict[str, str | int]],
+    uploads_dir: str,
+) -> dict[str, int | str]:
+    parsed = urlparse(file_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("file_url must start with http:// or https://")
+
+    video_path = Path(file_path).resolve()
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+
+    uploads_root = Path(uploads_dir).resolve()
+    reels_dir = uploads_root / project_id / "reels"
+    reels_dir.mkdir(parents=True, exist_ok=True)
+
+    done = 0
+    failed = 0
+    for item in reels:
+        reel_id = str(item.get("reel_id", ""))
+        title = str(item.get("title", "reel"))
+        track_json_raw = item.get("track_json")
+        track_json_path = item.get("track_json_path")
+        try:
+            if not reel_id:
+                raise ValueError("Missing reel_id")
+            track_payload: dict
+            if isinstance(track_json_path, str) and track_json_path:
+                path = Path(track_json_path).resolve()
+                if not path.exists() or not path.is_file():
+                    raise FileNotFoundError(f"track_json_path not found: {path}")
+                with path.open("r", encoding="utf-8") as f:
+                    track_payload = json.load(f)
+            else:
+                if not isinstance(track_json_raw, str):
+                    raise ValueError("Missing track_json or track_json_path")
+                track_payload = json.loads(track_json_raw)
+            if not isinstance(track_payload, dict):
+                raise ValueError("track payload must be object")
+
+            file_name = f"{reel_id}.mp4"
+            output_path = reels_dir / file_name
+            crop_and_save_track_payload(
+                video_path=str(video_path),
+                track_payload=track_payload,
+                output_path=str(output_path),
+            )
+            relative_url = f"/uploads/{project_id}/reels/{file_name}"
+            celery_app.send_task(
+                API_UPDATE_REEL_TASK_NAME,
+                args=[reel_id, project_id, user_id, "ready", relative_url],
+                queue=API_IMPORT_TASK_QUEUE,
+            )
+            done += 1
+            logger.info("Reel generated project=%s reel=%s title=%s path=%s", project_id, reel_id, title, output_path)
+        except Exception:
+            failed += 1
+            logger.exception("Failed to generate reel project=%s reel=%s title=%s", project_id, reel_id, title)
+            try:
+                celery_app.send_task(
+                    API_UPDATE_REEL_TASK_NAME,
+                    args=[reel_id, project_id, user_id, "failed", None],
+                    queue=API_IMPORT_TASK_QUEUE,
+                )
+            except Exception:
+                logger.exception("Failed to enqueue reel failure status project=%s reel=%s", project_id, reel_id)
+
+    return {
+        "project_id": project_id,
+        "user_id": user_id,
+        "generated": done,
+        "failed": failed,
+        "reels_dir": str(reels_dir),
     }

@@ -8,7 +8,10 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from constants import DEFAULT_CROP_ASPECT_RATIO, DEFAULT_FPS, DEFAULT_SMOOTH_WINDOW
+try:
+    from .constants import DEFAULT_CROP_ASPECT_RATIO, DEFAULT_FPS, DEFAULT_SMOOTH_WINDOW
+except ImportError:
+    from constants import DEFAULT_CROP_ASPECT_RATIO, DEFAULT_FPS, DEFAULT_SMOOTH_WINDOW
 
 LOG = logging.getLogger(__name__)
 
@@ -42,6 +45,33 @@ def load_single_track(track_json_path: str) -> Dict:
     return {
         "start_frame": data["start_frame"],
         "last_frame": data["last_frame"],
+        "positions": positions,
+    }
+
+
+def load_track_from_payload(track_payload: Dict) -> Dict:
+    positions = []
+    for item in track_payload.get("positions", []):
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        xy, frame = item[0], item[1]
+        if not isinstance(xy, (list, tuple)) or len(xy) < 2:
+            continue
+        x, y = xy[0], xy[1]
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            continue
+        if not isinstance(frame, (int, float)):
+            continue
+        positions.append((float(x), float(y), int(frame)))
+
+    start_frame = track_payload.get("start_frame")
+    last_frame = track_payload.get("last_frame")
+    if not isinstance(start_frame, int) or not isinstance(last_frame, int):
+        raise ValueError("track_json must include integer start_frame and last_frame")
+
+    return {
+        "start_frame": start_frame,
+        "last_frame": last_frame,
         "positions": positions,
     }
 
@@ -225,6 +255,33 @@ def crop_and_save_track(
         out.release()
     if visualize:
         cv2.destroyAllWindows()
+
+
+def crop_and_save_track_payload(
+    video_path: str,
+    track_payload: Dict,
+    output_path: str,
+    visualize: bool = False,
+    smoothing: str = "moving_avg",
+    interpolation: str = "hold",
+    smooth_window: int = DEFAULT_SMOOTH_WINDOW,
+    smooth_polyorder: int = 2,
+    margin: float = 0.0,
+    padding: str = "none",
+) -> None:
+    track = load_track_from_payload(track_payload)
+    crop_and_save_track(
+        video_path=video_path,
+        track=track,
+        output_path=output_path,
+        visualize=visualize,
+        smoothing=smoothing,
+        interpolation=interpolation,
+        smooth_window=smooth_window,
+        smooth_polyorder=smooth_polyorder,
+        margin=margin,
+        padding=padding,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
