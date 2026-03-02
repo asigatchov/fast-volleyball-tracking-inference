@@ -10,6 +10,12 @@ from typing import Dict, List, Tuple
 import cv2
 import numpy as np
 from tqdm import tqdm
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:  # pragma: no cover - optional dependency
+    Image = None
+    ImageDraw = None
+    ImageFont = None
 
 try:
     from .constants import DEFAULT_CROP_ASPECT_RATIO, DEFAULT_FPS, DEFAULT_SMOOTH_WINDOW
@@ -18,6 +24,7 @@ except ImportError:
 
 LOG = logging.getLogger(__name__)
 WATERMARK_TEXT = "vb-ai.ru"
+WATERMARK_FONT_PATH = Path(__file__).resolve().parent / "fonts" / "PlayfairDisplay-MediumItalic.ttf"
 
 
 try:
@@ -178,20 +185,42 @@ def crop_frame(frame: np.ndarray, center_x: int, crop_width: int, padding: str) 
 def add_watermark_top_right(frame: np.ndarray, text: str = WATERMARK_TEXT) -> np.ndarray:
     """Draw a compact watermark in the top-right corner."""
     h, w = frame.shape[:2]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = max(0.6, min(1.0, w / 1200.0)) * 3.0
-    thickness = max(1, int(round(scale * 2)))
-    margin = max(10, int(round(scale * 16)))
     alpha = 0.2
+    scale = max(0.6, min(1.0, w / 1200.0)) * 3.0
+    margin = max(10, int(round(scale * 16)))
 
-    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+    if Image is not None and ImageDraw is not None and ImageFont is not None and WATERMARK_FONT_PATH.exists():
+        try:
+            font_size = max(16, int(round(scale * 24)))
+            font = ImageFont.truetype(str(WATERMARK_FONT_PATH), size=font_size)
+            rgba = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
+            overlay = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+
+            left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+            text_w = right - left
+            text_h = bottom - top
+            x = max(margin, w - text_w - margin)
+            y = margin
+            text_alpha = int(round(255 * alpha))
+
+            draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, text_alpha))
+            draw.text((x, y), text, font=font, fill=(255, 255, 255, text_alpha))
+
+            composited = Image.alpha_composite(rgba, overlay).convert("RGB")
+            return cv2.cvtColor(np.array(composited), cv2.COLOR_RGB2BGR)
+        except Exception:
+            LOG.exception("Failed to render watermark with TTF font, fallback to OpenCV font")
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thickness = max(1, int(round(scale * 2)))
+    (text_w, text_h), _ = cv2.getTextSize(text, font, scale, thickness)
     x = max(margin, w - text_w - margin)
     y = margin + text_h
 
-    overlay = frame.copy()
-    # Shadow first for readability on bright backgrounds.
+    fallback_overlay = frame.copy()
     cv2.putText(
-        overlay,
+        fallback_overlay,
         text,
         (x + 2, y + 2),
         font,
@@ -200,8 +229,8 @@ def add_watermark_top_right(frame: np.ndarray, text: str = WATERMARK_TEXT) -> np
         thickness + 2,
         cv2.LINE_AA,
     )
-    cv2.putText(overlay, text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    cv2.putText(fallback_overlay, text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    cv2.addWeighted(fallback_overlay, alpha, frame, 1 - alpha, 0, frame)
     return frame
 
 
