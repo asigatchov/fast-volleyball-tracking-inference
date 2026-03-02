@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -22,6 +22,7 @@ from constants import (
     DEFAULT_NET_Y_THRESHOLD,
 )
 from court_transformer import CoordinateTransformer, CourtTransformer
+from models import CourtGeometry
 from track_utils import find_cyclic_sequences, find_rolling_sequences
 
 LOG = logging.getLogger(__name__)
@@ -38,6 +39,8 @@ class TrackCalculatorConfig:
     min_y_displacement: float
     bounce_frames: int
     court_json_path: Optional[str]
+    video_width: Optional[int]
+    video_height: Optional[int]
 
 
 def setup_logging(verbose: bool) -> None:
@@ -62,6 +65,7 @@ class TrackCalculator:
     def __init__(self, config: TrackCalculatorConfig) -> None:
         self.config = config
         self.tracks: List[Track] = []
+        self._camera_position = "unknown"
 
         transformer = CourtTransformer(config.court_json_path)
         result = transformer.load()
@@ -74,6 +78,8 @@ class TrackCalculator:
 
         if config.court_json_path and not self._court_geometry:
             LOG.warning("Court JSON provided but could not be loaded, using image coordinates")
+        else:
+            self._camera_position = self._classify_camera_position()
 
     def _validate_csv(self) -> None:
         if not os.path.exists(self.config.csv_path):
@@ -86,7 +92,92 @@ class TrackCalculator:
         df["X"] = pd.to_numeric(df["X"], errors="coerce")
         df["Y"] = pd.to_numeric(df["Y"], errors="coerce")
         df.loc[(df["X"] == -1) | (df["Visibility"] == 0), ["X", "Y"]] = np.nan
+        self._maybe_rescale_court_geometry(df)
         return df
+
+    def _maybe_rescale_court_geometry(self, df: pd.DataFrame) -> None:
+        if not self._court_enabled or not self._court_geometry:
+            return
+
+        target_w = self.config.video_width
+        target_h = self.config.video_height
+
+        if target_w is None or target_h is None:
+            max_x = df["X"].max(skipna=True)
+            max_y = df["Y"].max(skipna=True)
+            if (
+                pd.notna(max_x)
+                and pd.notna(max_y)
+                and (
+                    max_x > self._court_geometry.image_width
+                    or max_y > self._court_geometry.image_height
+                )
+            ):
+                target_w = max(int(max_x) + 1, self._court_geometry.image_width)
+                target_h = max(int(max_y) + 1, self._court_geometry.image_height)
+                LOG.warning(
+                    "Detected coordinates exceed court.json image size (%sx%s). "
+                    "Applied best-effort scaling to %sx%s; prefer explicit --video_width/--video_height.",
+                    self._court_geometry.image_width,
+                    self._court_geometry.image_height,
+                    target_w,
+                    target_h,
+                )
+
+        if target_w is None or target_h is None:
+            return
+        if target_w <= 0 or target_h <= 0:
+            return
+        if (
+            target_w == self._court_geometry.image_width
+            and target_h == self._court_geometry.image_height
+        ):
+            return
+
+        scale_x = target_w / self._court_geometry.image_width
+        scale_y = target_h / self._court_geometry.image_height
+        scaled_keypoints = tuple((x * scale_x, y * scale_y) for x, y in self._court_geometry.keypoints)
+
+        self._court_geometry = CourtGeometry(
+            length_m=self._court_geometry.length_m,
+            width_m=self._court_geometry.width_m,
+            net_height_m=self._court_geometry.net_height_m,
+            image_width=target_w,
+            image_height=target_h,
+            keypoints=scaled_keypoints,
+        )
+        self._court_matrix = CourtTransformer._calculate_transform(scaled_keypoints)
+        self._coordinate_transformer = CoordinateTransformer(self._court_geometry, self._court_matrix)
+        self._camera_position = self._classify_camera_position()
+        LOG.info("Scaled court keypoints to %sx%s", target_w, target_h)
+
+    def _classify_camera_position(self) -> str:
+        if not self._court_geometry or len(self._court_geometry.keypoints) < 8:
+            return "unknown"
+
+        p1, p2, p3, p4 = self._court_geometry.keypoints[:4]
+        p7, p8 = self._court_geometry.keypoints[6], self._court_geometry.keypoints[7]
+
+        dx = p8[0] - p7[0]
+        dy = p8[1] - p7[1]
+        court_span = max(np.hypot(p4[0] - p1[0], p4[1] - p1[1]), np.hypot(p3[0] - p2[0], p3[1] - p2[1]), 1.0)
+        net_span = np.hypot(dx, dy)
+        net_span_ratio = net_span / court_span
+
+        if abs(dx) < 1.0 or abs(dy) / (abs(dx) + 1e-6) > 0.7 or net_span_ratio < 0.28:
+            return "sideline"
+
+        left_depth = np.hypot(p2[0] - p1[0], p2[1] - p1[1])
+        right_depth = np.hypot(p4[0] - p3[0], p4[1] - p3[1])
+        depth_ratio = max(left_depth, right_depth) / max(1.0, min(left_depth, right_depth))
+        net_mid_x = (p7[0] + p8[0]) / 2.0
+        center_offset = abs(net_mid_x - self._court_geometry.image_width / 2.0) / max(
+            1.0, self._court_geometry.image_width
+        )
+
+        if depth_ratio <= 1.35 and center_offset <= 0.12:
+            return "backline"
+        return "diagonal"
 
     @staticmethod
     def _is_overlapping(track1: Track, track2: Track) -> bool:
@@ -115,6 +206,120 @@ class TrackCalculator:
             track.positions = [
                 pos for pos in track.positions if track.start_frame <= pos[1] <= track.last_frame
             ]
+        return track
+
+    def _net_y_at_x(self, x: float) -> float:
+        if not self._court_geometry or len(self._court_geometry.keypoints) < 8:
+            return DEFAULT_NET_Y_THRESHOLD
+
+        net_left = self._court_geometry.keypoints[6]
+        net_right = self._court_geometry.keypoints[7]
+        dx = net_right[0] - net_left[0]
+        if abs(dx) < 1e-6:
+            return float(min(net_left[1], net_right[1]))
+        t = (x - net_left[0]) / dx
+        return float(net_left[1] + t * (net_right[1] - net_left[1]))
+
+    def _is_above_net(self, x: float, y: float) -> bool:
+        net_y = self._net_y_at_x(x)
+        image_h = self._court_geometry.image_height if self._court_geometry else 720
+        clearance = max(6.0, image_h * 0.01)
+        return y < (net_y - clearance)
+
+    def _find_rolling_start_frame(
+        self, positions: List[Any], start_index: int = 0
+    ) -> Optional[int]:
+        if not positions or start_index >= len(positions):
+            return None
+
+        tail = positions[start_index:]
+        if len(tail) < 8:
+            return None
+
+        xs = np.array([p[0][0] for p in tail], dtype=np.float64)
+        ys = np.array([p[0][1] for p in tail], dtype=np.float64)
+        frames = np.array([p[1] for p in tail], dtype=np.int64)
+
+        image_w = self._court_geometry.image_width if self._court_geometry else 1280
+        image_h = self._court_geometry.image_height if self._court_geometry else 720
+
+        window = 8
+        y_range_threshold = max(18.0, image_h * 0.025)
+        x_range_threshold = max(30.0, image_w * 0.03)
+        floor_y = float(np.percentile(ys, 85))
+        floor_tolerance = max(22.0, image_h * 0.05)
+
+        for i in range(0, len(tail) - window + 1):
+            xw = xs[i : i + window]
+            yw = ys[i : i + window]
+
+            y_range = float(np.max(yw) - np.min(yw))
+            x_range = float(np.max(xw) - np.min(xw))
+            is_near_floor = float(np.mean(yw)) >= (floor_y - floor_tolerance)
+            if y_range <= y_range_threshold and x_range >= x_range_threshold and is_near_floor:
+                return int(frames[i])
+
+        return None
+
+    def _analyze_track_trajectory(self, track: Track) -> Dict[str, Any]:
+        positions = sorted(track.positions, key=lambda p: p[1])
+        if not positions:
+            return {
+                "camera_position": self._camera_position,
+                "last_above_net_frame": None,
+                "stop_rising_above_net_frame": None,
+                "rolling_start_frame": None,
+                "game_pause_frame": None,
+                "stop_rising_above_net_sec": None,
+            }
+
+        above_flags = [self._is_above_net(pos[0][0], pos[0][1]) for pos in positions]
+        above_indices = [idx for idx, flag in enumerate(above_flags) if flag]
+        last_above_idx = above_indices[-1] if above_indices else None
+        last_above_frame = positions[last_above_idx][1] if last_above_idx is not None else None
+
+        stop_rising_frame = None
+        search_start_idx = 0
+        if last_above_idx is not None and (last_above_idx + 1) < len(positions):
+            stop_rising_frame = positions[last_above_idx + 1][1]
+            search_start_idx = last_above_idx + 1
+
+        rolling_start_frame = self._find_rolling_start_frame(positions, start_index=search_start_idx)
+        game_pause_frame = rolling_start_frame
+
+        if rolling_start_frame is not None:
+            stop_rising_frame = rolling_start_frame
+        elif stop_rising_frame is not None:
+            game_pause_frame = stop_rising_frame
+
+        stop_rising_sec = (
+            float(stop_rising_frame) / self.config.fps
+            if stop_rising_frame is not None and self.config.fps > 0
+            else None
+        )
+
+        return {
+            "camera_position": self._camera_position,
+            "last_above_net_frame": int(last_above_frame) if last_above_frame is not None else None,
+            "stop_rising_above_net_frame": int(stop_rising_frame) if stop_rising_frame is not None else None,
+            "rolling_start_frame": int(rolling_start_frame) if rolling_start_frame is not None else None,
+            "game_pause_frame": int(game_pause_frame) if game_pause_frame is not None else None,
+            "stop_rising_above_net_sec": stop_rising_sec,
+        }
+
+    def _trim_after_game_pause(self, track: Track) -> Track:
+        if not track.positions:
+            return track
+
+        analysis = self._analyze_track_trajectory(track)
+        pause_frame = analysis["game_pause_frame"]
+        if pause_frame is None:
+            return track
+        if pause_frame <= track.start_frame or pause_frame >= track.last_frame:
+            return track
+
+        track.last_frame = int(pause_frame)
+        track.positions = [pos for pos in track.positions if track.start_frame <= pos[1] <= track.last_frame]
         return track
 
     def _filter_by_min_duration(self, tracks: List[Track]) -> List[Track]:
@@ -170,26 +375,20 @@ class TrackCalculator:
     def _over_net_level(self, track: Track) -> bool:
         if not track.positions:
             return False
-
-        net_y = DEFAULT_NET_Y_THRESHOLD
-        if self._court_geometry and len(self._court_geometry.keypoints) >= 8:
-            net_left_y = self._court_geometry.keypoints[6][1]
-            net_right_y = self._court_geometry.keypoints[7][1]
-            net_y = min(net_left_y, net_right_y)
-
-        min_ball_y = min(pos[0][1] for pos in track.positions)
-        return min_ball_y < net_y
+        return any(self._is_above_net(pos[0][0], pos[0][1]) for pos in track.positions)
 
     def _filter_by_net(self, tracks: List[Track]) -> List[Track]:
         return [track for track in tracks if self._over_net_level(track)]
 
     def _filter_short_tracks(self, episodes: List[Track]) -> List[Track]:
         episodes = [self._trim_bounce_start(ep) for ep in episodes]
+        episodes = [self._trim_after_game_pause(ep) for ep in episodes]
         episodes = self._filter_by_min_duration(episodes)
         episodes = self._remove_overlapping(episodes)
         episodes = self._extend_tracks(episodes)
         episodes = self._merge_overlapping(episodes)
         episodes = [self._trim_bounce_start(ep) for ep in episodes]
+        episodes = [self._trim_after_game_pause(ep) for ep in episodes]
         if self._court_enabled:
             episodes = self._filter_by_net(episodes)
         return sorted(episodes, key=lambda x: x.start_frame)
@@ -237,6 +436,8 @@ class TrackCalculator:
 
         for track in self.tracks:
             track_dict = track.to_dict()
+            trajectory_analysis = self._analyze_track_trajectory(track)
+            track_dict["trajectory_analysis"] = trajectory_analysis
             if self._court_enabled:
                 court_positions = []
                 for pos in track_dict["positions"]:
@@ -249,6 +450,7 @@ class TrackCalculator:
                     "image_height": self._court_geometry.image_height,
                     "court_points_count": len(self._court_geometry.keypoints),
                     "has_court_transform": self._court_matrix is not None,
+                    "camera_position": self._camera_position,
                 }
 
             file_path = os.path.join(tracks_dir, f"track_{track.track_id:04d}.json")
@@ -270,6 +472,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Calculate tracks from CSV to JSON")
     parser.add_argument("--csv_path", type=str, required=True, help="Path to ball.csv")
     parser.add_argument("--court_json_path", type=str, help="Path to court coordinates JSON file")
+    parser.add_argument(
+        "--video_width",
+        type=int,
+        default=1920,
+        help="Source video width for court scaling (default: 1920)",
+    )
+    parser.add_argument(
+        "--video_height",
+        type=int,
+        default=1080,
+        help="Source video height for court scaling (default: 1080)",
+    )
     parser.add_argument(
         "--output_dir", type=str, default="output", help="Root output directory for JSON"
     )
@@ -320,6 +534,8 @@ def main() -> None:
         max_x_displacement=args.max_x_displacement,
         min_y_displacement=args.min_y_displacement,
         bounce_frames=args.bounce_frames,
+        video_width=args.video_width,
+        video_height=args.video_height,
     )
 
     calculator = TrackCalculator(config)
