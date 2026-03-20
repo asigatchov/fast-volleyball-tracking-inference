@@ -3,7 +3,7 @@ import logging
 import os
 import queue
 import threading
-import time
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import cv2
@@ -25,6 +25,11 @@ os.environ["LD_LIBRARY_PATH"] = "./.venv/lib/python3.12/site-packages/nvidia/cub
 ort.preload_dlls()
 
 LOG = logging.getLogger(__name__)
+
+GRID_INPUT_WIDTH = 768
+GRID_INPUT_HEIGHT = 432
+GRID_COLS = 48
+GRID_ROWS = 27
 
 
 def setup_logging(verbose: bool) -> None:
@@ -73,9 +78,31 @@ def parse_args():
     return parser.parse_args()
 
 
+def infer_model_params(model_path: str) -> dict:
+    model_name = Path(model_path).name.lower()
+    if "vballnetgrid" in model_name:
+        return {
+            "family": "grid",
+            "seq": 9,
+            "input_width": GRID_INPUT_WIDTH,
+            "input_height": GRID_INPUT_HEIGHT,
+            "grid_cols": GRID_COLS,
+            "grid_rows": GRID_ROWS,
+        }
+    return {
+        "family": "heatmap",
+        "seq": 15 if "seq15" in model_name else 9 if "seq9" in model_name else 3,
+        "input_width": DEFAULT_INPUT_WIDTH,
+        "input_height": DEFAULT_INPUT_HEIGHT,
+        "grid_cols": None,
+        "grid_rows": None,
+    }
+
+
 def load_onnx_model(model_path):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
+    model_params = infer_model_params(model_path)
     session = ort.InferenceSession(
         model_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
     )
@@ -106,25 +133,27 @@ def load_onnx_model(model_path):
                 resolved_shape.append(dim)
         h0_shape = tuple(resolved_shape)
 
-    if "seq15" in model_path.lower():
-        out_dim = 15
-        batch_size = 15
-    elif "seq9" in model_path.lower():
-        out_dim = 9
-        batch_size = 9
-    else:
-        out_dim = 3
-        batch_size = 3
+    out_dim = model_params["seq"]
+    batch_size = model_params["seq"]
 
     LOG.info("Model loaded: %s", model_path)
     LOG.info(
-        "GRU: %s | Sequence length: %s | Output heatmaps: %s | h0 shape: %s",
+        "Family: %s | GRU: %s | Sequence length: %s | h0 shape: %s",
+        model_params["family"],
         has_gru,
         batch_size,
-        out_dim,
         h0_shape if has_gru else "N/A",
     )
-    return session, has_gru, out_dim, h0_shape, batch_size, input_names, output_names
+    return (
+        session,
+        has_gru,
+        out_dim,
+        h0_shape,
+        batch_size,
+        input_names,
+        output_names,
+        model_params,
+    )
 
 
 def initialize_video(video_path):
@@ -170,7 +199,9 @@ def append_to_csv(result, csv_path):
     pd.DataFrame([result]).to_csv(csv_path, mode="a", header=False, index=False)
 
 
-def preprocess_frames(frames, input_height=DEFAULT_INPUT_HEIGHT, input_width=DEFAULT_INPUT_WIDTH):
+def preprocess_frames(
+    frames, input_height=DEFAULT_INPUT_HEIGHT, input_width=DEFAULT_INPUT_WIDTH
+):
     processed = []
     for frame in frames:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -180,8 +211,12 @@ def preprocess_frames(frames, input_height=DEFAULT_INPUT_HEIGHT, input_width=DEF
     return processed
 
 
-def postprocess_output(
-    output, threshold=DEFAULT_HEATMAP_THRESHOLD, input_height=DEFAULT_INPUT_HEIGHT, input_width=DEFAULT_INPUT_WIDTH, out_dim=9
+def postprocess_heatmap_output(
+    output,
+    threshold=DEFAULT_HEATMAP_THRESHOLD,
+    input_height=DEFAULT_INPUT_HEIGHT,
+    input_width=DEFAULT_INPUT_WIDTH,
+    out_dim=9,
 ):
     results = []
     for frame_idx in range(out_dim):
@@ -204,8 +239,55 @@ def postprocess_output(
     return results
 
 
+def postprocess_grid_output(
+    output, threshold, seq, input_height, input_width, grid_rows, grid_cols
+):
+    output = output[0].reshape(seq, 3, grid_rows, grid_cols)
+    results = []
+    for frame_idx in range(seq):
+        conf = output[frame_idx, 0]
+        x_offset = output[frame_idx, 1]
+        y_offset = output[frame_idx, 2]
+        max_index = int(np.argmax(conf))
+        row = max_index // grid_cols
+        col = max_index % grid_cols
+        conf_score = float(conf[row, col])
+        if conf_score < threshold:
+            results.append((0, 0, 0))
+            continue
+        x = (col + float(x_offset[row, col])) * (input_width / grid_cols)
+        y = (row + float(y_offset[row, col])) * (input_height / grid_rows)
+        x = int(np.clip(x, 0, input_width - 1))
+        y = int(np.clip(y, 0, input_height - 1))
+        results.append((1, x, y))
+    return results
+
+
+def decode_predictions(output, model_params, threshold):
+    if model_params["family"] == "grid":
+        return postprocess_grid_output(
+            output=output,
+            threshold=threshold,
+            seq=model_params["seq"],
+            input_height=model_params["input_height"],
+            input_width=model_params["input_width"],
+            grid_rows=model_params["grid_rows"],
+            grid_cols=model_params["grid_cols"],
+        )
+    return postprocess_heatmap_output(
+        output=output,
+        threshold=threshold,
+        input_height=model_params["input_height"],
+        input_width=model_params["input_width"],
+        out_dim=model_params["seq"],
+    )
+
+
 def draw_track(
-    frame, points: List[Tuple[int, int]], current_color=(0, 0, 255), history_color=(255, 0, 0)
+    frame,
+    points: List[Tuple[int, int]],
+    current_color=(0, 0, 255),
+    history_color=(255, 0, 0),
 ):
     for point in points[:-1]:
         cv2.circle(frame, point, 5, history_color, -1)
@@ -281,8 +363,6 @@ def main():
     args = parse_args()
     setup_logging(args.verbose)
 
-    input_width, input_height = DEFAULT_INPUT_WIDTH, DEFAULT_INPUT_HEIGHT
-
     (
         model_session,
         has_gru,
@@ -291,7 +371,10 @@ def main():
         batch_size,
         input_names,
         output_names,
+        model_params,
     ) = load_onnx_model(args.model_path)
+    input_width = model_params["input_width"]
+    input_height = model_params["input_height"]
 
     cap, frame_width, frame_height, fps, total_frames = initialize_video(
         args.video_path
@@ -359,13 +442,7 @@ def main():
             if has_gru and new_h0 is not None:
                 h0 = new_h0
 
-            predictions = postprocess_output(
-                output,
-                threshold=args.confidence_threshold,
-                input_height=input_height,
-                input_width=input_width,
-                out_dim=out_dim,
-            )
+            predictions = decode_predictions(output, model_params, args.confidence_threshold)
 
             for i, (visibility, x, y) in enumerate(predictions[: len(frames)]):
                 x_orig = x * frame_width / input_width if visibility else -1

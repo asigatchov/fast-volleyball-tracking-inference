@@ -1,85 +1,121 @@
 #!/usr/bin/env python3
+
 import argparse
+import os
+import time
+from collections import deque
+from pathlib import Path
+
 import cv2
 import numpy as np
 import pandas as pd
 from openvino.runtime import Core
-from collections import deque
-import os
-import time
 from tqdm import tqdm
-import threading
-import queue
+
+
+DEFAULT_INPUT_WIDTH = 512
+DEFAULT_INPUT_HEIGHT = 288
+DEFAULT_SEQ = 9
+GRID_INPUT_WIDTH = 768
+GRID_INPUT_HEIGHT = 432
+GRID_COLS = 48
+GRID_ROWS = 27
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Volleyball ball detection with OpenVINO 2025+ (Intel GPU, grayscale)"
+        description="Volleyball ball detection with OpenVINO (heatmap and grid grayscale models)"
     )
     parser.add_argument("--video_path", type=str, required=True, help="Path to input video")
-    parser.add_argument("--model_xml", type=str, required=True, help="Path to .xml")
+    parser.add_argument("--model_xml", type=str, required=True, help="Path to .xml or .onnx model")
     parser.add_argument("--track_length", type=int, default=8, help="Track length")
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory")
     parser.add_argument("--visualize", action="store_true", help="Show visualization")
     parser.add_argument("--only_csv", action="store_true", help="Save only CSV")
     parser.add_argument("--device", type=str, default="GPU", help="CPU, GPU, AUTO")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Confidence threshold")
     return parser.parse_args()
 
 
-def load_model(model_xml, device="CPU"):
-    model_bin = model_xml.replace(".xml", ".bin")
-    if not os.path.exists(model_xml):
-        raise FileNotFoundError(f"XML не найден: {model_xml}")
-    if not os.path.exists(model_bin):
-        raise FileNotFoundError(f"BIN не найден: {model_bin}")
+def infer_model_params(model_path):
+    model_name = Path(model_path).name.lower()
+    if "vballnetgrid" in model_name:
+        return {
+            "family": "grid",
+            "seq": 9,
+            "grayscale": True,
+            "input_width": GRID_INPUT_WIDTH,
+            "input_height": GRID_INPUT_HEIGHT,
+            "grid_cols": GRID_COLS,
+            "grid_rows": GRID_ROWS,
+        }
+    return {
+        "family": "heatmap",
+        "seq": DEFAULT_SEQ,
+        "grayscale": True,
+        "input_width": DEFAULT_INPUT_WIDTH,
+        "input_height": DEFAULT_INPUT_HEIGHT,
+        "grid_cols": None,
+        "grid_rows": None,
+    }
 
+
+def load_model(model_path, device="CPU"):
+    path = Path(model_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Модель не найдена: {path}")
+    if path.suffix.lower() == ".xml":
+        model_bin = path.with_suffix(".bin")
+        if not model_bin.exists():
+            raise FileNotFoundError(f"BIN не найден: {model_bin}")
+
+    model_params = infer_model_params(path)
     core = Core()
-    model = core.read_model(model=model_xml)
+    model = core.read_model(model=str(path))
 
-    # === КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: обработка динамических входов ===
     input_layer = model.input(0)
     pshape = input_layer.partial_shape
+    expected_shape = [
+        1,
+        model_params["seq"],
+        model_params["input_height"],
+        model_params["input_width"],
+    ]
 
     print(f"Исходная форма входа: {pshape}")
-
     if pshape.is_dynamic:
-        print("Динамическая форма — фиксируем на [1,9,288,512]")
-        model.reshape({input_layer.any_name: [1, 9, 288, 512]})
+        print(f"Динамическая форма — фиксируем на {expected_shape}")
+        model.reshape({input_layer.any_name: expected_shape})
 
-    # Теперь компилируем
     compiled_model = core.compile_model(model=model, device_name=device)
-
-    # Получаем финальные слои
     input_layer = compiled_model.input(0)
     output_layer = compiled_model.output(0)
-    input_shape = input_layer.shape
-    out_dim = input_shape[1]  # seq length = 9
 
     print(f"Модель загружена на: {device}")
-    print(f"  Вход: {input_layer.any_name} {input_shape}")
+    print(f"  Вход: {input_layer.any_name} {input_layer.shape}")
     print(f"  Выход: {output_layer.any_name} {output_layer.shape}")
-    print(f"  out_dim = {out_dim}")
+    print(f"  Семейство: {model_params['family']}")
 
-    return compiled_model, input_layer, output_layer, out_dim, input_shape
+    return compiled_model, input_layer, output_layer, model_params
 
 
 def initialize_video(video_path):
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise ValueError(f"Не открыть видео: {video_path}")
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    return cap, w, h, fps, total
+    return cap, width, height, fps, total
 
 
-def setup_output_writer(basename, out_dir, w, h, fps, only_csv):
+def setup_output_writer(basename, out_dir, width, height, fps, only_csv):
     if out_dir is None or only_csv:
         return None, None
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{basename}_predict.mp4")
-    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
     return writer, path
 
 
@@ -97,155 +133,189 @@ def append_to_csv(result, csv_path):
         pd.DataFrame([result]).to_csv(csv_path, mode="a", header=False, index=False)
 
 
-def preprocess_frames(frames, h=288, w=512):
+def preprocess_frames(frames, input_height, input_width):
     processed = []
     for frame in frames:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        resized = cv2.resize(gray, (w, h))
-        normalized = resized.astype(np.float32) / 255.0
-        processed.append(normalized)
+        resized = cv2.resize(gray, (input_width, input_height), interpolation=cv2.INTER_AREA)
+        processed.append(resized.astype(np.float32) / 255.0)
     return processed
 
 
-def _postprocess_output(output, threshold=0.5, in_h=288, in_w=512, out_dim=9):
+def postprocess_heatmap(output, threshold, input_height, input_width, out_dim):
     results = []
     for i in range(out_dim):
-        heatmap = output[i, 0, :, :]
+        heatmap = output[i]
         _, binary = cv2.threshold(heatmap, threshold, 1.0, cv2.THRESH_BINARY)
         contours, _ = cv2.findContours(
             (binary * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        if contours:
-            c = max(contours, key=cv2.contourArea)
-            M = cv2.moments(c)
-            if M["m00"] > 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                results.append((1, cx, cy))
-            else:
-                results.append((0, 0, 0))
-        else:
-            results.append((0, 0, 0))
+        if not contours:
+            results.append((0, -1, -1))
+            continue
+        contour = max(contours, key=cv2.contourArea)
+        moments = cv2.moments(contour)
+        if moments["m00"] <= 0:
+            results.append((0, -1, -1))
+            continue
+        cx = int(moments["m10"] / moments["m00"])
+        cy = int(moments["m01"] / moments["m00"])
+        results.append((1, cx, cy))
     return results
 
-def postprocess_output(output, threshold=0.5, in_h=288, in_w=512, out_dim=9):
+
+def postprocess_grid(output, threshold, seq, input_height, input_width, grid_rows, grid_cols):
+    output = output.reshape(seq, 3, grid_rows, grid_cols)
     results = []
-    for i in range(out_dim):
-        heatmap = output[i]  # (288, 512)
-        _, binary = cv2.threshold(heatmap, threshold, 1.0, cv2.THRESH_BINARY)
-        contours, _ = cv2.findContours(
-            (binary * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        if contours:
-            c = max(contours, key=cv2.contourArea)
-            M = cv2.moments(c)
-            if M["m00"] > 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                results.append((1, cx, cy))
-            else:
-                results.append((0, 0, 0))
-        else:
-            results.append((0, 0, 0))
+    for frame_idx in range(seq):
+        conf = output[frame_idx, 0]
+        x_offset = output[frame_idx, 1]
+        y_offset = output[frame_idx, 2]
+        max_index = int(np.argmax(conf))
+        row = max_index // grid_cols
+        col = max_index % grid_cols
+        conf_score = float(conf[row, col])
+        if conf_score < threshold:
+            results.append((0, -1, -1))
+            continue
+        x = (col + float(x_offset[row, col])) * (input_width / grid_cols)
+        y = (row + float(y_offset[row, col])) * (input_height / grid_rows)
+        x = int(np.clip(x, 0, input_width - 1))
+        y = int(np.clip(y, 0, input_height - 1))
+        results.append((1, x, y))
     return results
+
+
+def decode_predictions(output, model_params, threshold):
+    if model_params["family"] == "grid":
+        return postprocess_grid(
+            output=output,
+            threshold=threshold,
+            seq=model_params["seq"],
+            input_height=model_params["input_height"],
+            input_width=model_params["input_width"],
+            grid_rows=model_params["grid_rows"],
+            grid_cols=model_params["grid_cols"],
+        )
+    return postprocess_heatmap(
+        output=output,
+        threshold=threshold,
+        input_height=model_params["input_height"],
+        input_width=model_params["input_width"],
+        out_dim=model_params["seq"],
+    )
+
 
 def draw_track(frame, track, cur_color=(0, 0, 255), hist_color=(255, 0, 0)):
-    for p in list(track)[:-1]:
-        if p: cv2.circle(frame, p, 5, hist_color, -1)
-    if track and track[-1]: cv2.circle(frame, track[-1], 5, cur_color, -1)
+    for point in list(track)[:-1]:
+        if point:
+            cv2.circle(frame, point, 5, hist_color, -1)
+    if track and track[-1]:
+        cv2.circle(frame, track[-1], 5, cur_color, -1)
     return frame
 
 
-def read_frames(cap, q, max_n=9):
-    frames = []
-    while len(frames) < max_n:
-        ret, f = cap.read()
-        if not ret: break
-        frames.append(f)
-    q.put(frames if frames else None)
+def render_prediction(frame, visibility, x_orig, y_orig, writer, visualize, track):
+    if visibility:
+        track.append((x_orig, y_orig))
+    else:
+        if track:
+            track.popleft()
+
+    if writer or visualize:
+        vis_frame = draw_track(frame.copy(), track)
+        if visibility:
+            cv2.circle(vis_frame, (x_orig, y_orig), 12, (0, 255, 0), 2)
+        if writer:
+            writer.write(vis_frame)
+        if visualize:
+            cv2.imshow("Ball Tracking", vis_frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                raise KeyboardInterrupt
 
 
 def main():
     args = parse_args()
-    in_w, in_h = 512, 288
-    batch_size = 9
+    compiled_model, _, output_layer, model_params = load_model(args.model_xml, device=args.device)
 
-    # Загрузка модели с исправлением динамической формы
-    compiled_model, input_layer, output_layer, out_dim, input_shape = load_model(
-        args.model_xml, device=args.device
+    cap, frame_width, frame_height, fps, total = initialize_video(args.video_path)
+    basename = os.path.splitext(os.path.basename(args.video_path))[0]
+    writer, _ = setup_output_writer(
+        basename, args.output_dir, frame_width, frame_height, fps, args.only_csv
     )
+    csv_path = setup_csv_file(basename, args.output_dir)
 
-    cap, fw, fh, fps, total = initialize_video(args.video_path)
-    base = os.path.splitext(os.path.basename(args.video_path))[0]
-    writer, _ = setup_output_writer(base, args.output_dir, fw, fh, fps, args.only_csv)
-    csv_path = setup_csv_file(base, args.output_dir)
-
-    buffer = deque(maxlen=batch_size)
+    seq = model_params["seq"]
+    current_frames = []
     track = deque(maxlen=args.track_length)
-    frame_idx = 0
-    q = queue.Queue(maxsize=2)
-
-    def reader():
-        while cap.isOpened():
-            read_frames(cap, q, batch_size)
-    threading.Thread(target=reader, daemon=True).start()
-
+    frame_index = 0
     pbar = tqdm(total=total, desc="Обработка", unit="кадр")
-    exit_flag = False
 
-    while True:
-        start = time.time()
-        batch = q.get()
-        if batch is None: break
+    try:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        proc = preprocess_frames(batch, in_h, in_w)
+            current_frames.append(frame.copy())
+            if len(current_frames) != seq:
+                frame_index += 1
+                pbar.update(1)
+                continue
 
-        while len(buffer) < batch_size:
-            buffer.append(proc[0] if proc else np.zeros((in_h, in_w), np.float32))
-        for f in proc:
-            buffer.append(f)
+            processed_frames = preprocess_frames(
+                current_frames,
+                input_height=model_params["input_height"],
+                input_width=model_params["input_width"],
+            )
+            input_tensor = np.asarray([processed_frames], dtype=np.float32)
+            output = compiled_model(input_tensor)[output_layer][0]
+            predictions = decode_predictions(output, model_params, args.threshold)
 
-        # Вход: (1,9,288,512) — гарантировано после reshape
-        stacked = np.stack(buffer, axis=2)
-        input_tensor = np.expand_dims(stacked, axis=0).transpose(0, 3, 1, 2)
+            start_frame_index = frame_index - seq + 1
+            for local_index, (frame_item, prediction) in enumerate(
+                zip(current_frames, predictions, strict=True)
+            ):
+                visibility, x_resized, y_resized = prediction
+                if visibility:
+                    x_orig = int(x_resized * frame_width / model_params["input_width"])
+                    y_orig = int(y_resized * frame_height / model_params["input_height"])
+                else:
+                    x_orig, y_orig = -1, -1
 
-        # Инференс
-        result = compiled_model(input_tensor)
-        output = result[output_layer]  # (1,9,288,512)
+                result = {
+                    "Frame": start_frame_index + local_index,
+                    "Visibility": visibility,
+                    "X": x_orig,
+                    "Y": y_orig,
+                }
+                append_to_csv(result, csv_path)
+                render_prediction(
+                    frame_item, visibility, x_orig, y_orig, writer, args.visualize, track
+                )
 
-        preds = postprocess_output(output[0], in_h=in_h, in_w=in_w, out_dim=out_dim)
+            current_frames = []
+            frame_index += 1
+            pbar.update(1)
 
-        for i, (vis, x, y) in enumerate(preds[:len(batch)]):
-            x_orig = x * fw / in_w if vis else -1
-            y_orig = y * fh / in_h if vis else -1
-
-            if vis:
-                track.append((int(x_orig), int(y_orig)))
-            else:
-                if track: track.popleft()
-
-            res = {"Frame": frame_idx + i, "Visibility": vis, "X": int(x_orig), "Y": int(y_orig)}
-            append_to_csv(res, csv_path)
-
-            if args.visualize or writer:
-                vis_frame = batch[i].copy()
-                vis_frame = draw_track(vis_frame, track)
-                if args.visualize:
-                    cv2.imshow("Ball Tracking", vis_frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        exit_flag = True
-                        break
-                if writer:
-                    writer.write(vis_frame)
-        if exit_flag: break
-
-        pbar.update(len(batch))
-        frame_idx += len(batch)
-
-    pbar.close()
-    cap.release()
-    if writer: writer.release()
-    if args.visualize: cv2.destroyAllWindows()
+        if current_frames:
+            start_frame_index = frame_index - len(current_frames)
+            for local_index, frame_item in enumerate(current_frames):
+                result = {
+                    "Frame": start_frame_index + local_index,
+                    "Visibility": 0,
+                    "X": -1,
+                    "Y": -1,
+                }
+                append_to_csv(result, csv_path)
+                render_prediction(frame_item, 0, -1, -1, writer, args.visualize, track)
+    finally:
+        pbar.close()
+        cap.release()
+        if writer:
+            writer.release()
+        if args.visualize:
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
