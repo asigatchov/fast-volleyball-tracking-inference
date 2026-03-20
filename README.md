@@ -102,17 +102,27 @@ output/gtu_20250316_002/
 - `--output_dir ./demo-result/`
 
 ## Available ONNX models
-```text
-models/VballNetFastV1_155_h288_w512.onnx
-models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx
-models/VballNetV1_150_h288_w512.onnx
-models/VballNetV1_seq9_grayscale_148_h288_w512.onnx
-models/VballNetV1_seq9_grayscale_204_h288_w512.onnx
-models/VballNetV1_seq9_grayscale_330_h288_w512.onnx
-models/VballNetV1b_seq9_grayscale_best.onnx
-models/VballNetV1c_seq9_grayscale_best.onnx
-models/VballNetV2_seq9_grayscale_320_h288_w512.onnx
-```
+Benchmark setup:
+- runner: `src/inference_onnx_seq_gray_v2.py`
+- video: `match9/video/woman_transhmash_2_00004.mp4`
+- ground truth: `match9/csv/woman_transhmash_2_00004_ball.csv`
+- runtime: local `onnxruntime` on CPU (`CPUExecutionProvider`)
+- `Acc@5px (all)` = frame is correct if ball is visible and predicted within 5 px, or if both GT and prediction mark frame as invisible
+- `Acc@5px (visible)` = only GT-visible frames are evaluated, prediction must be within 5 px
+
+| Model | FPS | Acc@5px (all) | Acc@5px (visible) |
+| --- | ---: | ---: | ---: |
+| `VballNetV1_seq9_grayscale_148_h288_w512.onnx` | 138.68 | 87.25% | 86.43% |
+| `VballNetV1_seq9_grayscale_204_h288_w512.onnx` | 138.39 | 85.95% | 84.88% |
+| `VballNetV2_seq9_grayscale_320_h288_w512.onnx` | 114.22 | 83.01% | 82.56% |
+| `VballNetV1_seq9_grayscale_330_h288_w512.onnx` | 141.04 | 82.35% | 81.78% |
+| `VballNetV1c_seq9_grayscale_best.onnx` | 142.17 | 76.80% | 74.81% |
+| `VballNetGridV1b_seq9_grayscale_20260319_193937.onnx` | 117.55 | 75.49% | 74.03% |
+| `VballNetFastV1_seq9_grayscale_233_h288_w512.onnx` | 271.86 | 73.20% | 68.99% |
+| `VballNetV1b_seq9_grayscale_best.onnx` | 142.56 | 72.88% | 70.16% |
+| `VballNetGridV1c_seq9_grayscale_20260317.onnx` | 185.85 | 64.05% | 62.02% |
+| `VballNetFastV1_155_h288_w512.onnx` | 307.56 | 15.03% | 0.00% |
+| `VballNetV1_150_h288_w512.onnx` | 149.88 | 10.13% | 0.00% |
 
 ## Notes
 - `onnxruntime` can run on CPU if CUDA provider is unavailable.

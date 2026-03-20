@@ -84,6 +84,7 @@ def infer_model_params(model_path: str) -> dict:
         return {
             "family": "grid",
             "seq": 9,
+            "input_seq": 9,
             "input_width": GRID_INPUT_WIDTH,
             "input_height": GRID_INPUT_HEIGHT,
             "grid_cols": GRID_COLS,
@@ -92,11 +93,18 @@ def infer_model_params(model_path: str) -> dict:
     return {
         "family": "heatmap",
         "seq": 15 if "seq15" in model_name else 9 if "seq9" in model_name else 3,
+        "input_seq": 15 if "seq15" in model_name else 9,
         "input_width": DEFAULT_INPUT_WIDTH,
         "input_height": DEFAULT_INPUT_HEIGHT,
         "grid_cols": None,
         "grid_rows": None,
     }
+
+
+def resolve_dim(dim, fallback: int) -> int:
+    if isinstance(dim, int):
+        return dim
+    return fallback
 
 
 def load_onnx_model(model_path):
@@ -108,6 +116,18 @@ def load_onnx_model(model_path):
     )
     input_names = [inp.name for inp in session.get_inputs()]
     output_names = [out.name for out in session.get_outputs()]
+    input_shape = session.get_inputs()[0].shape
+    output_shape = session.get_outputs()[0].shape
+
+    input_seq = resolve_dim(input_shape[1], model_params["input_seq"])
+    if model_params["family"] == "grid":
+        output_channels = resolve_dim(output_shape[1], input_seq * 3)
+        out_dim = output_channels // 3
+    else:
+        out_dim = resolve_dim(output_shape[1], model_params["seq"])
+
+    model_params["input_seq"] = input_seq
+    model_params["seq"] = out_dim
 
     has_gru = "h0" in input_names
     h0_shape = None
@@ -133,15 +153,15 @@ def load_onnx_model(model_path):
                 resolved_shape.append(dim)
         h0_shape = tuple(resolved_shape)
 
-    out_dim = model_params["seq"]
-    batch_size = model_params["seq"]
+    batch_size = model_params["input_seq"]
 
     LOG.info("Model loaded: %s", model_path)
     LOG.info(
-        "Family: %s | GRU: %s | Sequence length: %s | h0 shape: %s",
+        "Family: %s | GRU: %s | Input sequence: %s | Output sequence: %s | h0 shape: %s",
         model_params["family"],
         has_gru,
         batch_size,
+        out_dim,
         h0_shape if has_gru else "N/A",
     )
     return (
