@@ -97,7 +97,7 @@ def process_uploaded_video(project_id: str, user_id: str, file_path: str, file_u
     model_xml = Path(
         os.getenv(
             "INFERENCE_MODEL_XML",
-            str(repo_dir / "ov" / "VballNetV2_seq9_grayscale_ov.xml"),
+            str(repo_dir / "ov" / "VballNetGridV1b_seq9_grayscale_20260319_193937.xml"),
         )
     ).resolve()
     if not model_xml.exists():

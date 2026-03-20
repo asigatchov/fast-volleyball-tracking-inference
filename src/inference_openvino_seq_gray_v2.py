@@ -229,7 +229,10 @@ def render_prediction(frame, visibility, x_orig, y_orig, writer, visualize, trac
         if writer:
             writer.write(vis_frame)
         if visualize:
-            cv2.imshow("Ball Tracking", vis_frame)
+            win_name = 'Ball Tracking'
+            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(win_name, 1920, 1080)  
+            cv2.imshow(win_name, vis_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 raise KeyboardInterrupt
 
