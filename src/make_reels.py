@@ -2,15 +2,29 @@ import argparse
 import json
 import logging
 import os
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
 from tqdm import tqdm
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:  # pragma: no cover - optional dependency
+    Image = None
+    ImageDraw = None
+    ImageFont = None
 
-from constants import DEFAULT_CROP_ASPECT_RATIO, DEFAULT_FPS, DEFAULT_SMOOTH_WINDOW
+try:
+    from .constants import DEFAULT_CROP_ASPECT_RATIO, DEFAULT_FPS, DEFAULT_SMOOTH_WINDOW
+except ImportError:
+    from constants import DEFAULT_CROP_ASPECT_RATIO, DEFAULT_FPS, DEFAULT_SMOOTH_WINDOW
 
 LOG = logging.getLogger(__name__)
+WATERMARK_TEXT = "vb-ai.ru"
+WATERMARK_FONT_PATH = Path(__file__).resolve().parent / "fonts" / "PlayfairDisplay-MediumItalic.ttf"
 
 
 try:
@@ -42,6 +56,33 @@ def load_single_track(track_json_path: str) -> Dict:
     return {
         "start_frame": data["start_frame"],
         "last_frame": data["last_frame"],
+        "positions": positions,
+    }
+
+
+def load_track_from_payload(track_payload: Dict) -> Dict:
+    positions = []
+    for item in track_payload.get("positions", []):
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        xy, frame = item[0], item[1]
+        if not isinstance(xy, (list, tuple)) or len(xy) < 2:
+            continue
+        x, y = xy[0], xy[1]
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            continue
+        if not isinstance(frame, (int, float)):
+            continue
+        positions.append((float(x), float(y), int(frame)))
+
+    start_frame = track_payload.get("start_frame")
+    last_frame = track_payload.get("last_frame")
+    if not isinstance(start_frame, int) or not isinstance(last_frame, int):
+        raise ValueError("track_json must include integer start_frame and last_frame")
+
+    return {
+        "start_frame": start_frame,
+        "last_frame": last_frame,
         "positions": positions,
     }
 
@@ -141,6 +182,58 @@ def crop_frame(frame: np.ndarray, center_x: int, crop_width: int, padding: str) 
     return frame[:, left:right]
 
 
+def add_watermark_top_right(frame: np.ndarray, text: str = WATERMARK_TEXT) -> np.ndarray:
+    """Draw a compact watermark in the top-right corner."""
+    h, w = frame.shape[:2]
+    alpha = 0.2
+    scale = max(0.6, min(1.0, w / 1200.0)) * 3.0
+    margin = max(10, int(round(scale * 16)))
+
+    if Image is not None and ImageDraw is not None and ImageFont is not None and WATERMARK_FONT_PATH.exists():
+        try:
+            font_size = max(16, int(round(scale * 24)))
+            font = ImageFont.truetype(str(WATERMARK_FONT_PATH), size=font_size)
+            rgba = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
+            overlay = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+
+            left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+            text_w = right - left
+            text_h = bottom - top
+            x = max(margin, w - text_w - margin)
+            y = margin
+            text_alpha = int(round(255 * alpha))
+
+            draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, text_alpha))
+            draw.text((x, y), text, font=font, fill=(255, 255, 255, text_alpha))
+
+            composited = Image.alpha_composite(rgba, overlay).convert("RGB")
+            return cv2.cvtColor(np.array(composited), cv2.COLOR_RGB2BGR)
+        except Exception:
+            LOG.exception("Failed to render watermark with TTF font, fallback to OpenCV font")
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thickness = max(1, int(round(scale * 2)))
+    (text_w, text_h), _ = cv2.getTextSize(text, font, scale, thickness)
+    x = max(margin, w - text_w - margin)
+    y = margin + text_h
+
+    fallback_overlay = frame.copy()
+    cv2.putText(
+        fallback_overlay,
+        text,
+        (x + 2, y + 2),
+        font,
+        scale,
+        (0, 0, 0),
+        thickness + 2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(fallback_overlay, text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    cv2.addWeighted(fallback_overlay, alpha, frame, 1 - alpha, 0, frame)
+    return frame
+
+
 def crop_and_save_track(
     video_path: str,
     track: Dict,
@@ -213,6 +306,7 @@ def crop_and_save_track(
         if out is not None:
             if cropped.shape[1] != crop_width:
                 cropped = cv2.resize(cropped, (crop_width, crop_height))
+            cropped = add_watermark_top_right(cropped)
             out.write(cropped)
 
         if visualize:
@@ -225,6 +319,112 @@ def crop_and_save_track(
         out.release()
     if visualize:
         cv2.destroyAllWindows()
+
+
+def crop_and_save_track_payload(
+    video_path: str,
+    track_payload: Dict,
+    output_path: str,
+    visualize: bool = False,
+    smoothing: str = "moving_avg",
+    interpolation: str = "hold",
+    smooth_window: int = DEFAULT_SMOOTH_WINDOW,
+    smooth_polyorder: int = 2,
+    margin: float = 0.0,
+    padding: str = "none",
+) -> None:
+    track = load_track_from_payload(track_payload)
+    crop_and_save_track(
+        video_path=video_path,
+        track=track,
+        output_path=output_path,
+        visualize=visualize,
+        smoothing=smoothing,
+        interpolation=interpolation,
+        smooth_window=smooth_window,
+        smooth_polyorder=smooth_polyorder,
+        margin=margin,
+        padding=padding,
+    )
+
+
+def crop_and_save_track_payloads(
+    video_path: str,
+    track_payloads: List[Dict],
+    output_path: str,
+    visualize: bool = False,
+    smoothing: str = "moving_avg",
+    interpolation: str = "hold",
+    smooth_window: int = DEFAULT_SMOOTH_WINDOW,
+    smooth_polyorder: int = 2,
+    margin: float = 0.0,
+    padding: str = "none",
+) -> None:
+    if not track_payloads:
+        raise ValueError("track_payloads must not be empty")
+
+    if len(track_payloads) == 1:
+        crop_and_save_track_payload(
+            video_path=video_path,
+            track_payload=track_payloads[0],
+            output_path=output_path,
+            visualize=visualize,
+            smoothing=smoothing,
+            interpolation=interpolation,
+            smooth_window=smooth_window,
+            smooth_polyorder=smooth_polyorder,
+            margin=margin,
+            padding=padding,
+        )
+        return
+
+    output_target = Path(output_path).resolve()
+    output_target.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="reel_segments_") as tmp_dir_raw:
+        tmp_dir = Path(tmp_dir_raw)
+        segment_files: List[Path] = []
+        for idx, payload in enumerate(track_payloads, start=1):
+            segment_path = tmp_dir / f"segment_{idx:04d}.mp4"
+            crop_and_save_track_payload(
+                video_path=video_path,
+                track_payload=payload,
+                output_path=str(segment_path),
+                visualize=visualize,
+                smoothing=smoothing,
+                interpolation=interpolation,
+                smooth_window=smooth_window,
+                smooth_polyorder=smooth_polyorder,
+                margin=margin,
+                padding=padding,
+            )
+            segment_files.append(segment_path)
+
+        concat_list = tmp_dir / "concat_list.txt"
+        concat_list.write_text(
+            "\n".join([f"file '{segment_path.name}'" for segment_path in segment_files]),
+            encoding="utf-8",
+        )
+
+        concat_cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_list),
+            "-c",
+            "copy",
+            str(output_target),
+        ]
+        try:
+            subprocess.run(concat_cmd, cwd=tmp_dir, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"ffmpeg concat failed: {exc.stderr[-2000:] if exc.stderr else str(exc)}"
+            ) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
