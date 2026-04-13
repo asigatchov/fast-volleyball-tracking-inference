@@ -3,6 +3,7 @@ import logging
 import os
 import queue
 import threading
+from collections import deque
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -30,6 +31,12 @@ GRID_INPUT_WIDTH = 768
 GRID_INPUT_HEIGHT = 432
 GRID_COLS = 48
 GRID_ROWS = 27
+BALL_SIZE_HISTORY = 12
+BALL_RAW_SIZE_HISTORY = 5
+BALL_TREND_FRAMES = 3
+BALL_RADIUS_MIN = 3
+BALL_RADIUS_MAX = 40
+BALL_ROI_HALF_SIZE = 48
 
 
 def setup_logging(verbose: bool) -> None:
@@ -207,7 +214,7 @@ def setup_csv_file(video_basename, output_dir):
     video_dir = os.path.join(output_dir, video_basename)
     os.makedirs(video_dir, exist_ok=True)
     csv_path = os.path.join(video_dir, "ball.csv")
-    pd.DataFrame(columns=["Frame", "Visibility", "X", "Y"]).to_csv(
+    pd.DataFrame(columns=["Frame", "Visibility", "X", "Y", "Radius"]).to_csv(
         csv_path, index=False
     )
     return csv_path
@@ -316,6 +323,147 @@ def draw_track(
     return frame
 
 
+def build_motion_mask(prev_gray, gray):
+    diff = cv2.absdiff(prev_gray, gray)
+    diff = cv2.GaussianBlur(diff, (5, 5), 0)
+    _, motion_mask = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
+    kernel = np.ones((3, 3), np.uint8)
+    motion_mask = cv2.morphologyEx(
+        motion_mask, cv2.MORPH_OPEN, kernel, iterations=1
+    )
+    motion_mask = cv2.dilate(motion_mask, kernel, iterations=2)
+    return motion_mask
+
+
+def contour_narrow_radius(contour):
+    if len(contour) < 5:
+        (_, _), radius = cv2.minEnclosingCircle(contour)
+        return float(radius)
+
+    (_, _), (width, height), _ = cv2.minAreaRect(contour)
+    narrow_diameter = min(width, height)
+    if narrow_diameter <= 0:
+        (_, _), radius = cv2.minEnclosingCircle(contour)
+        return float(radius)
+    return float(narrow_diameter) / 2.0
+
+
+def fallback_radius(size_state):
+    smoothed_radius = size_state["smoothed_radius"]
+    if smoothed_radius > 0:
+        return int(round(smoothed_radius))
+    filtered_history = size_state["filtered_history"]
+    if not filtered_history:
+        return 0
+    return int(round(float(np.median(filtered_history))))
+
+
+def filter_ball_radius(radius, size_state):
+    if radius <= 0:
+        return fallback_radius(size_state)
+
+    raw_history = size_state["raw_history"]
+    filtered_history = size_state["filtered_history"]
+    raw_history.append(radius)
+
+    if not filtered_history:
+        filtered_history.append(radius)
+        size_state["smoothed_radius"] = float(radius)
+        return radius
+
+    baseline = size_state["smoothed_radius"]
+    if baseline <= 0:
+        baseline = float(np.median(filtered_history))
+
+    trend_window = list(raw_history)[-BALL_TREND_FRAMES:]
+    trend_confirmed = False
+    if len(trend_window) == BALL_TREND_FRAMES:
+        upper_shift = [value > baseline for value in trend_window]
+        lower_shift = [value < baseline for value in trend_window]
+        trend_confirmed = all(upper_shift) or all(lower_shift)
+
+    target_radius = float(radius)
+    if trend_confirmed:
+        target_radius = float(np.median(trend_window))
+    else:
+        max_deviation = max(3.0, baseline * 0.55)
+        target_radius = float(
+            np.clip(radius, baseline - max_deviation, baseline + max_deviation)
+        )
+
+    alpha = 0.6 if trend_confirmed else 0.3
+    smoothed_radius = baseline * (1.0 - alpha) + target_radius * alpha
+    smoothed_radius = float(np.clip(smoothed_radius, BALL_RADIUS_MIN, BALL_RADIUS_MAX))
+
+    accepted_radius = int(round(smoothed_radius))
+    filtered_history.append(accepted_radius)
+    size_state["smoothed_radius"] = smoothed_radius
+    return accepted_radius
+
+
+def estimate_ball_radius(prev_gray, gray, x_orig, y_orig, size_state):
+    if prev_gray is None or x_orig < 0 or y_orig < 0:
+        return 0, None
+
+    motion_mask = build_motion_mask(prev_gray, gray)
+    x1 = max(0, x_orig - BALL_ROI_HALF_SIZE)
+    y1 = max(0, y_orig - BALL_ROI_HALF_SIZE)
+    x2 = min(gray.shape[1], x_orig + BALL_ROI_HALF_SIZE)
+    y2 = min(gray.shape[0], y_orig + BALL_ROI_HALF_SIZE)
+    roi = motion_mask[y1:y2, x1:x2]
+    if roi.size == 0:
+        return fallback_radius(size_state), None
+
+    contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return fallback_radius(size_state), None
+
+    center = np.array([x_orig - x1, y_orig - y1], dtype=np.float32)
+    best_contour = None
+    best_score = None
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 8:
+            continue
+        (cx, cy), _ = cv2.minEnclosingCircle(contour)
+        radius = contour_narrow_radius(contour)
+        if radius < BALL_RADIUS_MIN or radius > BALL_RADIUS_MAX:
+            continue
+        distance = np.linalg.norm(np.array([cx, cy], dtype=np.float32) - center)
+        score = distance - area * 0.02
+        if best_score is None or score < best_score:
+            best_score = score
+            best_contour = contour
+
+    if best_contour is None:
+        return fallback_radius(size_state), None
+
+    radius = contour_narrow_radius(best_contour)
+    filtered_radius = filter_ball_radius(int(round(radius)), size_state)
+    contour_global = best_contour + np.array([[[x1, y1]]], dtype=np.int32)
+    return filtered_radius, contour_global
+
+
+def render_prediction(frame, points, visibility, x_orig, y_orig, radius, contour):
+    vis_frame = draw_track(frame.copy(), points)
+    if visibility:
+        if contour is not None:
+            cv2.drawContours(vis_frame, [contour], -1, (0, 255, 255), 1)
+        draw_radius = radius if radius > 0 else 8
+        cv2.circle(vis_frame, (x_orig, y_orig), draw_radius, (0, 255, 0), 2)
+        cv2.putText(
+            vis_frame,
+            f"R:{radius}" if radius > 0 else "R:n/a",
+            (x_orig + draw_radius + 4, y_orig - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    return vis_frame
+
+
 def run_inference(session, input_tensor, has_gru, h0, input_names, output_names):
     inputs = {input_names[0]: input_tensor}
     if has_gru:
@@ -379,6 +527,29 @@ def frame_reader(cap, frame_queue, batch_size, stop_event, error_queue):
         stop_event.set()
 
 
+def initialize_visualization(enabled: bool) -> bool:
+    if not enabled:
+        return False
+    try:
+        cv2.namedWindow("Ball Tracking", cv2.WINDOW_NORMAL)
+        return True
+    except Exception as exc:
+        LOG.warning("Visualization disabled: failed to initialize OpenCV window: %s", exc)
+        return False
+
+
+def show_visualization(enabled: bool, frame) -> Tuple[bool, bool]:
+    if not enabled:
+        return False, False
+    try:
+        cv2.imshow("Ball Tracking", frame)
+        should_exit = cv2.waitKey(1) & 0xFF == ord("q")
+        return True, should_exit
+    except Exception as exc:
+        LOG.warning("Visualization disabled while rendering frame: %s", exc)
+        return False, False
+
+
 def main():
     args = parse_args()
     setup_logging(args.verbose)
@@ -411,6 +582,13 @@ def main():
     frame_queue = queue.Queue(maxsize=2)
     error_queue = queue.Queue()
     stop_event = threading.Event()
+    visualization_enabled = initialize_visualization(args.visualize)
+    size_state = {
+        "filtered_history": deque(maxlen=BALL_SIZE_HISTORY),
+        "raw_history": deque(maxlen=BALL_RAW_SIZE_HISTORY),
+        "smoothed_radius": 0.0,
+    }
+    prev_gray = None
 
     h0 = np.zeros(h0_shape, dtype=np.float32) if has_gru and h0_shape else None
 
@@ -465,14 +643,19 @@ def main():
             predictions = decode_predictions(output, model_params, args.confidence_threshold)
 
             for i, (visibility, x, y) in enumerate(predictions[: len(frames)]):
+                frame_gray = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
                 x_orig = x * frame_width / input_width if visibility else -1
                 y_orig = y * frame_height / input_height if visibility else -1
 
                 if visibility:
                     point = (int(x_orig), int(y_orig))
                     track_state.update(point)
+                    radius, contour = estimate_ball_radius(
+                        prev_gray, frame_gray, point[0], point[1], size_state
+                    )
                 else:
                     track_state.update(None)
+                    radius, contour = 0, None
 
                 if track_state.is_lost():
                     track_state.reset()
@@ -482,21 +665,31 @@ def main():
                     "Visibility": visibility,
                     "X": int(x_orig),
                     "Y": int(y_orig),
+                    "Radius": radius,
                 }
                 append_to_csv(result, csv_path)
 
-                if args.visualize or out_writer is not None:
-                    vis_frame = frames[i].copy()
-                    vis_frame = draw_track(vis_frame, track_state.points())
-                    if args.visualize:
-                        cv2.namedWindow("Ball Tracking", cv2.WINDOW_NORMAL)
-                        cv2.imshow("Ball Tracking", vis_frame)
-                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                if visualization_enabled or out_writer is not None:
+                    vis_frame = render_prediction(
+                        frames[i],
+                        track_state.points(),
+                        visibility,
+                        int(x_orig),
+                        int(y_orig),
+                        radius,
+                        contour,
+                    )
+                    if visualization_enabled:
+                        visualization_enabled, should_exit = show_visualization(
+                            visualization_enabled, vis_frame
+                        )
+                        if should_exit:
                             exit_flag = True
                             stop_event.set()
                             break
                     if out_writer is not None:
                         out_writer.write(vis_frame)
+                prev_gray = frame_gray
 
             if exit_flag:
                 break
@@ -510,7 +703,7 @@ def main():
         cap.release()
         if out_writer is not None:
             out_writer.release()
-        if args.visualize:
+        if visualization_enabled:
             cv2.destroyAllWindows()
 
 
