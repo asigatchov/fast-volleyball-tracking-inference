@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import re
 import time
 from collections import deque
 from pathlib import Path
@@ -45,10 +46,12 @@ def parse_args():
 
 def infer_model_params(model_path):
     model_name = Path(model_path).name.lower()
+    seq_match = re.search(r"seq(\d+)", model_name)
+    seq = int(seq_match.group(1)) if seq_match else DEFAULT_SEQ
     if "vballnetgrid" in model_name:
         return {
             "family": "grid",
-            "seq": 9,
+            "seq": seq,
             "grayscale": True,
             "input_width": GRID_INPUT_WIDTH,
             "input_height": GRID_INPUT_HEIGHT,
@@ -57,7 +60,7 @@ def infer_model_params(model_path):
         }
     return {
         "family": "heatmap",
-        "seq": DEFAULT_SEQ,
+        "seq": seq,
         "grayscale": True,
         "input_width": DEFAULT_INPUT_WIDTH,
         "input_height": DEFAULT_INPUT_HEIGHT,
