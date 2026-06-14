@@ -3,8 +3,12 @@ from collections import deque
 from scipy.spatial import distance
 from dataclasses import dataclass, field
 import json
+import logging
 from typing import List, Tuple, Dict, Optional, Any
 import dataclasses
+
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass
@@ -173,8 +177,13 @@ class BallTracker:
         track.ball_sizes = deque([diameter], maxlen=self.buffer_size)
         track.reason = reason
         self.tracks[self.next_id] = track
-        print(
-            f"New track {self.next_id} created at frame {frame_number}, position ({center_x:.1f}, {center_y:.1f}), reason: {reason}"
+        LOG.debug(
+            "New track %s created at frame %s, position (%.1f, %.1f), reason: %s",
+            self.next_id,
+            frame_number,
+            center_x,
+            center_y,
+            reason,
         )
         self.next_id += 1
 

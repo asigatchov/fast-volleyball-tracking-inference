@@ -380,7 +380,7 @@ class TrackCalculator:
 
         if rolling_start_frame is not None:
             stop_rising_frame = rolling_start_frame
-        elif stop_rising_frame is not None:
+        elif stop_rising_frame is not None and self._court_enabled:
             game_pause_frame = stop_rising_frame
 
         stop_rising_sec = (
