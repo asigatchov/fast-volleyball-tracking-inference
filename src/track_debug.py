@@ -216,7 +216,7 @@ def render_frame(
             scale=0.55,
         )
 
-    draw_text(frame, "space pause/play  a -1  f +1  s -15  w +15  q exit", (12, 112), scale=0.55)
+    draw_text(frame, "space pause/play  a -1  d +1  s -15  w +15  q exit", (12, 112), scale=0.55)
 
 
 def clamp_frame(frame_idx: int, total_frames: int) -> int:
@@ -280,7 +280,7 @@ def show_debug_view(
                 frame_idx = clamp_frame(frame_idx - 1, total_frames)
                 paused = True
                 continue
-            if key == ord("f"):
+            if key == ord("d"):
                 frame_idx = clamp_frame(frame_idx + 1, total_frames)
                 paused = True
                 continue

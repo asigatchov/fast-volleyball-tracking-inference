@@ -12,6 +12,8 @@ import pandas as pd
 
 from ball_tracker import BallTracker, Track
 from constants import (
+    BEACH_COURT_LENGTH_M,
+    BEACH_COURT_WIDTH_M,
     COURT_LENGTH_M,
     COURT_WIDTH_M,
     DEFAULT_BOUNCE_FRAMES,
@@ -49,6 +51,7 @@ class TrackCalculatorConfig:
     court_json_path: Optional[str]
     video_width: Optional[int]
     video_height: Optional[int]
+    beach: bool
 
 
 def setup_logging(verbose: bool) -> None:
@@ -76,10 +79,16 @@ class TrackCalculator:
         self._camera_position = "unknown"
         self._distance_unit = "px"
         self._cm_per_px_scale: Optional[float] = None
+        self._court_length_m = BEACH_COURT_LENGTH_M if self.config.beach else COURT_LENGTH_M
+        self._court_width_m = BEACH_COURT_WIDTH_M if self.config.beach else COURT_WIDTH_M
         self._frame_width_scale = self._compute_frame_width_scale()
         self._scaled_max_distance = self.config.max_distance * self._frame_width_scale
 
-        transformer = CourtTransformer(config.court_json_path)
+        transformer = CourtTransformer(
+            config.court_json_path,
+            court_length_m=self._court_length_m,
+            court_width_m=self._court_width_m,
+        )
         result = transformer.load()
         self._court_geometry = result.geometry
         self._court_matrix = result.matrix
@@ -113,6 +122,12 @@ class TrackCalculator:
                 self._cm_per_px_scale,
                 self._distance_unit,
             )
+        LOG.info(
+            "Court dimensions: mode=%s length=%.1fm width=%.1fm",
+            "beach" if self.config.beach else "classic",
+            self._court_length_m,
+            self._court_width_m,
+        )
 
     def _compute_frame_width_scale(self) -> float:
         width = self.config.video_width
@@ -142,10 +157,10 @@ class TrackCalculator:
         span_cm = 0.0
         if self._camera_position == "backline":
             span_px = self._distance_px(p1, p4)
-            span_cm = COURT_WIDTH_M * 100.0
+            span_cm = self._court_width_m * 100.0
         elif self._camera_position == "sideline":
             span_px = self._distance_px(p3, p4)
-            span_cm = COURT_LENGTH_M * 100.0
+            span_cm = self._court_length_m * 100.0
 
         if span_px > 1e-6 and span_cm > 0:
             candidates_cm_per_px.append(span_cm / span_px)
@@ -454,6 +469,7 @@ class TrackCalculator:
                 "has_game_pause": False,
                 "has_rolling": False,
                 "camera_position": self._camera_position,
+                "measurement_unit": self._distance_unit,
             }
 
         if trajectory_analysis is None:
@@ -487,6 +503,7 @@ class TrackCalculator:
                 "has_game_pause": trajectory_analysis.get("game_pause_frame") is not None,
                 "has_rolling": trajectory_analysis.get("rolling_start_frame") is not None,
                 "camera_position": self._camera_position,
+                "measurement_unit": self._distance_unit,
             }
 
         frame_diffs = np.diff(frames)
@@ -501,6 +518,24 @@ class TrackCalculator:
         vx = dx / dt
         vy = dy / dt
         continuous = frame_diffs <= 2
+
+        metric_unit = "px"
+        x_range_m = None
+        y_range_m = None
+        path_len_m = None
+        median_speed_m_s = None
+        p90_speed_m_s = None
+        max_speed_m_s = None
+
+        if self._cm_per_px_scale is not None:
+            metric_scale = self._cm_per_px_scale / 100.0
+            metric_unit = "m"
+            x_range_m = float((xs.max() - xs.min()) * metric_scale)
+            y_range_m = float((ys.max() - ys.min()) * metric_scale)
+            path_len_m = float(step_dist.sum() * metric_scale)
+            median_speed_m_s = float(np.median(speed) * metric_scale)
+            p90_speed_m_s = float(np.percentile(speed, 90) * metric_scale)
+            max_speed_m_s = float(speed.max() * metric_scale)
 
         return {
             "track_id": int(track.track_id),
@@ -522,6 +557,13 @@ class TrackCalculator:
             "has_game_pause": trajectory_analysis.get("game_pause_frame") is not None,
             "has_rolling": trajectory_analysis.get("rolling_start_frame") is not None,
             "camera_position": self._camera_position,
+            "measurement_unit": metric_unit,
+            "x_range_m": x_range_m,
+            "y_range_m": y_range_m,
+            "path_len_m": path_len_m,
+            "median_speed_m_s": median_speed_m_s,
+            "p90_speed_m_s": p90_speed_m_s,
+            "max_speed_m_s": max_speed_m_s,
         }
 
     def _classify_rally(self, features: Dict[str, Any]) -> Dict[str, Any]:
@@ -529,21 +571,48 @@ class TrackCalculator:
         positive_flags: List[str] = []
         penalty_flags: List[str] = []
 
-        if features["duration_sec"] >= 4.5:
-            score += 2
-            positive_flags.append("long_duration")
-        if features["path_len_px"] >= 2200:
-            score += 2
-            positive_flags.append("long_path")
-        if features["x_range_px"] >= 450:
-            score += 1
-            positive_flags.append("wide_x_range")
-        if features["y_range_px"] >= 500:
-            score += 1
-            positive_flags.append("wide_y_range")
-        if features["p90_speed_px_s"] >= 900:
-            score += 1
-            positive_flags.append("high_p90_speed")
+        if features.get("measurement_unit") == "m" and features.get("path_len_m") is not None:
+            long_path_threshold = self._court_length_m * 1.2
+            x_range_threshold = self._court_length_m * 0.25
+            y_range_threshold = self._court_width_m * 0.5
+            fast_speed_threshold = 8.0
+
+            if features["duration_sec"] >= 4.5:
+                score += 2
+                positive_flags.append("long_duration")
+            if features["path_len_m"] >= long_path_threshold:
+                score += 2
+                positive_flags.append("long_path")
+            if features["x_range_m"] is not None and features["x_range_m"] >= x_range_threshold:
+                score += 1
+                positive_flags.append("wide_x_range")
+            if features["y_range_m"] is not None and features["y_range_m"] >= y_range_threshold:
+                score += 1
+                positive_flags.append("wide_y_range")
+            if features["p90_speed_m_s"] is not None and features["p90_speed_m_s"] >= fast_speed_threshold:
+                score += 1
+                positive_flags.append("high_p90_speed")
+        else:
+            path_len_threshold_px = 2200 * self._frame_width_scale
+            x_range_threshold_px = 450 * self._frame_width_scale
+            y_range_threshold_px = 500 * self._frame_width_scale
+            fast_speed_threshold_px_s = 900 * self._frame_width_scale
+
+            if features["duration_sec"] >= 4.5:
+                score += 2
+                positive_flags.append("long_duration")
+            if features["path_len_px"] >= path_len_threshold_px:
+                score += 2
+                positive_flags.append("long_path")
+            if features["x_range_px"] >= x_range_threshold_px:
+                score += 1
+                positive_flags.append("wide_x_range")
+            if features["y_range_px"] >= y_range_threshold_px:
+                score += 1
+                positive_flags.append("wide_y_range")
+            if features["p90_speed_px_s"] >= fast_speed_threshold_px_s:
+                score += 1
+                positive_flags.append("high_p90_speed")
         if features["vy_sign_changes"] >= 8:
             score += 1
             positive_flags.append("many_vertical_phases")
@@ -562,6 +631,7 @@ class TrackCalculator:
             "not_rally_confidence": float(1.0 - rally_confidence),
             "score": int(score),
             "decision_threshold": 5,
+            "measurement_unit": features.get("measurement_unit", "px"),
             "positive_flags": positive_flags,
             "penalty_flags": penalty_flags,
         }
@@ -830,6 +900,9 @@ class TrackCalculator:
                     "court_points_count": len(self._court_geometry.keypoints),
                     "has_court_transform": self._court_matrix is not None,
                     "camera_position": self._camera_position,
+                    "court_mode": "beach" if self.config.beach else "classic",
+                    "court_length_m": self._court_length_m,
+                    "court_width_m": self._court_width_m,
                     "distance_unit": self._distance_unit,
                     "cm_per_px": self._cm_per_px_scale,
                     "net_height_cm": NET_HEIGHT_CM,
@@ -874,6 +947,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1080,
         help="Source video height for court scaling (default: 1080)",
+    )
+    parser.add_argument(
+        "--beach",
+        action="store_true",
+        help="Use beach volleyball court dimensions (16x8 m). Default is classic indoor 18x9 m.",
     )
     parser.add_argument(
         "--output_dir", type=str, default="output", help="Root output directory for JSON"
@@ -927,6 +1005,7 @@ def main() -> None:
         bounce_frames=args.bounce_frames,
         video_width=args.video_width,
         video_height=args.video_height,
+        beach=args.beach,
     )
 
     calculator = TrackCalculator(config)

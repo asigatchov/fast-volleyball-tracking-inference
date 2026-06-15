@@ -29,8 +29,15 @@ class CourtTransformResult:
 class CourtTransformer:
     """Loads court geometry and provides coordinate transforms."""
 
-    def __init__(self, court_json_path: Optional[str]) -> None:
+    def __init__(
+        self,
+        court_json_path: Optional[str],
+        court_length_m: float = COURT_LENGTH_M,
+        court_width_m: float = COURT_WIDTH_M,
+    ) -> None:
         self._court_json_path = court_json_path
+        self._court_length_m = court_length_m
+        self._court_width_m = court_width_m
 
     def load(self) -> CourtTransformResult:
         if not self._court_json_path:
@@ -45,35 +52,14 @@ class CourtTransformer:
         except (OSError, json.JSONDecodeError):
             return CourtTransformResult(None, None)
 
-        images = court_data.get("images", [])
-        image_width = DEFAULT_IMAGE_WIDTH
-        image_height = DEFAULT_IMAGE_HEIGHT
-        if images:
-            image_width = images[0].get("width", image_width)
-            image_height = images[0].get("height", image_height)
-
-        annotations = court_data.get("annotations", [])
-        if not annotations:
-            return CourtTransformResult(None, None)
-
-        keypoints_raw = annotations[0].get("keypoints", [])
-        if len(keypoints_raw) < 24:
-            return CourtTransformResult(None, None)
-
-        keypoints: list[Point2D] = []
-        for i in range(0, len(keypoints_raw), 3):
-            if i + 2 >= len(keypoints_raw):
-                break
-            x, y, visibility = keypoints_raw[i], keypoints_raw[i + 1], keypoints_raw[i + 2]
-            if visibility > 0:
-                keypoints.append((float(x), float(y)))
+        image_width, image_height, keypoints = self._parse_court_data(court_data)
 
         if len(keypoints) < 4:
             return CourtTransformResult(None, None)
 
         geometry = CourtGeometry(
-            length_m=COURT_LENGTH_M,
-            width_m=COURT_WIDTH_M,
+            length_m=self._court_length_m,
+            width_m=self._court_width_m,
             net_height_m=NET_HEIGHT_M,
             image_width=int(image_width),
             image_height=int(image_height),
@@ -84,7 +70,41 @@ class CourtTransformer:
         return CourtTransformResult(geometry, matrix)
 
     @staticmethod
-    def _calculate_transform(keypoints: Sequence[Point2D]) -> Optional[np.ndarray]:
+    def _parse_court_data(court_data: dict) -> tuple[int, int, list[Point2D]]:
+        image_width = DEFAULT_IMAGE_WIDTH
+        image_height = DEFAULT_IMAGE_HEIGHT
+
+        images = court_data.get("images", [])
+        if images:
+            image_width = int(images[0].get("width", image_width))
+            image_height = int(images[0].get("height", image_height))
+
+        annotations = court_data.get("annotations", [])
+        if annotations:
+            keypoints_raw = annotations[0].get("keypoints", [])
+            keypoints: list[Point2D] = []
+            for i in range(0, len(keypoints_raw), 3):
+                if i + 2 >= len(keypoints_raw):
+                    break
+                x, y, visibility = keypoints_raw[i], keypoints_raw[i + 1], keypoints_raw[i + 2]
+                if visibility > 0:
+                    keypoints.append((float(x), float(y)))
+            return image_width, image_height, keypoints
+
+        image_width = int(court_data.get("frame_width", image_width))
+        image_height = int(court_data.get("frame_height", image_height))
+        keypoints = []
+        for point in court_data.get("keypoints", []):
+            if not point.get("visible", False):
+                continue
+            x = point.get("x")
+            y = point.get("y")
+            if x is None or y is None:
+                continue
+            keypoints.append((float(x), float(y)))
+        return image_width, image_height, keypoints
+
+    def _calculate_transform(self, keypoints: Sequence[Point2D]) -> Optional[np.ndarray]:
         if len(keypoints) < 4:
             return None
 
@@ -99,10 +119,10 @@ class CourtTransformer:
         )
         court_points = np.array(
             [
-                [-COURT_LENGTH_M / 2, -COURT_WIDTH_M / 2],
-                [COURT_LENGTH_M / 2, -COURT_WIDTH_M / 2],
-                [COURT_LENGTH_M / 2, COURT_WIDTH_M / 2],
-                [-COURT_LENGTH_M / 2, COURT_WIDTH_M / 2],
+                [-self._court_length_m / 2, -self._court_width_m / 2],
+                [self._court_length_m / 2, -self._court_width_m / 2],
+                [self._court_length_m / 2, self._court_width_m / 2],
+                [-self._court_length_m / 2, self._court_width_m / 2],
             ],
             dtype=np.float32,
         )
@@ -128,8 +148,8 @@ class CoordinateTransformer:
             norm_x = x / max(1, self._geometry.image_width)
             norm_y = y / max(1, self._geometry.image_height)
             return (
-                norm_x * COURT_LENGTH_M - COURT_LENGTH_M / 2,
-                norm_y * COURT_WIDTH_M - COURT_WIDTH_M / 2,
+                norm_x * self._geometry.length_m - self._geometry.length_m / 2,
+                norm_y * self._geometry.width_m - self._geometry.width_m / 2,
             )
 
         point = np.array([[x, y]], dtype=np.float32)
