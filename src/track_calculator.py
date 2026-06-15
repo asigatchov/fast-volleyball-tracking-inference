@@ -2,6 +2,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -415,6 +416,156 @@ class TrackCalculator:
         track.positions = [pos for pos in track.positions if track.start_frame <= pos[1] <= track.last_frame]
         return track
 
+    @staticmethod
+    def _count_sign_changes(values: np.ndarray, mask: np.ndarray, eps: float = 60.0) -> int:
+        filtered = values[mask]
+        if filtered.size < 2:
+            return 0
+
+        signs = np.sign(filtered)
+        signs[np.abs(filtered) < eps] = 0
+        signs = signs[signs != 0]
+        if signs.size < 2:
+            return 0
+        return int(np.sum(signs[1:] * signs[:-1] < 0))
+
+    def _extract_rally_features(
+        self, track: Track, trajectory_analysis: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        positions = sorted(track.positions, key=lambda p: p[1])
+        if not positions:
+            return {
+                "track_id": int(track.track_id),
+                "frame_start": int(track.start_frame),
+                "frame_end": int(track.last_frame),
+                "duration_sec": 0.0,
+                "points_count": 0,
+                "coverage": 0.0,
+                "x_range_px": 0.0,
+                "y_range_px": 0.0,
+                "path_len_px": 0.0,
+                "median_speed_px_s": 0.0,
+                "p90_speed_px_s": 0.0,
+                "max_speed_px_s": 0.0,
+                "vy_sign_changes": 0,
+                "vx_sign_changes": 0,
+                "gap_count_gt5": 0,
+                "max_gap_frames": 0,
+                "has_game_pause": False,
+                "has_rolling": False,
+                "camera_position": self._camera_position,
+            }
+
+        if trajectory_analysis is None:
+            trajectory_analysis = self._analyze_track_trajectory(track)
+
+        frames = np.array([int(p[1]) for p in positions], dtype=np.float64)
+        xs = np.array([float(p[0][0]) for p in positions], dtype=np.float64)
+        ys = np.array([float(p[0][1]) for p in positions], dtype=np.float64)
+
+        duration_frames = max(int(frames[-1] - frames[0] + 1), 1)
+        duration_sec = duration_frames / self.config.fps if self.config.fps > 0 else 0.0
+
+        if len(positions) < 2:
+            return {
+                "track_id": int(track.track_id),
+                "frame_start": int(frames[0]),
+                "frame_end": int(frames[-1]),
+                "duration_sec": float(duration_sec),
+                "points_count": int(len(positions)),
+                "coverage": float(len(positions) / duration_frames),
+                "x_range_px": 0.0,
+                "y_range_px": 0.0,
+                "path_len_px": 0.0,
+                "median_speed_px_s": 0.0,
+                "p90_speed_px_s": 0.0,
+                "max_speed_px_s": 0.0,
+                "vy_sign_changes": 0,
+                "vx_sign_changes": 0,
+                "gap_count_gt5": 0,
+                "max_gap_frames": 0,
+                "has_game_pause": trajectory_analysis.get("game_pause_frame") is not None,
+                "has_rolling": trajectory_analysis.get("rolling_start_frame") is not None,
+                "camera_position": self._camera_position,
+            }
+
+        frame_diffs = np.diff(frames)
+        dt = frame_diffs / self.config.fps if self.config.fps > 0 else frame_diffs
+        min_dt = 1.0 / self.config.fps if self.config.fps > 0 else 1.0
+        dt = np.maximum(dt, min_dt)
+
+        dx = np.diff(xs)
+        dy = np.diff(ys)
+        step_dist = np.sqrt(dx * dx + dy * dy)
+        speed = step_dist / dt
+        vx = dx / dt
+        vy = dy / dt
+        continuous = frame_diffs <= 2
+
+        return {
+            "track_id": int(track.track_id),
+            "frame_start": int(frames[0]),
+            "frame_end": int(frames[-1]),
+            "duration_sec": float(duration_sec),
+            "points_count": int(len(positions)),
+            "coverage": float(len(positions) / duration_frames),
+            "x_range_px": float(xs.max() - xs.min()),
+            "y_range_px": float(ys.max() - ys.min()),
+            "path_len_px": float(step_dist.sum()),
+            "median_speed_px_s": float(np.median(speed)),
+            "p90_speed_px_s": float(np.percentile(speed, 90)),
+            "max_speed_px_s": float(speed.max()),
+            "vy_sign_changes": self._count_sign_changes(vy, continuous),
+            "vx_sign_changes": self._count_sign_changes(vx, continuous),
+            "gap_count_gt5": int(np.sum(frame_diffs > 5)),
+            "max_gap_frames": int(frame_diffs.max()),
+            "has_game_pause": trajectory_analysis.get("game_pause_frame") is not None,
+            "has_rolling": trajectory_analysis.get("rolling_start_frame") is not None,
+            "camera_position": self._camera_position,
+        }
+
+    def _classify_rally(self, features: Dict[str, Any]) -> Dict[str, Any]:
+        score = 0
+        positive_flags: List[str] = []
+        penalty_flags: List[str] = []
+
+        if features["duration_sec"] >= 4.5:
+            score += 2
+            positive_flags.append("long_duration")
+        if features["path_len_px"] >= 2200:
+            score += 2
+            positive_flags.append("long_path")
+        if features["x_range_px"] >= 450:
+            score += 1
+            positive_flags.append("wide_x_range")
+        if features["y_range_px"] >= 500:
+            score += 1
+            positive_flags.append("wide_y_range")
+        if features["p90_speed_px_s"] >= 900:
+            score += 1
+            positive_flags.append("high_p90_speed")
+        if features["vy_sign_changes"] >= 8:
+            score += 1
+            positive_flags.append("many_vertical_phases")
+
+        if features["has_game_pause"] or features["has_rolling"]:
+            score -= 1
+            penalty_flags.append("pause_or_rolling_detected")
+
+        rally_confidence = 1.0 / (1.0 + math.exp(-(float(score) - 5.0)))
+        label = "rally" if rally_confidence >= 0.5 else "not_rally"
+
+        return {
+            "label": label,
+            "is_rally": label == "rally",
+            "rally_confidence": float(rally_confidence),
+            "not_rally_confidence": float(1.0 - rally_confidence),
+            "score": int(score),
+            "decision_threshold": 5,
+            "positive_flags": positive_flags,
+            "penalty_flags": penalty_flags,
+        }
+
     def _filter_by_min_duration(self, tracks: List[Track]) -> List[Track]:
         return [track for track in tracks if track.duration_sec() >= self.config.min_duration_sec]
 
@@ -662,6 +813,10 @@ class TrackCalculator:
             track_dict = track.to_dict()
             trajectory_analysis = self._analyze_track_trajectory(track)
             track_dict["trajectory_analysis"] = trajectory_analysis
+            rally_features = self._extract_rally_features(track, trajectory_analysis)
+            rally_classification = self._classify_rally(rally_features)
+            track_dict["rally_features"] = rally_features
+            track_dict["rally_classification"] = rally_classification
             if self._court_enabled:
                 court_positions = []
                 for pos in track_dict["positions"]:
