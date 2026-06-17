@@ -14,7 +14,8 @@ import json
 import logging
 import os
 import time
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 from tqdm import tqdm
@@ -23,6 +24,24 @@ from ball_tracker import Track
 from constants import DEFAULT_FADE_DURATION
 
 LOG = logging.getLogger(__name__)
+
+
+@dataclass
+class LoadedTrack:
+    track: Track
+    metadata: Dict[str, Any]
+
+    @property
+    def track_id(self) -> int:
+        return int(self.track.track_id)
+
+    @property
+    def start_frame(self) -> int:
+        return int(self.track.start_frame)
+
+    @property
+    def last_frame(self) -> int:
+        return int(self.track.last_frame)
 
 
 def setup_logging(verbose: bool) -> None:
@@ -120,13 +139,15 @@ class TrackProcessor:
         output_path: Optional[str] = None,
         split_dir: Optional[str] = None,
         fps: float = 30.0,
+        debug: bool = False,
     ) -> None:
         self.json_dir = json_dir
         self.video_path = video_path
         self.output_path = output_path
         self.split_dir = split_dir
         self.fps = fps
-        self.tracks: List[Track] = []
+        self.debug = debug
+        self.tracks: List[LoadedTrack] = []
         self.total_processed_frames = 0
         self.total_processing_time = 0.0
 
@@ -152,7 +173,7 @@ class TrackProcessor:
             with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             track = Track.from_dict(data)
-            self.tracks.append(track)
+            self.tracks.append(LoadedTrack(track=track, metadata=data))
 
         LOG.info("Loaded %s track(s) from %s", len(self.tracks), self.json_dir)
 
@@ -186,6 +207,77 @@ class TrackProcessor:
         self.total_processing_time += fade_time
         self.total_processed_frames += fade_frames
 
+    @staticmethod
+    def _format_track_kind(metadata: Dict[str, Any]) -> str:
+        classification = metadata.get("rally_classification", {})
+        label = classification.get("label", "unknown")
+        reason = classification.get("not_rally_reason")
+        if label == "rally":
+            return "rally"
+        if reason == "technical_return":
+            return "technical_return"
+        return label
+
+    @staticmethod
+    def _format_metrics(metadata: Dict[str, Any]) -> List[str]:
+        features = metadata.get("rally_features", {})
+        classification = metadata.get("rally_classification", {})
+        trajectory = metadata.get("trajectory_analysis", {})
+        state_after = metadata.get("match_state_after", {})
+
+        lines = [
+            f"class={classification.get('label', 'unknown')} side={trajectory.get('serve_side', 'unknown')}",
+            f"reason={classification.get('not_rally_reason') or '-'} score={classification.get('score', '-')}",
+            f"rally_conf={classification.get('rally_confidence', 0.0):.2f} tech_conf={classification.get('technical_return_confidence', 0.0):.2f}",
+            f"dur={features.get('duration_sec', 0.0):.2f}s path_m={features.get('path_len_m') if features.get('path_len_m') is not None else '-'} post_net_m={features.get('post_net_path_len_m', '-')}",
+            f"scope_m={features.get('effective_scope_m', '-')}, vy_changes={features.get('vy_sign_changes', '-')}, vx_changes={features.get('vx_sign_changes', '-')}",
+            f"expected_server={state_after.get('expected_server_side', 'unknown')} score_state={state_after.get('score', {})}",
+        ]
+        return lines
+
+    def _draw_debug_overlay(
+        self,
+        frame,
+        track_id: int,
+        frame_num: int,
+        total_video_frames: int,
+        metadata: Dict[str, Any],
+    ):
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (980, 190), (0, 0, 0), -1)
+        alpha = 0.55
+        frame = cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0)
+
+        trajectory = metadata.get("trajectory_analysis", {})
+        header = (
+            f"track={track_id} frame={frame_num}/{total_video_frames} "
+            f"serve_side={trajectory.get('serve_side', 'unknown')} "
+            f"kind={self._format_track_kind(metadata)}"
+        )
+        cv2.putText(
+            frame,
+            header,
+            (20, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        for idx, line in enumerate(self._format_metrics(metadata), start=1):
+            cv2.putText(
+                frame,
+                line,
+                (20, 35 + idx * 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                (200, 255, 200),
+                1,
+                cv2.LINE_AA,
+            )
+        return frame
+
     def visualize_tracks(self) -> None:
         self._validate_video()
         cap = cv2.VideoCapture(self.video_path)
@@ -207,10 +299,12 @@ class TrackProcessor:
 
         overall_start_time = time.time()
 
-        for track in self.tracks:
-            track_id = track.track_id
-            start_frame = track.start_frame
-            end_frame = track.last_frame
+        for loaded_track in self.tracks:
+            track = loaded_track.track
+            metadata = loaded_track.metadata
+            track_id = loaded_track.track_id
+            start_frame = loaded_track.start_frame
+            end_frame = loaded_track.last_frame
             frame_count = end_frame - start_frame + 1
 
             LOG.info(
@@ -267,6 +361,15 @@ class TrackProcessor:
                         cv2.LINE_AA,
                     )
 
+                if self.debug:
+                    frame = self._draw_debug_overlay(
+                        frame=frame,
+                        track_id=track_id,
+                        frame_num=frame_num,
+                        total_video_frames=total_video_frames,
+                        metadata=metadata,
+                    )
+
                 if not self.output_path and not self.split_dir:
                     debug_text = f"Frame: {frame_num}/{total_video_frames}, Track: {track_id}"
                     cv2.putText(
@@ -288,9 +391,9 @@ class TrackProcessor:
                         return
 
                 if exporter:
-                    exporter.write(clean_frame)
+                    exporter.write(frame)
 
-                last_clean_frame = clean_frame.copy()
+                last_clean_frame = frame.copy()
                 frame_num += 1
                 pbar.update(1)
 
@@ -359,6 +462,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fps", type=float, default=30.0, help="Output FPS if video has none"
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Overlay track classification, serve side and metrics onto output frames",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     return parser
 
@@ -393,6 +501,7 @@ def main() -> None:
         output_path=args.output_path,
         split_dir=args.split_dir,
         fps=args.fps,
+        debug=args.debug,
     )
     processor._load_tracks_from_json()
     processor.visualize_tracks()
