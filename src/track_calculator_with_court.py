@@ -40,6 +40,7 @@ NET_HEIGHT_CM = 243.0
 BALL_DIAMETER_CM = 21.0
 BALL_SIZE_WINDOW = 6
 MAX_MERGE_GAP_FRAMES = 40
+MAX_AIRBORNE_REENTRY_GAP_SECONDS = 3.0
 POST_PAUSE_TAIL_SECONDS = 0.5
 MIN_EFFECTIVE_SCOPE_M = 0.45
 MIN_EFFECTIVE_SCOPE_PX = 14.0
@@ -1195,6 +1196,7 @@ class TrackCalculatorWithCourt:
         filtered = self._extend_tracks(filtered)
         filtered = self._merge_overlapping(filtered)
         filtered = self._split_discontinuous_tracks(filtered)
+        filtered = self._merge_airborne_reentry_tracks(filtered)
         if self._court.enabled:
             filtered = [track for track in filtered if self._track_crosses_net(track)]
         return sorted(filtered, key=lambda item: item.start_frame)
@@ -1272,6 +1274,107 @@ class TrackCalculatorWithCourt:
                 child.prediction = track.prediction
                 result.append(child)
         return result
+
+    def _merge_airborne_reentry_tracks(self, tracks: Sequence[Track]) -> list[Track]:
+        items = sorted(tracks, key=lambda item: item.start_frame)
+        if not items:
+            return []
+
+        merged: list[Track] = []
+        current = items[0]
+        for candidate in items[1:]:
+            if self._should_merge_airborne_reentry(current, candidate):
+                current = self._combine_tracks(current, candidate)
+            else:
+                merged.append(current)
+                current = candidate
+        merged.append(current)
+        return merged
+
+    def _should_merge_airborne_reentry(self, first: Track, second: Track) -> bool:
+        gap_frames = second.start_frame - first.last_frame
+        if gap_frames <= 0:
+            return False
+
+        max_gap_frames = max(1, int(round(self.config.fps * MAX_AIRBORNE_REENTRY_GAP_SECONDS)))
+        if gap_frames > max_gap_frames:
+            return False
+
+        first_points = self._sorted_track_points(first)
+        second_points = self._sorted_track_points(second)
+        if len(first_points) < 2 or len(second_points) < 2:
+            return False
+
+        if not self._track_exits_top(first_points) or not self._track_enters_from_top(second_points):
+            return False
+
+        width = self._resolved_video_width()
+        max_x_gap = max(140.0, (width * 0.18) if width is not None else 220.0)
+        end_x = float(np.median([point[0] for point in first_points[-min(3, len(first_points)) :]]))
+        start_x = float(np.median([point[0] for point in second_points[: min(3, len(second_points))]]))
+        return abs(end_x - start_x) <= max_x_gap
+
+    def _track_exits_top(self, points: Sequence[tuple[float, float, int]]) -> bool:
+        top_margin = self._top_reentry_margin()
+        tail = points[-min(5, len(points)) :]
+        if min(point[1] for point in tail) > top_margin:
+            return False
+
+        tail_vy = self._median_vertical_speed(tail)
+        if tail_vy >= -4.0:
+            return False
+
+        return (tail[0][1] - tail[-1][1]) >= 18.0
+
+    def _track_enters_from_top(self, points: Sequence[tuple[float, float, int]]) -> bool:
+        top_margin = self._top_reentry_margin()
+        head = points[: min(5, len(points))]
+        if min(point[1] for point in head) > top_margin:
+            return False
+
+        head_vy = self._median_vertical_speed(head)
+        if head_vy <= 4.0:
+            return False
+
+        return (head[-1][1] - head[0][1]) >= 18.0
+
+    def _top_reentry_margin(self) -> float:
+        height = self._resolved_video_height()
+        if height is None or height <= 0:
+            return 120.0
+        return max(80.0, height * 0.16)
+
+    @staticmethod
+    def _sorted_track_points(track: Track) -> list[tuple[float, float, int]]:
+        points: list[tuple[float, float, int]] = []
+        for pos, frame in sorted(track.positions, key=lambda item: item[1]):
+            points.append((float(pos[0]), float(pos[1]), int(frame)))
+        return points
+
+    @staticmethod
+    def _median_vertical_speed(points: Sequence[tuple[float, float, int]]) -> float:
+        if len(points) < 2:
+            return 0.0
+
+        speeds: list[float] = []
+        for (_, y1, frame1), (_, y2, frame2) in zip(points, points[1:]):
+            dt = max(frame2 - frame1, 1)
+            speeds.append((y2 - y1) / dt)
+        if not speeds:
+            return 0.0
+        return float(np.median(speeds))
+
+    @staticmethod
+    def _combine_tracks(base: Track, other: Track) -> Track:
+        base.start_frame = min(base.start_frame, other.start_frame)
+        base.last_frame = max(base.last_frame, other.last_frame)
+        base.positions = type(base.positions)(
+            sorted([*base.positions, *other.positions], key=lambda item: item[1]),
+            maxlen=base.positions.maxlen,
+        )
+        base.ball_sizes = type(base.ball_sizes)([*base.ball_sizes, *other.ball_sizes], maxlen=base.ball_sizes.maxlen)
+        base.prediction = other.prediction if other.prediction else base.prediction
+        return base
 
     def _track_crosses_net(self, track: Track) -> bool:
         observations = self._feature_extractor.build_frame_observations(track, self._observations_by_frame)

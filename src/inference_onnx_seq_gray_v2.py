@@ -20,7 +20,7 @@ from constants import (
 )
 from models import BallTrack
 
-os.environ["LD_LIBRARY_PATH"] = "./.venv/lib/python3.12/site-packages/nvidia/cublas/lib:" + os.environ.get(
+os.environ["LD_LIBRARY_PATH"] = "/opt/apps/venv/lib/python3.12/site-packages/nvidia/cublas/lib:" + os.environ.get(
     "LD_LIBRARY_PATH", ""
 )
 ort.preload_dlls()

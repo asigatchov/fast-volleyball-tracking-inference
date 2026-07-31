@@ -10,8 +10,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pandas as pd
-from openvino.runtime import Core
 from tqdm import tqdm
+
+try:
+    from openvino import Core
+except ImportError:
+    from openvino.runtime import Core
 
 
 DEFAULT_INPUT_WIDTH = 512
