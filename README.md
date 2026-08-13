@@ -14,6 +14,11 @@ High-speed pipeline for volleyball ball detection, rally extraction, and automat
 3. `src/track_processor.py` -> creates combined video (`combined.mp4`) or split rally clips.
 4. `src/make_reels.py` -> creates vertical 9:16 reels centered around ball trajectory.
 
+`src/track_calculator_with_court.py` is the court-aware variant of step 2. Given
+player detections it also finds ball touches with their technique and tells a
+rally apart from a ball handed over for the next serve - see
+[PLAYER_CONTACTS.md](PLAYER_CONTACTS.md).
+
 ## Installation
 ```bash
 git clone https://github.com/asigatchov/fast-volleyball-tracking-inference.git
@@ -83,9 +88,29 @@ output/gtu_20250316_002/
 - `--fps`, `--max_distance`, `--min_duration_sec` - main tracking/filtering params.
 
 ### `src/track_processor.py`
+- By default, only tracks with `rally_classification.is_rally=true` are exported;
+  `not_rally` and unclassified tracks are skipped.
+- `--include-not-rally` - include all tracks for diagnostic exports.
 - `--output_dir` - auto-resolves `tracks` and `combined.mp4` by video basename.
 - `--json_dir` - explicit tracks folder.
 - `--split_dir` - export each rally into a separate clip.
+
+### `src/show_rally.py`
+Interactive review of tracks over the source video:
+```bash
+uv run src/show_rally.py output/beach-mixt/tracks /path/to/video.mp4 \
+  --players_json_path ../uploads/mix/beach-mixt_predictions.json \
+  --court_json_path ../uploads/mix/beach-mixt_court.json
+```
+- `space` play/pause, `a`/`d` step one frame, `w`/`s` jump 15 frames,
+  `n`/`p` next/previous track, `v` switches the main view between video and schematic,
+  `b` toggles the left box-only panel (court, player boxes and ball),
+  `t` ball path, `h` help, `q` quit.
+- Player and court JSON files are auto-detected next to `<clip>/tracks` by the
+  `<clip>_predict.json` and `<clip>_court.json` names. Legacy `<clip>_coort.json`
+  files are also recognized; explicit paths override auto-detection.
+- `--track N` - start from a given track, `--snapshot FILE` - render one frame and exit
+  (works without a display).
 
 ### `src/make_reels.py`
 - `--smoothing {none,moving_avg,savitzky_golay,kalman}`

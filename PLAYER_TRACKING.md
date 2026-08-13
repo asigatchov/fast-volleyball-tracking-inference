@@ -16,7 +16,7 @@ The player tracking system performs the following tasks:
 ## Files
 
 - [src/player_tracker.py](src/player_tracker.py) - Main player tracking class with DeepSORT-like tracking
-- [src/coort_coordinats.py](src/coort_coordinats.py) - Modified coordinate mapping script with player tracking integration
+- [src/court_coordinates.py](src/court_coordinates.py) - Modified coordinate mapping script with player tracking integration
 - [src/demo_player_tracking.py](src/demo_player_tracking.py) - Original demonstration script
 - [src/demo_player_tracking_v2.py](src/demo_player_tracking_v2.py) - Updated demonstration script with tracking features
 - [src/test_player_tracker.py](src/test_player_tracker.py) - Test script
@@ -75,7 +75,7 @@ To use the player tracking functionality:
 1. Ensure the YOLO model is available at `models_yolo/yolo11n.onnx`
 2. Run the coordinate mapping script with player tracking:
    ```bash
-   python src/coort_coordinats.py --video_path path/to/video.mp4
+   python src/court_coordinates.py path/to/video.mp4
    ```
 
 3. Or run the demonstration script:
@@ -85,7 +85,7 @@ To use the player tracking functionality:
 
 ## Integration with Existing Code
 
-The player tracking functionality has been integrated into the existing coordinate mapping system in [src/coort_coordinats.py](src/coort_coordinats.py). This allows for seamless use of both ball tracking and player tracking in the same workflow.
+The player tracking functionality has been integrated into the existing coordinate mapping system in [src/court_coordinates.py](src/court_coordinates.py). This allows for seamless use of both ball tracking and player tracking in the same workflow.
 
 ## Key Features Implemented
 

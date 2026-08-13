@@ -1,11 +1,12 @@
 import argparse
 import json
 import logging
+import math
 import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -25,6 +26,7 @@ except ImportError:
 LOG = logging.getLogger(__name__)
 WATERMARK_TEXT = "vb-ai.ru"
 WATERMARK_FONT_PATH = Path(__file__).resolve().parent / "fonts" / "PlayfairDisplay-MediumItalic.ttf"
+BLACK_TRANSITION_SECONDS = 0.3
 
 
 try:
@@ -46,18 +48,31 @@ def load_single_track(track_json_path: str) -> Dict:
     """Load a single track JSON and normalize it for processing."""
     with open(track_json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
+    return load_track_from_payload(data)
 
-    positions = []
-    for item in data["positions"]:
-        xy, frame = item
-        x, y = xy
-        positions.append((float(x), float(y), int(frame)))
 
-    return {
-        "start_frame": data["start_frame"],
-        "last_frame": data["last_frame"],
-        "positions": positions,
-    }
+def _positive_dimension(value: object) -> Optional[int]:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        return None
+    return int(round(float(value)))
+
+
+def tracking_frame_size(track_payload: Dict) -> Optional[Tuple[int, int]]:
+    """Resolution in which track coordinates were produced.
+
+    New track files carry both dimensions in ``tracking_scale``. Older files
+    may only have width there, so ``court_info`` is used as a compatible
+    fallback. A missing height is handled later with uniform width scaling.
+    """
+    tracking_scale = track_payload.get("tracking_scale") or {}
+    court_info = track_payload.get("court_info") or {}
+    width = _positive_dimension(tracking_scale.get("frame_width_px"))
+    height = _positive_dimension(tracking_scale.get("frame_height_px"))
+    width = width or _positive_dimension(court_info.get("image_width"))
+    height = height or _positive_dimension(court_info.get("image_height"))
+    if width is None:
+        return None
+    return width, height or 0
 
 
 def load_track_from_payload(track_payload: Dict) -> Dict:
@@ -84,7 +99,47 @@ def load_track_from_payload(track_payload: Dict) -> Dict:
         "start_frame": start_frame,
         "last_frame": last_frame,
         "positions": positions,
+        "tracking_frame_size": tracking_frame_size(track_payload),
     }
+
+
+def scale_track_to_video(track: Dict, video_width: int, video_height: int) -> Dict:
+    """Convert proxy-space positions to the opened video's pixel space."""
+    source_size = track.get("tracking_frame_size")
+    if not source_size:
+        return track
+
+    source_width, source_height = source_size
+    if source_width <= 0 or video_width <= 0 or video_height <= 0:
+        return track
+
+    scale_x = float(video_width) / float(source_width)
+    # Old track JSONs only stored width. Their proxy/full videos have the same
+    # aspect ratio, so uniform width scaling is the safest compatible fallback.
+    scale_y = (
+        float(video_height) / float(source_height)
+        if source_height and source_height > 0
+        else scale_x
+    )
+    if math.isclose(scale_x, 1.0) and math.isclose(scale_y, 1.0):
+        return track
+
+    LOG.info(
+        "Scaling track coordinates: %sx%s -> %sx%s (x=%.4f, y=%.4f)",
+        source_width,
+        source_height or "?",
+        video_width,
+        video_height,
+        scale_x,
+        scale_y,
+    )
+    scaled = dict(track)
+    scaled["positions"] = [
+        (float(x) * scale_x, float(y) * scale_y, int(frame))
+        for x, y, frame in track["positions"]
+    ]
+    scaled["tracking_frame_size"] = (video_width, video_height)
+    return scaled
 
 
 def interpolate_positions(
@@ -234,6 +289,46 @@ def add_watermark_top_right(frame: np.ndarray, text: str = WATERMARK_TEXT) -> np
     return frame
 
 
+def black_fade_alpha(
+    frame_index: int,
+    total_frames: int,
+    fps: float,
+    fade_in: bool,
+    fade_out: bool,
+    duration_sec: float = BLACK_TRANSITION_SECONDS,
+) -> float:
+    """Brightness for a fade from/to black at a segment boundary."""
+    if total_frames <= 1 or fps <= 0 or duration_sec <= 0:
+        return 1.0
+    fade_frames = min(
+        max(2, int(round(fps * duration_sec))),
+        max(2, total_frames // 2),
+    )
+    alpha = 1.0
+    if fade_in and frame_index < fade_frames:
+        alpha = min(alpha, frame_index / float(fade_frames - 1))
+    fade_out_start = total_frames - fade_frames
+    if fade_out and frame_index >= fade_out_start:
+        alpha = min(alpha, (total_frames - 1 - frame_index) / float(fade_frames - 1))
+    return float(max(0.0, min(1.0, alpha)))
+
+
+def apply_black_fade(
+    frame: np.ndarray,
+    frame_index: int,
+    total_frames: int,
+    fps: float,
+    fade_in: bool,
+    fade_out: bool,
+) -> np.ndarray:
+    alpha = black_fade_alpha(
+        frame_index, total_frames, fps, fade_in=fade_in, fade_out=fade_out
+    )
+    if alpha >= 1.0:
+        return frame
+    return cv2.convertScaleAbs(frame, alpha=alpha, beta=0)
+
+
 def crop_and_save_track(
     video_path: str,
     track: Dict,
@@ -245,6 +340,8 @@ def crop_and_save_track(
     smooth_polyorder: int = 2,
     margin: float = 0.0,
     padding: str = "none",
+    fade_in: bool = False,
+    fade_out: bool = False,
 ) -> None:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -261,6 +358,7 @@ def crop_and_save_track(
         raise ValueError("Failed to read first video frame")
 
     frame_height, frame_width = frame.shape[:2]
+    track = scale_track_to_video(track, frame_width, frame_height)
     crop_width = min(int(frame_height * DEFAULT_CROP_ASPECT_RATIO), frame_width)
     crop_height = frame_height
 
@@ -307,6 +405,16 @@ def crop_and_save_track(
             if cropped.shape[1] != crop_width:
                 cropped = cv2.resize(cropped, (crop_width, crop_height))
             cropped = add_watermark_top_right(cropped)
+        cropped = apply_black_fade(
+            cropped,
+            i,
+            total_frames,
+            fps,
+            fade_in=fade_in,
+            fade_out=fade_out,
+        )
+
+        if out is not None:
             out.write(cropped)
 
         if visualize:
@@ -332,6 +440,8 @@ def crop_and_save_track_payload(
     smooth_polyorder: int = 2,
     margin: float = 0.0,
     padding: str = "none",
+    fade_in: bool = False,
+    fade_out: bool = False,
 ) -> None:
     track = load_track_from_payload(track_payload)
     crop_and_save_track(
@@ -345,6 +455,8 @@ def crop_and_save_track_payload(
         smooth_polyorder=smooth_polyorder,
         margin=margin,
         padding=padding,
+        fade_in=fade_in,
+        fade_out=fade_out,
     )
 
 
@@ -359,6 +471,7 @@ def crop_and_save_track_payloads(
     smooth_polyorder: int = 2,
     margin: float = 0.0,
     padding: str = "none",
+    fade_transition: bool = False,
 ) -> None:
     if not track_payloads:
         raise ValueError("track_payloads must not be empty")
@@ -397,6 +510,8 @@ def crop_and_save_track_payloads(
                 smooth_polyorder=smooth_polyorder,
                 margin=margin,
                 padding=padding,
+                fade_in=fade_transition and idx > 1,
+                fade_out=fade_transition and idx < len(track_payloads),
             )
             segment_files.append(segment_path)
 
@@ -434,6 +549,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video_path", required=True, help="Path to video file")
     parser.add_argument("--track_json", help="Path to a single track JSON file")
     parser.add_argument("--track_jsons", nargs="+", help="Paths to multiple track JSON files")
+    parser.add_argument(
+        "--fade-transition",
+        "--black-transition",
+        dest="fade_transition",
+        action="store_true",
+        help=(
+            "Join --track_jsons with a 0.3s fade to black followed by a "
+            "0.3s fade from black"
+        ),
+    )
     parser.add_argument("--json_dir", help="Directory with track_*.json files")
     parser.add_argument("--output_dir", default=None, help="Root output directory")
     parser.add_argument("--visualize", action="store_true", help="Show real-time cropped video")
@@ -501,6 +626,36 @@ def main() -> None:
 
     reels_dir = os.path.join(args.output_dir, base_name, "reels") if args.output_dir else "reels"
     ensure_reels_dir(reels_dir)
+
+    if args.fade_transition and (not args.track_jsons or len(args.track_jsons) < 2):
+        parser.error("--fade-transition requires at least two files in --track_jsons")
+
+    if args.track_jsons:
+        track_payloads = []
+        for track_json_path in args.track_jsons:
+            with open(track_json_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if not isinstance(payload, dict):
+                raise ValueError(f"Track JSON must contain an object: {track_json_path}")
+            track_payloads.append(payload)
+
+        output_path = os.path.join(reels_dir, f"reel_{base_name}_combined.mp4")
+        crop_and_save_track_payloads(
+            video_path=args.video_path,
+            track_payloads=track_payloads,
+            output_path=output_path,
+            visualize=args.visualize,
+            smoothing=args.smoothing,
+            interpolation=args.interpolation,
+            smooth_window=args.smooth_window,
+            smooth_polyorder=args.smooth_polyorder,
+            margin=args.margin,
+            padding=args.padding,
+            fade_transition=args.fade_transition,
+        )
+        if not args.visualize:
+            LOG.info("Saved combined reel: %s", output_path)
+        return
 
     for track_json_path in json_paths:
         track = load_single_track(track_json_path)

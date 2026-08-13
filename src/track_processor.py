@@ -24,6 +24,7 @@ from ball_tracker import Track
 from constants import DEFAULT_FADE_DURATION
 
 LOG = logging.getLogger(__name__)
+TRACK_PADDING_FRAMES = 10
 
 
 @dataclass
@@ -140,6 +141,8 @@ class TrackProcessor:
         split_dir: Optional[str] = None,
         fps: float = 30.0,
         debug: bool = False,
+        include_not_rally: bool = False,
+        mark_ball: bool = True,
     ) -> None:
         self.json_dir = json_dir
         self.video_path = video_path
@@ -147,6 +150,8 @@ class TrackProcessor:
         self.split_dir = split_dir
         self.fps = fps
         self.debug = debug
+        self.include_not_rally = include_not_rally
+        self.mark_ball = mark_ball
         self.tracks: List[LoadedTrack] = []
         self.total_processed_frames = 0
         self.total_processing_time = 0.0
@@ -159,6 +164,7 @@ class TrackProcessor:
 
     def _load_tracks_from_json(self) -> None:
         self._validate_json_dir()
+        self.tracks = []
 
         json_files = sorted(
             [
@@ -168,14 +174,39 @@ class TrackProcessor:
             ]
         )
 
+        skipped_not_rally = 0
+        skipped_unclassified = 0
         for filename in json_files:
             file_path = os.path.join(self.json_dir, filename)
             with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            if not self.include_not_rally and not self._is_rally(data):
+                classification = data.get("rally_classification") or {}
+                if classification.get("label") == "not_rally" or classification.get(
+                    "is_rally"
+                ) is False:
+                    skipped_not_rally += 1
+                else:
+                    skipped_unclassified += 1
+                continue
             track = Track.from_dict(data)
             self.tracks.append(LoadedTrack(track=track, metadata=data))
 
-        LOG.info("Loaded %s track(s) from %s", len(self.tracks), self.json_dir)
+        LOG.info(
+            "Loaded %s track(s) from %s; skipped %s not_rally and %s unclassified",
+            len(self.tracks),
+            self.json_dir,
+            skipped_not_rally,
+            skipped_unclassified,
+        )
+
+    @staticmethod
+    def _is_rally(metadata: Dict[str, Any]) -> bool:
+        classification = metadata.get("rally_classification") or {}
+        is_rally = classification.get("is_rally")
+        if isinstance(is_rally, bool):
+            return is_rally
+        return classification.get("label") == "rally"
 
     def _validate_video(self) -> None:
         if not os.path.exists(self.video_path):
@@ -187,6 +218,19 @@ class TrackProcessor:
         if self.output_path:
             return CombinedVideoExporter(self.output_path, fps, size)
         return None
+
+    @staticmethod
+    def _clip_frame_range(
+        start_frame: int,
+        end_frame: int,
+        total_video_frames: int,
+    ) -> Tuple[int, int]:
+        """Add ten context frames on both sides without leaving the video."""
+        clip_start = max(0, int(start_frame) - TRACK_PADDING_FRAMES)
+        clip_end = int(end_frame) + TRACK_PADDING_FRAMES
+        if total_video_frames > 0:
+            clip_end = min(clip_end, total_video_frames - 1)
+        return clip_start, clip_end
 
     def _write_fade_out(self, exporter: BaseExporter, frame, fade_frames: int) -> None:
         fade_pbar = tqdm(
@@ -305,13 +349,18 @@ class TrackProcessor:
             track_id = loaded_track.track_id
             start_frame = loaded_track.start_frame
             end_frame = loaded_track.last_frame
-            frame_count = end_frame - start_frame + 1
+            clip_start_frame, clip_end_frame = self._clip_frame_range(
+                start_frame, end_frame, total_video_frames
+            )
+            frame_count = clip_end_frame - clip_start_frame + 1
 
             LOG.info(
-                "Processing track %s | Frames: %s-%s (%s)",
+                "Processing track %s | Track: %s-%s | Clip: %s-%s (%s frames)",
                 track_id,
                 start_frame,
                 end_frame,
+                clip_start_frame,
+                clip_end_frame,
                 frame_count,
             )
 
@@ -323,8 +372,8 @@ class TrackProcessor:
                 x, y = pos[0]
                 pos_by_frame[int(pos[1])] = (int(x), int(y))
 
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-            frame_num = start_frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, clip_start_frame)
+            frame_num = clip_start_frame
             last_clean_frame = None
 
             pbar = tqdm(
@@ -336,7 +385,7 @@ class TrackProcessor:
             )
             track_start_time = time.time()
 
-            while frame_num <= end_frame:
+            while frame_num <= clip_end_frame:
                 ret, frame = cap.read()
                 if not ret:
                     LOG.warning("Failed to read frame %s, stopping track %s", frame_num, track_id)
@@ -345,7 +394,7 @@ class TrackProcessor:
                 clean_frame = frame.copy()
 
                 pos = pos_by_frame.get(frame_num)
-                if pos:
+                if pos and self.mark_ball:
                     px, py = pos
                     cv2.circle(frame, (px, py), 10, (0, 255, 255), -1)
                     elapsed_time = (frame_num - start_frame) / fps
@@ -467,6 +516,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Overlay track classification, serve side and metrics onto output frames",
     )
+    parser.add_argument(
+        "--include-not-rally",
+        "--include_not_rally",
+        dest="include_not_rally",
+        action="store_true",
+        help="Include not_rally and unclassified tracks (default: rally only)",
+    )
+    parser.add_argument(
+        "--no-mark",
+        action="store_true",
+        help="Do not draw the ball marker, track ID or coordinates on video frames",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     return parser
 
@@ -502,6 +563,8 @@ def main() -> None:
         split_dir=args.split_dir,
         fps=args.fps,
         debug=args.debug,
+        include_not_rally=args.include_not_rally,
+        mark_ball=not args.no_mark,
     )
     processor._load_tracks_from_json()
     processor.visualize_tracks()

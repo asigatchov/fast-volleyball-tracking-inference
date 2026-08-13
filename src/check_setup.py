@@ -10,7 +10,7 @@ def check_files():
         "models_yolo/yolo11n.onnx",
         "models_yolo/yolo11n_vb.onnx",
         "src/player_tracker.py",
-        "src/coort_coordinats.py",
+        "src/court_coordinates.py",
         "src/demo_player_tracking_v2.py"
     ]
     
@@ -31,7 +31,7 @@ def check_files():
     if all_files_exist:
         print("All required files are present!")
         print("\nTo use player tracking, run:")
-        print("  python src/coort_coordinats.py --video_path path/to/video.mp4")
+        print("  python src/court_coordinates.py path/to/video.mp4")
         print("\nOr to run the demo with tracking:")
         print("  python src/demo_player_tracking_v2.py --video_path path/to/video.mp4 --visualize")
     else:
