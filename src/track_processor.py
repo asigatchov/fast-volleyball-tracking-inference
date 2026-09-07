@@ -25,6 +25,7 @@ from constants import DEFAULT_FADE_DURATION
 
 LOG = logging.getLogger(__name__)
 TRACK_PADDING_FRAMES = 10
+DEFAULT_PADDING_SECONDS = TRACK_PADDING_FRAMES / 30.0
 
 
 @dataclass
@@ -143,7 +144,11 @@ class TrackProcessor:
         debug: bool = False,
         include_not_rally: bool = False,
         mark_ball: bool = True,
+        padding: float = DEFAULT_PADDING_SECONDS,
     ) -> None:
+        if padding < 0:
+            raise ValueError("padding must be greater than or equal to 0")
+
         self.json_dir = json_dir
         self.video_path = video_path
         self.output_path = output_path
@@ -152,6 +157,7 @@ class TrackProcessor:
         self.debug = debug
         self.include_not_rally = include_not_rally
         self.mark_ball = mark_ball
+        self.padding = padding
         self.tracks: List[LoadedTrack] = []
         self.total_processed_frames = 0
         self.total_processing_time = 0.0
@@ -224,10 +230,13 @@ class TrackProcessor:
         start_frame: int,
         end_frame: int,
         total_video_frames: int,
+        fps: float = 30.0,
+        padding: float = DEFAULT_PADDING_SECONDS,
     ) -> Tuple[int, int]:
-        """Add ten context frames on both sides without leaving the video."""
-        clip_start = max(0, int(start_frame) - TRACK_PADDING_FRAMES)
-        clip_end = int(end_frame) + TRACK_PADDING_FRAMES
+        """Add context on both sides without leaving the video bounds."""
+        padding_frames = max(0, round(padding * fps))
+        clip_start = max(0, int(start_frame) - padding_frames)
+        clip_end = int(end_frame) + padding_frames
         if total_video_frames > 0:
             clip_end = min(clip_end, total_video_frames - 1)
         return clip_start, clip_end
@@ -350,7 +359,11 @@ class TrackProcessor:
             start_frame = loaded_track.start_frame
             end_frame = loaded_track.last_frame
             clip_start_frame, clip_end_frame = self._clip_frame_range(
-                start_frame, end_frame, total_video_frames
+                start_frame,
+                end_frame,
+                total_video_frames,
+                fps=fps,
+                padding=self.padding,
             )
             frame_count = clip_end_frame - clip_start_frame + 1
 
@@ -512,6 +525,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--fps", type=float, default=30.0, help="Output FPS if video has none"
     )
     parser.add_argument(
+        "--padding",
+        type=float,
+        default=DEFAULT_PADDING_SECONDS,
+        help="Seconds to add before and after each rally (default: %(default).3f)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Overlay track classification, serve side and metrics onto output frames",
@@ -565,6 +584,7 @@ def main() -> None:
         debug=args.debug,
         include_not_rally=args.include_not_rally,
         mark_ball=not args.no_mark,
+        padding=args.padding,
     )
     processor._load_tracks_from_json()
     processor.visualize_tracks()

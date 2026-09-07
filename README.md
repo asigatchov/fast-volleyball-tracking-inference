@@ -91,6 +91,7 @@ output/gtu_20250316_002/
 - By default, only tracks with `rally_classification.is_rally=true` are exported;
   `not_rally` and unclassified tracks are skipped.
 - `--include-not-rally` - include all tracks for diagnostic exports.
+- `--padding` - seconds to add before and after every rally in the exported video.
 - `--output_dir` - auto-resolves `tracks` and `combined.mp4` by video basename.
 - `--json_dir` - explicit tracks folder.
 - `--split_dir` - export each rally into a separate clip.
