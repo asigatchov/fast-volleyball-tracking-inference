@@ -505,7 +505,10 @@ def main():
         frame_count = len(timestamps)
         paused = False
         exporting = bool(args.output or args.output_csv)
-        print("Ballistic fit: instantaneous derivative of fitted trajectory; manual intervals must exclude contacts." if args.mode == "physics" else
+        fitted = ("Ballistic fit: instantaneous derivative of fitted trajectory; manual intervals must exclude contacts."
+                  if args.segment else
+                  "Ballistic fit: instantaneous derivative of fitted trajectory; detected intervals fit one parabola each.")
+        print(fitted if args.mode == "physics" else
               "Radius-derived 3D estimate; radius noise affects depth and speed." if camera else
               "Approximate floor-plane speed; airborne ball speed is not recovered.")
         print("Controls: A/D = -1/+1 frame; W/S = +15/-15 frames; Space = pause/resume; Q or Esc = quit.")

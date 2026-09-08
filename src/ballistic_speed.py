@@ -286,6 +286,7 @@ def detect_segments(camera, detections, timestamps, diameter=0.22, width=9., len
             index += 1
     return [(int(frames[a]), int(frames[b])) for a, b in segments]
 
+
 def save_plots(path, flights, timestamps):
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg

@@ -96,6 +96,7 @@ def infer_model_params(model_path: str) -> dict:
             "input_height": GRID_INPUT_HEIGHT,
             "grid_cols": GRID_COLS,
             "grid_rows": GRID_ROWS,
+            "planes": 3,
         }
     return {
         "family": "heatmap",
@@ -105,6 +106,7 @@ def infer_model_params(model_path: str) -> dict:
         "input_height": DEFAULT_INPUT_HEIGHT,
         "grid_cols": None,
         "grid_rows": None,
+        "planes": 1,
     }
 
 
@@ -127,14 +129,21 @@ def load_onnx_model(model_path):
     output_shape = session.get_outputs()[0].shape
 
     input_seq = resolve_dim(input_shape[1], model_params["input_seq"])
+    # VballNetGridV2b and VballNetV2c append one radius plane per frame, so the
+    # output has more channels than frames. Read the ratio rather than the file
+    # name: an exported model can be renamed, its channel count cannot.
     if model_params["family"] == "grid":
         output_channels = resolve_dim(output_shape[1], input_seq * 3)
-        out_dim = output_channels // 3
+        planes = 4 if output_channels % 4 == 0 and output_channels // 4 == input_seq else 3
+        out_dim = output_channels // planes
     else:
-        out_dim = resolve_dim(output_shape[1], model_params["seq"])
+        output_channels = resolve_dim(output_shape[1], model_params["seq"])
+        planes = 2 if output_channels == input_seq * 2 else 1
+        out_dim = output_channels // planes
 
     model_params["input_seq"] = input_seq
     model_params["seq"] = out_dim
+    model_params["planes"] = planes
 
     has_gru = "h0" in input_names
     h0_shape = None
@@ -164,8 +173,9 @@ def load_onnx_model(model_path):
 
     LOG.info("Model loaded: %s", model_path)
     LOG.info(
-        "Family: %s | GRU: %s | Input sequence: %s | Output sequence: %s | h0 shape: %s",
+        "Family: %s | ball radius: %s | GRU: %s | Input sequence: %s | Output sequence: %s | h0 shape: %s",
         model_params["family"],
+        "from model" if model_params["planes"] in (2, 4) else "from contours",
         has_gru,
         batch_size,
         out_dim,
@@ -244,7 +254,14 @@ def postprocess_heatmap_output(
     input_height=DEFAULT_INPUT_HEIGHT,
     input_width=DEFAULT_INPUT_WIDTH,
     out_dim=9,
+    planes=1,
 ):
+    """Decode heatmaps to (visibility, x, y, radius).
+
+    ``radius`` is None unless the model is a V2c, which emits a radius map after
+    its heatmaps; there it is read at the detected point and returned as a
+    fraction of frame width, so the caller can scale it to the source video.
+    """
     results = []
     for frame_idx in range(out_dim):
         heatmap = output[0, frame_idx, :, :]
@@ -258,18 +275,26 @@ def postprocess_heatmap_output(
             if moments["m00"] != 0:
                 cx = int(moments["m10"] / moments["m00"])
                 cy = int(moments["m01"] / moments["m00"])
-                results.append((1, cx, cy))
+                radius = None
+                if planes == 2:
+                    radius = float(output[0, out_dim + frame_idx, cy, cx])
+                results.append((1, cx, cy, radius))
             else:
-                results.append((0, 0, 0))
+                results.append((0, 0, 0, None))
         else:
-            results.append((0, 0, 0))
+            results.append((0, 0, 0, None))
     return results
 
 
 def postprocess_grid_output(
-    output, threshold, seq, input_height, input_width, grid_rows, grid_cols
+    output, threshold, seq, input_height, input_width, grid_rows, grid_cols, planes=3
 ):
-    output = output[0].reshape(seq, 3, grid_rows, grid_cols)
+    """Decode the detection grid to (visibility, x, y, radius).
+
+    ``radius`` is None for the three-plane models and, for VballNetGridV2b, the
+    fourth plane read at the winning cell -- a fraction of frame width.
+    """
+    output = output[0].reshape(seq, planes, grid_rows, grid_cols)
     results = []
     for frame_idx in range(seq):
         conf = output[frame_idx, 0]
@@ -280,13 +305,14 @@ def postprocess_grid_output(
         col = max_index % grid_cols
         conf_score = float(conf[row, col])
         if conf_score < threshold:
-            results.append((0, 0, 0))
+            results.append((0, 0, 0, None))
             continue
         x = (col + float(x_offset[row, col])) * (input_width / grid_cols)
         y = (row + float(y_offset[row, col])) * (input_height / grid_rows)
         x = int(np.clip(x, 0, input_width - 1))
         y = int(np.clip(y, 0, input_height - 1))
-        results.append((1, x, y))
+        radius = float(output[frame_idx, 3, row, col]) if planes == 4 else None
+        results.append((1, x, y, radius))
     return results
 
 
@@ -300,6 +326,7 @@ def decode_predictions(output, model_params, threshold):
             input_width=model_params["input_width"],
             grid_rows=model_params["grid_rows"],
             grid_cols=model_params["grid_cols"],
+            planes=model_params["planes"],
         )
     return postprocess_heatmap_output(
         output=output,
@@ -307,6 +334,7 @@ def decode_predictions(output, model_params, threshold):
         input_height=model_params["input_height"],
         input_width=model_params["input_width"],
         out_dim=model_params["seq"],
+        planes=model_params["planes"],
     )
 
 
@@ -442,6 +470,20 @@ def estimate_ball_radius(prev_gray, gray, x_orig, y_orig, size_state):
     filtered_radius = filter_ball_radius(int(round(radius)), size_state)
     contour_global = best_contour + np.array([[[x1, y1]]], dtype=np.int32)
     return filtered_radius, contour_global
+
+
+def model_radius_to_pixels(radius_norm, frame_width):
+    """A model's radius (fraction of frame width) as pixels in the source frame.
+
+    V2b and V2c regress the ball's size directly, so where a model provides one
+    there is nothing for the motion-contour estimator to do: that path exists
+    because the older models predict a point and no size at all. Clipped to the
+    same bounds the contour path uses, which reject anything that is not a ball.
+    """
+    if radius_norm is None or radius_norm <= 0:
+        return 0
+    radius = int(round(radius_norm * frame_width))
+    return int(np.clip(radius, BALL_RADIUS_MIN, BALL_RADIUS_MAX))
 
 
 def render_prediction(frame, points, visibility, x_orig, y_orig, radius, contour):
@@ -642,7 +684,7 @@ def main():
 
             predictions = decode_predictions(output, model_params, args.confidence_threshold)
 
-            for i, (visibility, x, y) in enumerate(predictions[: len(frames)]):
+            for i, (visibility, x, y, radius_norm) in enumerate(predictions[: len(frames)]):
                 frame_gray = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
                 x_orig = x * frame_width / input_width if visibility else -1
                 y_orig = y * frame_height / input_height if visibility else -1
@@ -650,9 +692,14 @@ def main():
                 if visibility:
                     point = (int(x_orig), int(y_orig))
                     track_state.update(point)
-                    radius, contour = estimate_ball_radius(
-                        prev_gray, frame_gray, point[0], point[1], size_state
-                    )
+                    if model_params["planes"] in (2, 4):
+                        # The model regressed the size; no contour to find.
+                        radius = model_radius_to_pixels(radius_norm, frame_width)
+                        contour = None
+                    else:
+                        radius, contour = estimate_ball_radius(
+                            prev_gray, frame_gray, point[0], point[1], size_state
+                        )
                 else:
                     track_state.update(None)
                     radius, contour = 0, None

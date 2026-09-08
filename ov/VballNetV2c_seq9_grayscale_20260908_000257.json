@@ -1,0 +1,33 @@
+{
+  "name": "VballNetV2c_seq9_grayscale_20260908_000257",
+  "model_name": "VballNetV2c",
+  "family": "heatmap",
+  "checkpoint": "/home/ubuntu/projects/vball-net-pytorch/outputs/VballNetV2c_seq9_grayscale_20260908_000257/checkpoints/VballNetV2c_seq9_grayscale_best.pth",
+  "epoch": 74,
+  "onnx": "/home/ubuntu/projects/vball-net-pytorch/models/VballNetV2c_seq9_grayscale_20260908_000257.onnx",
+  "openvino_xml": "/home/ubuntu/projects/vball-net-pytorch/models/openvino/VballNetV2c_seq9_grayscale_20260908_000257.xml",
+  "openvino_bin": "/home/ubuntu/projects/vball-net-pytorch/models/openvino/VballNetV2c_seq9_grayscale_20260908_000257.bin",
+  "input_name": "clip",
+  "input_shape": [
+    1,
+    9,
+    288,
+    512
+  ],
+  "output_names": [
+    "maps",
+    "hn"
+  ],
+  "output_shape": [
+    1,
+    18,
+    288,
+    512
+  ],
+  "seq": 9,
+  "grayscale": true,
+  "planes_per_frame": 2,
+  "channel_layout": "heatmaps then radius maps",
+  "radius_unit": "fraction of frame width",
+  "fused_conv_bn_pairs": 0
+}
