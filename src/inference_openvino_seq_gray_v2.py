@@ -21,6 +21,10 @@ except ImportError:
 DEFAULT_INPUT_WIDTH = 512
 DEFAULT_INPUT_HEIGHT = 288
 DEFAULT_SEQ = 9
+# Only a fallback: every exported model states its own input and grid size and
+# load_model reads them from there. These are the VballNetGridV1b/V1c/V2b
+# numbers, kept for a model whose shapes are fully dynamic. VballNetGridV3
+# reads 1024x576 on a 64x36 grid.
 GRID_INPUT_WIDTH = 768
 GRID_INPUT_HEIGHT = 432
 GRID_COLS = 48
@@ -49,6 +53,7 @@ def parse_args():
 
 
 def infer_model_params(model_path):
+    """Guess from the file name; load_model overrides this from the model itself."""
     model_name = Path(model_path).name.lower()
     seq_match = re.search(r"seq(\d+)", model_name)
     seq = int(seq_match.group(1)) if seq_match else DEFAULT_SEQ
@@ -90,6 +95,19 @@ def load_model(model_path, device="CPU"):
 
     input_layer = model.input(0)
     pshape = input_layer.partial_shape
+
+    # The exported models leave only the batch axis dynamic and state seq,
+    # height and width. Trust that over the file name: VballNetGridV3 reads
+    # 1024x576 where V1b/V2b read 768x432, and a name-derived size would not
+    # fail here -- it would quietly reshape the network to the wrong resolution
+    # and cost accuracy with nothing in the log to show for it.
+    for axis, key in ((1, "seq"), (2, "input_height"), (3, "input_width")):
+        if pshape[axis].is_static:
+            stated = pshape[axis].get_length()
+            if model_params[key] != stated:
+                print(f"  {key}: имя файла даёт {model_params[key]}, модель — {stated}; берём модель")
+            model_params[key] = stated
+
     expected_shape = [
         1,
         model_params["seq"],
@@ -106,20 +124,36 @@ def load_model(model_path, device="CPU"):
     input_layer = compiled_model.input(0)
     output_layer = compiled_model.output(0)
 
-    # VballNetGridV2b and VballNetV2c append one radius plane per frame, so the
-    # output carries more channels than there are frames. Read the ratio rather
+    # Family, grid size and plane count all come from the output shape rather
     # than the file name: an exported model can be renamed, its shape cannot.
-    output_channels = int(output_layer.shape[1])
+    # A heatmap model emits one map per frame at the input resolution; the grid
+    # family emits a coarser cell grid, whose size changed between V2b (48x27)
+    # and V3 (64x36). VballNetGridV2b and VballNetV2c append one radius plane
+    # per frame, which the channel-to-frame ratio reveals.
+    output_shape = [int(dim) for dim in output_layer.shape]
+    if len(output_shape) != 4:
+        raise ValueError(f"Ожидался выход [B, C, H, W], получен {output_shape}")
+    output_channels = output_shape[1]
     seq = model_params["seq"]
-    if model_params["family"] == "grid":
-        model_params["planes"] = 4 if output_channels == seq * 4 else 3
-    else:
+    if output_shape[2:] == [model_params["input_height"], model_params["input_width"]]:
+        model_params["family"] = "heatmap"
+        model_params["grid_rows"] = model_params["grid_cols"] = None
         model_params["planes"] = 2 if output_channels == seq * 2 else 1
+    else:
+        model_params["family"] = "grid"
+        model_params["grid_rows"] = output_shape[2]
+        model_params["grid_cols"] = output_shape[3]
+        model_params["planes"] = 4 if output_channels == seq * 4 else 3
 
     print(f"Модель загружена на: {device}")
     print(f"  Вход: {input_layer.any_name} {input_layer.shape}")
     print(f"  Выход: {output_layer.any_name} {output_layer.shape}")
-    print(f"  Семейство: {model_params['family']}")
+    print(f"  Семейство: {model_params['family']}, seq {seq}, "
+          f"вход {model_params['input_width']}x{model_params['input_height']}")
+    if model_params["family"] == "grid":
+        cell = model_params["input_width"] / model_params["grid_cols"]
+        print(f"  Сетка: {model_params['grid_cols']}x{model_params['grid_rows']} "
+              f"(ячейка {cell:.0f} px)")
     print(f"  Радиус мяча: {'из модели' if model_params['planes'] in (2, 4) else 'по контурам'}")
 
     return compiled_model, input_layer, output_layer, model_params

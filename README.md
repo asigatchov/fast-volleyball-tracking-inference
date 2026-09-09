@@ -26,7 +26,10 @@ cd fast-volleyball-tracking-inference
 uv sync
 ```
 
-For visualization (using `--visualize` parameter):
+The pipeline itself needs nothing beyond that - `--visualize` works on the base install,
+since `opencv-python` already ships the GUI backend. The `dev` extra adds `matplotlib`
+for the diagnostic plots in `src/test_models.py` and `src/serv_det*.py`, and `pytest`
+to run the suite under `tests/`:
 ```bash
 uv sync --extra dev
 ```
@@ -34,11 +37,11 @@ uv sync --extra dev
 ## Quick start (tested)
 Example input:
 - video: `examples/gtu_20250316_002.mp4`
-- model: `models/VballNetV1_seq9_grayscale_330_h288_w512.onnx`
+- model: `models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx`
 
 ```bash
 VIDEO="examples/gtu_20250316_002.mp4"
-MODEL="models/VballNetV1_seq9_grayscale_330_h288_w512.onnx"
+MODEL="models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx"
 OUT="output"
 
 # 1) Detection -> ball.csv
@@ -122,33 +125,39 @@ uv run src/show_rally.py output/beach-mixt/tracks /path/to/video.mp4 \
 
 ## OpenVino runtime
 ### `uv run src/inference_openvino_seq_gray_v2.py`
-- `--model_xml ./ov/VballNetV2_seq9_grayscale_ov.xml`
+- `--model_xml ./ov/VballNetV4c_seq9_grayscale_20260908_213829.xml`
 - `--video_path ./examples/gtu_20250316_002.mp4`
 - `--only_csv`
 - `--output_dir ./demo-result/`
 
 ## Available ONNX models
 Benchmark setup:
-- runner: `src/inference_onnx_seq_gray_v2.py`
-- video: `match9/video/woman_transhmash_2_00004.mp4`
-- ground truth: `match9/csv/woman_transhmash_2_00004_ball.csv`
-- runtime: local `onnxruntime` on CPU (`CPUExecutionProvider`)
-- `Acc@5px (all)` = frame is correct if ball is visible and predicted within 5 px, or if both GT and prediction mark frame as invisible
-- `Acc@5px (visible)` = only GT-visible frames are evaluated, prediction must be within 5 px
+- runner: `scripts/eval_ov_models.py`, which reuses the decode path of `src/inference_openvino_seq_gray_v2.py`
+- dataset: `beach-test-raw` - 3 clips, 886 labelled frames, 1280x720 and 1920x1080
+- runtime: OpenVINO on CPU (Intel Core i5-10400F, 12 threads)
+- a detection counts as a hit when it lands within 9 px of the label at 1920 frame width; the tolerance is scaled to each clip's resolution, so the 720p clips are judged at 6 px
+- `Precision`, `Recall` and `F1` are computed over those hits; frames where label and prediction agree the ball is invisible count as true negatives
+- `CPU FPS` times the inference call alone, not the end-to-end pipeline. `scripts/bench_inference_fps.py` feeds the model a synthetic random tensor of its own
+  input shape (`[1, seq, H, W]`, float32), runs 10 warm-up inferences and then times 60 more. One call decodes `seq` frames at once, so a run scores `seq / median(latency)`.
+  The model is reloaded for each of the 3 repeats, because OpenVINO lays the network out across threads differently from load to load, and the table reports the median of
+  those repeats. Video decode, the grayscale+resize preprocess and the heatmap/grid postprocess are all excluded.
 
-| Model | FPS | Acc@5px (all) | Acc@5px (visible) |
-| --- | ---: | ---: | ---: |
-| `VballNetV1_seq9_grayscale_148_h288_w512.onnx` | 138.68 | 87.25% | 86.43% |
-| `VballNetV1_seq9_grayscale_204_h288_w512.onnx` | 138.39 | 85.95% | 84.88% |
-| `VballNetV2_seq9_grayscale_320_h288_w512.onnx` | 114.22 | 83.01% | 82.56% |
-| `VballNetV1_seq9_grayscale_330_h288_w512.onnx` | 141.04 | 82.35% | 81.78% |
-| `VballNetV1c_seq9_grayscale_best.onnx` | 142.17 | 76.80% | 74.81% |
-| `VballNetGridV1b_seq9_grayscale_20260319_193937.onnx` | 117.55 | 75.49% | 74.03% |
-| `VballNetFastV1_seq9_grayscale_233_h288_w512.onnx` | 271.86 | 73.20% | 68.99% |
-| `VballNetV1b_seq9_grayscale_best.onnx` | 142.56 | 72.88% | 70.16% |
-| `VballNetGridV1c_seq9_grayscale_20260317.onnx` | 185.85 | 64.05% | 62.02% |
-| `VballNetFastV1_155_h288_w512.onnx` | 307.56 | 15.03% | 0.00% |
-| `VballNetV1_150_h288_w512.onnx` | 149.88 | 10.13% | 0.00% |
+| Model | F1 | Precision | Recall | CPU FPS |
+| --- | ---: | ---: | ---: | ---: |
+| `VballNetV4c_seq9_grayscale_20260908_213829.onnx` | 0.902 | 0.900 | 0.904 | 149.6 |
+| `VballNetGridV2b_seq9_grayscale_20260909_001145.onnx` | 0.892 | 0.874 | 0.910 | 122.9 |
+| `VballNetGridV3_seq9_grayscale_20260908_225156.onnx` | 0.867 | 0.870 | 0.863 | 229.3 |
+| `VballNetFastV1_seq9_grayscale_233_h288_w512.onnx` | 0.799 | 0.778 | 0.822 | 1140.0 |
+
+Reproduce the speed column with:
+```bash
+uv run scripts/bench_inference_fps.py models/*.onnx
+```
+Expect the result to move by 3-4% between invocations. A full pipeline run is slower than the number above, since inference then shares the
+same cores with video decode - roughly 10% off for `VballNetGridV3` on this machine, and more on the lighter models where decode weighs relatively more.
+
+Earlier checkpoints and their OpenVINO IR counterparts live in `old_models/onnx/` and
+`old_models/ov/`; they are kept for reference and are not benchmarked here.
 
 ## Notes
 - `onnxruntime` can run on CPU if CUDA provider is unavailable.

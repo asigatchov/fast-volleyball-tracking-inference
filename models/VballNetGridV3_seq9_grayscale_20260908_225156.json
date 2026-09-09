@@ -1,0 +1,32 @@
+{
+  "name": "VballNetGridV3_seq9_grayscale_20260908_225156",
+  "model_name": "VballNetGridV3",
+  "family": "grid",
+  "checkpoint": "/home/ubuntu/projects/vball-net-pytorch/outputs/VballNetGridV3_seq9_grayscale_20260908_225156/checkpoints/best.pth",
+  "epoch": 17,
+  "onnx": "/home/ubuntu/projects/vball-net-pytorch/models/VballNetGridV3_seq9_grayscale_20260908_225156.onnx",
+  "openvino_xml": "/home/ubuntu/projects/vball-net-pytorch/models/openvino/VballNetGridV3_seq9_grayscale_20260908_225156.xml",
+  "openvino_bin": "/home/ubuntu/projects/vball-net-pytorch/models/openvino/VballNetGridV3_seq9_grayscale_20260908_225156.bin",
+  "input_name": "clip",
+  "input_shape": [
+    1,
+    9,
+    576,
+    1024
+  ],
+  "output_names": [
+    "grid"
+  ],
+  "output_shape": [
+    1,
+    36,
+    36,
+    64
+  ],
+  "seq": 9,
+  "grayscale": true,
+  "planes_per_frame": 4,
+  "channel_layout": "per frame: conf, x_offset, y_offset, radius",
+  "radius_unit": "fraction of frame width",
+  "fused_conv_bn_pairs": 13
+}

@@ -9,3 +9,14 @@ wheels/
 *.mp4
 # Virtual environments
 .venv
+
+# Local model archive - kept on disk, not in history (see README)
+old_models/
+
+# Benchmark and evaluation reports
+eval_results*/
+
+# Local runtime data
+uploads/
+db-data/
+pyproject.toml.old
