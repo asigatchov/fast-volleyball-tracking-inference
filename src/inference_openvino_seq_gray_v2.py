@@ -49,6 +49,13 @@ def parse_args():
     parser.add_argument("--only_csv", action="store_true", help="Save only CSV")
     parser.add_argument("--device", type=str, default="GPU", help="CPU, GPU, AUTO")
     parser.add_argument("--threshold", type=float, default=0.5, help="Confidence threshold")
+    parser.add_argument(
+        "--rotate",
+        type=int,
+        default=0,
+        choices=[-90, 0, 90, 180, -180],
+        help="Rotate frames before inference/output: -90 counterclockwise, 90 clockwise, 180 upside down",
+    )
     return parser.parse_args()
 
 
@@ -168,6 +175,22 @@ def initialize_video(video_path):
     fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     return cap, width, height, fps, total
+
+
+def rotated_dimensions(width, height, rotate):
+    if abs(rotate) == 90:
+        return height, width
+    return width, height
+
+
+def rotate_frame(frame, rotate):
+    if rotate == -90:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if rotate == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if abs(rotate) == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    return frame
 
 
 def setup_output_writer(basename, out_dir, width, height, fps, only_csv):
@@ -485,7 +508,8 @@ def main():
     args = parse_args()
     compiled_model, _, output_layer, model_params = load_model(args.model_xml, device=args.device)
 
-    cap, frame_width, frame_height, fps, total = initialize_video(args.video_path)
+    cap, orig_width, orig_height, fps, total = initialize_video(args.video_path)
+    frame_width, frame_height = rotated_dimensions(orig_width, orig_height, args.rotate)
     basename = os.path.splitext(os.path.basename(args.video_path))[0]
     writer, _ = setup_output_writer(
         basename, args.output_dir, frame_width, frame_height, fps, args.only_csv
@@ -510,6 +534,7 @@ def main():
             ret, frame = cap.read()
             if not ret:
                 break
+            frame = rotate_frame(frame, args.rotate)
 
             current_frames.append(frame.copy())
             if len(current_frames) != seq:
