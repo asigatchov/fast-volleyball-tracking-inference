@@ -27,6 +27,7 @@ LOG = logging.getLogger(__name__)
 WATERMARK_TEXT = "vb-ai.ru"
 WATERMARK_FONT_PATH = Path(__file__).resolve().parent / "fonts" / "PlayfairDisplay-MediumItalic.ttf"
 BLACK_TRANSITION_SECONDS = 0.3
+DEFAULT_PADDING_SECONDS = 0.33
 
 
 try:
@@ -209,32 +210,28 @@ def kalman_smooth(values: np.ndarray, process_var: float = 1e-3, meas_var: float
     return np.array(smoothed)
 
 
-def crop_frame(frame: np.ndarray, center_x: int, crop_width: int, padding: str) -> np.ndarray:
-    frame_height, frame_width = frame.shape[:2]
+def crop_frame(frame: np.ndarray, center_x: int, crop_width: int) -> np.ndarray:
+    """Crop around ``center_x``, shifting the window to stay inside the frame."""
+    frame_width = frame.shape[1]
     crop_width = min(crop_width, frame_width)
-    left = center_x - crop_width // 2
-    right = left + crop_width
+    left = max(0, min(center_x - crop_width // 2, frame_width - crop_width))
+    return frame[:, left:left + crop_width]
 
-    if padding == "none":
-        left = max(0, min(left, frame_width - crop_width))
-        right = left + crop_width
-        return frame[:, left:right]
 
-    pad_left = max(0, -left)
-    pad_right = max(0, right - frame_width)
-    if pad_left or pad_right:
-        if padding == "mirror":
-            border = cv2.BORDER_REFLECT_101
-            padded = cv2.copyMakeBorder(frame, 0, 0, pad_left, pad_right, border)
-        else:
-            padded = cv2.copyMakeBorder(
-                frame, 0, 0, pad_left, pad_right, cv2.BORDER_CONSTANT, value=(0, 0, 0)
-            )
-        left += pad_left
-        right += pad_left
-        return padded[:, left:right]
-
-    return frame[:, left:right]
+def clip_frame_range(
+    start_frame: int,
+    end_frame: int,
+    total_video_frames: int,
+    fps: float,
+    padding: float = DEFAULT_PADDING_SECONDS,
+) -> Tuple[int, int]:
+    """Add ``padding`` seconds on both sides without leaving the video bounds."""
+    padding_frames = max(0, round(padding * fps))
+    clip_start = max(0, int(start_frame) - padding_frames)
+    clip_end = int(end_frame) + padding_frames
+    if total_video_frames > 0:
+        clip_end = min(clip_end, total_video_frames - 1)
+    return clip_start, clip_end
 
 
 def add_watermark_top_right(frame: np.ndarray, text: str = WATERMARK_TEXT) -> np.ndarray:
@@ -339,7 +336,7 @@ def crop_and_save_track(
     smooth_window: int = DEFAULT_SMOOTH_WINDOW,
     smooth_polyorder: int = 2,
     margin: float = 0.0,
-    padding: str = "none",
+    padding: float = DEFAULT_PADDING_SECONDS,
     fade_in: bool = False,
     fade_out: bool = False,
 ) -> None:
@@ -368,11 +365,17 @@ def crop_and_save_track(
         out = cv2.VideoWriter(output_path, fourcc, fps, (crop_width, crop_height))
 
     frame_to_pos = {int(p[2]): (p[0], p[1]) for p in track["positions"]}
-    start_frame = track["start_frame"]
-    end_frame = track["last_frame"]
-
     if not frame_to_pos:
         raise ValueError("Track contains no ball positions")
+
+    # Before and after the track the crop holds the edge ball position.
+    start_frame, end_frame = clip_frame_range(
+        track["start_frame"],
+        track["last_frame"],
+        int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+        fps,
+        padding,
+    )
 
     x_values = interpolate_positions(frame_to_pos, start_frame, end_frame, interpolation)
     x_smooth = smooth_values(x_values, smoothing, smooth_window, smooth_polyorder)
@@ -399,7 +402,7 @@ def crop_and_save_track(
             lead = margin * np.sign(dx) if dx != 0 else 0.0
             center_x = int(center_x + lead)
 
-        cropped = crop_frame(frame, center_x, crop_width, padding)
+        cropped = crop_frame(frame, center_x, crop_width)
 
         if out is not None:
             if cropped.shape[1] != crop_width:
@@ -439,7 +442,7 @@ def crop_and_save_track_payload(
     smooth_window: int = DEFAULT_SMOOTH_WINDOW,
     smooth_polyorder: int = 2,
     margin: float = 0.0,
-    padding: str = "none",
+    padding: float = DEFAULT_PADDING_SECONDS,
     fade_in: bool = False,
     fade_out: bool = False,
 ) -> None:
@@ -470,7 +473,7 @@ def crop_and_save_track_payloads(
     smooth_window: int = DEFAULT_SMOOTH_WINDOW,
     smooth_polyorder: int = 2,
     margin: float = 0.0,
-    padding: str = "none",
+    padding: float = DEFAULT_PADDING_SECONDS,
     fade_transition: bool = False,
 ) -> None:
     if not track_payloads:
@@ -594,9 +597,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--padding",
-        choices=["none", "mirror", "black"],
-        default="none",
-        help="Padding strategy when crop exceeds frame bounds",
+        type=float,
+        default=DEFAULT_PADDING_SECONDS,
+        help="Seconds of video to add before the start and after the end of each rally",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     return parser
@@ -605,6 +608,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if args.padding < 0:
+        parser.error("--padding must be greater than or equal to 0")
     setup_logging(args.verbose)
 
     base_name = os.path.splitext(os.path.basename(args.video_path))[0]

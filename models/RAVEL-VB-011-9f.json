@@ -1,0 +1,71 @@
+{
+  "format": "ravel-vb-onnx-v1",
+  "release_id": "RAVEL-VB-011",
+  "model_number": 11,
+  "model_name": "RAVEL-VB-011-9f",
+  "architecture": "tape_vb6/model_v45.py",
+  "detects": [
+    "player",
+    "ball"
+  ],
+  "checkpoint": "/home/ubuntu/projects/vb-action/models/tape_vb6_beach_v45_grid_s16_step2_9f_40ep/best_v45.pt",
+  "checkpoint_source": "/home/ubuntu/projects/vb-action/models/tape_vb6_beach_v45_grid_s16_step2_9f_40ep/best_v45.pt",
+  "checkpoint_epoch": 34,
+  "architecture_version": 45,
+  "checkpoint_format": "tape-vb6-grid-v45",
+  "config": {
+    "clip_length": 9,
+    "input_channels": 1,
+    "image_height": 576,
+    "image_width": 1024,
+    "stem_channels": 24,
+    "head_stride": 16,
+    "neck_dim": 128,
+    "player_tower_blocks": 2,
+    "ball_tower_blocks": 1,
+    "player_top_k": 32,
+    "player_nms_kernel": 3,
+    "player_prior_height": 0.16,
+    "player_prior_aspect": 0.43,
+    "ball_prior_size_px": 8.0,
+    "player_prior_probability": 0.05,
+    "ball_prior_probability": 0.01,
+    "ball_width_prior": 0.012,
+    "ball_height_prior": 0.021
+  },
+  "input_name": "frames",
+  "input_shape": [
+    1,
+    9,
+    1,
+    576,
+    1024
+  ],
+  "actual_clip_length": 9,
+  "output_names": [
+    "logits",
+    "boxes",
+    "ball_grid",
+    "ball_size"
+  ],
+  "weights": "FP32",
+  "opset": 17,
+  "onnx_path": "/home/ubuntu/projects/vb-action/out/ravel_onnx/RAVEL-VB-011-9f.onnx",
+  "parameters": 1271802,
+  "source_modules": [
+    {
+      "path": ".venv/lib/python3.14/site-packages/torch/nn/modules/module.py",
+      "sha256": "56a1fa39f332238e3bad87f431903a875965abef92547afee6356c1390f2b713"
+    },
+    {
+      "path": "tape_vb6/model_v45.py",
+      "sha256": "9b136afc752df4a9f7050a467dff6178cc73db01d50da4f9b0d0e15302262ef3"
+    }
+  ],
+  "onnxruntime_max_difference": {
+    "logits": 4.0531158447265625e-06,
+    "boxes": 7.897615432739258e-07,
+    "ball_grid": 1.33514404296875e-05,
+    "ball_size": 2.9802322387695312e-06
+  }
+}

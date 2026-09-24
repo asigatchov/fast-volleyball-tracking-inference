@@ -71,6 +71,11 @@ BALL_REPAIR_NEIGHBOR_FRAMES = 4
 # Only dropouts inside a flight are filled: an isolated detection during a
 # pause would stitch a technical return to the rally that follows it.
 BALL_FILL_NEIGHBOR_FRAMES = 8
+# The filled ball must also lie near the flight between those detections:
+# a second ball (warm-up, in a player's hands) sits far off the chord. A touch
+# inside the gap bends the path, so the tolerance grows with the chord.
+BALL_FILL_MIN_TOLERANCE_PX = 45.0
+BALL_FILL_TOLERANCE_CHORD_RATIO = 0.35
 
 # Two tracks separated by a short blind spot at a player are one rally: the
 # touch reverses the ball, so the tracker cannot bridge the gap on its own.
@@ -80,6 +85,10 @@ CONTACT_SPLIT_MIN_DISTANCE_PX = 80.0
 # If neither detector sees the ball for that long, it is not in flight - the
 # episode ends there instead of stretching over the pause.
 BLIND_GAP_SECONDS = 0.8
+
+# Detections of a model run on every n-th frame (--frame_step of the players
+# model). Above this the step is treated as dropouts, not as sampling.
+MAX_BALL_FRAME_STEP = 4
 
 
 def is_foreign_court_trajectory(features: dict[str, Any]) -> bool:
@@ -1426,6 +1435,7 @@ class TrackCalculatorWithCourt:
         )
         self._frame_width_scale = self._compute_frame_width_scale()
         self._scaled_max_distance = self.config.max_distance * self._frame_width_scale
+        self._ball_frame_step = 1
         self._player_store = PlayerStore(None)
         self._contact_detector: Optional[ContactDetector] = None
         self._feature_extractor = TrackFeatureExtractor(
@@ -1524,6 +1534,13 @@ class TrackCalculatorWithCourt:
             self._apply_radius_smoothing(df)
         elif self._apply_player_ball_detections(df):
             self._apply_radius_smoothing(df)
+        self._ball_frame_step = self._detection_frame_step(df)
+        if self._ball_frame_step > 1:
+            LOG.info(
+                "Ball detected every %d frames: tracking windows scaled accordingly",
+                self._ball_frame_step,
+            )
+        self._build_contact_detector()
         self._feature_extractor = TrackFeatureExtractor(
             self._court,
             self.config.fps,
@@ -1606,8 +1623,16 @@ class TrackCalculatorWithCourt:
             source_width=self._resolved_video_width(),
             source_height=self._resolved_video_height(),
         )
+        self._build_contact_detector()
+
+    def _build_contact_detector(self) -> None:
         self._contact_detector = (
-            ContactDetector(self._player_store, self._court, self.config.fps)
+            ContactDetector(
+                self._player_store,
+                self._court,
+                self.config.fps,
+                frame_step=self._ball_frame_step,
+            )
             if self._player_store.enabled and self._court.enabled
             else None
         )
@@ -1615,8 +1640,9 @@ class TrackCalculatorWithCourt:
     def _apply_radius_smoothing(self, df: pd.DataFrame) -> None:
         valid_radius = df["Radius"].where(df["Radius"] > 0)
         self._csv_size_calibration = self._build_csv_size_calibration(valid_radius)
+        window = BALL_SIZE_WINDOW * self._detection_frame_step(df)
         df["RadiusMed6"] = (
-            valid_radius.rolling(window=BALL_SIZE_WINDOW, min_periods=1, center=True).median()
+            valid_radius.rolling(window=window, min_periods=1, center=True).median()
         )
         global_radius = (
             self._csv_size_calibration.radius_median_px
@@ -1624,6 +1650,16 @@ class TrackCalculatorWithCourt:
             else float(valid_radius.median()) if valid_radius.notna().any() else np.nan
         )
         df["RadiusMed6"] = df["RadiusMed6"].fillna(global_radius)
+
+    @staticmethod
+    def _detection_frame_step(df: pd.DataFrame) -> int:
+        """Sampling step of the ball detections: 2 for a model run every other frame."""
+        frames = df.loc[df["X"].notna(), "Frame"].dropna().to_numpy(dtype=float)
+        if len(frames) < 2:
+            return 1
+        steps = np.diff(np.unique(frames))
+        step = int(np.median(steps)) if len(steps) else 1
+        return step if 1 <= step <= MAX_BALL_FRAME_STEP else 1
 
     def _apply_player_ball_detections(self, df: pd.DataFrame) -> bool:
         """Fills gaps and repairs outliers in the CSV with the players-model ball.
@@ -1645,6 +1681,7 @@ class TrackCalculatorWithCourt:
 
         filled = 0
         repaired = 0
+        rejected = 0
         for index, frame in enumerate(frames):
             if not np.isfinite(frame):
                 continue
@@ -1653,9 +1690,15 @@ class TrackCalculatorWithCourt:
                 continue
 
             if np.isnan(original_xs[index]):
-                if self._interpolate_neighbors(
+                expected = self._interpolate_neighbors(
                     frames, original_xs, original_ys, index, BALL_FILL_NEIGHBOR_FRAMES
-                ) is None:
+                )
+                if expected is None:
+                    continue
+                if not self._fill_matches_flight(
+                    frames, original_xs, original_ys, index, ball.x, ball.y, expected
+                ):
+                    rejected += 1
                     continue
                 xs[index] = ball.x
                 ys[index] = ball.y
@@ -1692,11 +1735,45 @@ class TrackCalculatorWithCourt:
         df["Visibility"] = visibility
         df["BallSource"] = source
         LOG.info(
-            "Ball detections from players JSON: %d frames filled, %d outliers repaired",
+            "Ball detections from players JSON: %d frames filled, %d outliers repaired, "
+            "%d off-flight fills rejected",
             filled,
             repaired,
+            rejected,
         )
         return bool(filled or repaired)
+
+    def _fill_matches_flight(
+        self,
+        frames: np.ndarray,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        index: int,
+        ball_x: float,
+        ball_y: float,
+        expected: tuple[float, float],
+    ) -> bool:
+        """Whether a players-model ball fits the flight between its CSV neighbors."""
+        window = BALL_FILL_NEIGHBOR_FRAMES
+        previous = next(i for i in range(index - 1, max(-1, index - window - 1), -1) if not np.isnan(xs[i]))
+        following = next(i for i in range(index + 1, min(len(xs), index + window + 1)) if not np.isnan(xs[i]))
+        chord = float(np.hypot(xs[following] - xs[previous], ys[following] - ys[previous]))
+        tolerance = max(
+            BALL_FILL_MIN_TOLERANCE_PX * self._frame_width_scale,
+            BALL_FILL_TOLERANCE_CHORD_RATIO * chord,
+        )
+        error = float(np.hypot(ball_x - expected[0], ball_y - expected[1]))
+        if error <= tolerance:
+            return True
+        LOG.debug(
+            "Frame %d: players ball (%.0f, %.0f) is %.0f px off the flight (tolerance %.0f), not filled",
+            int(frames[index]),
+            ball_x,
+            ball_y,
+            error,
+            tolerance,
+        )
+        return False
 
     @staticmethod
     def _interpolate_neighbors(
@@ -1780,8 +1857,9 @@ class TrackCalculatorWithCourt:
         tracker = BallTracker(
             buffer_size=2500,
             max_disappeared=40,
-            max_distance=self._scaled_max_distance,
+            max_distance=self._tracking_max_distance,
             fps=self.config.fps,
+            frame_step=self._ball_frame_step,
         )
         closed_tracks: list[Track] = []
         all_frames = sorted(df["Frame"].dropna().astype(int).unique())
@@ -1798,6 +1876,11 @@ class TrackCalculatorWithCourt:
 
         episodes = [track for track in closed_tracks if track.positions]
         self.tracks = self._post_process_tracks(episodes)
+
+    @property
+    def _tracking_max_distance(self) -> float:
+        """Largest jump between two consecutive detections of one ball."""
+        return self._scaled_max_distance * self._ball_frame_step
 
     def _row_to_detection(self, row: Any) -> Optional[dict[str, float]]:
         if pd.isna(row.X) or pd.isna(row.Y):
@@ -1826,6 +1909,9 @@ class TrackCalculatorWithCourt:
         filtered = self._split_blind_gaps(filtered)
         filtered = self._merge_airborne_reentry_tracks(filtered)
         filtered = self._merge_contact_split_tracks(filtered)
+        # Splitting can leave fragments shorter than the minimum; merges above
+        # had their chance to reattach them.
+        filtered = [track for track in filtered if track.duration_sec() >= self.config.min_duration_sec]
         if self._court.enabled:
             filtered = [track for track in filtered if self._track_crosses_net(track)]
         return sorted(filtered, key=lambda item: item.start_frame)
@@ -1899,7 +1985,8 @@ class TrackCalculatorWithCourt:
         if not self._player_store.has_ball_detections:
             return list(tracks)
 
-        min_gap = max(2, int(round(self.config.fps * BLIND_GAP_SECONDS)))
+        # A sparse detector goes blind as long in samples, not in seconds.
+        min_gap = max(2, int(round(self.config.fps * BLIND_GAP_SECONDS * self._ball_frame_step)))
         result: list[Track] = []
         for track in tracks:
             positions = sorted(track.positions, key=lambda item: item[1])
@@ -1993,7 +2080,9 @@ class TrackCalculatorWithCourt:
     def _contact_between_tracks(self, first: Track, second: Track):
         """Player that touched the ball inside the gap between two tracks."""
         gap_frames = second.start_frame - first.last_frame
-        max_gap_frames = max(1, int(round(self.config.fps * CONTACT_SPLIT_MAX_GAP_SECONDS)))
+        max_gap_frames = max(
+            1, int(round(self.config.fps * CONTACT_SPLIT_MAX_GAP_SECONDS * self._ball_frame_step))
+        )
         if not 0 < gap_frames <= max_gap_frames:
             return None
 
@@ -2005,7 +2094,7 @@ class TrackCalculatorWithCourt:
         end = first_points[-1]
         start = second_points[0]
         distance = float(np.hypot(end[0] - start[0], end[1] - start[1]))
-        if distance > max(CONTACT_SPLIT_MIN_DISTANCE_PX, self._scaled_max_distance):
+        if distance > max(CONTACT_SPLIT_MIN_DISTANCE_PX, self._tracking_max_distance):
             return None
 
         for x, y, frame in (end, start):

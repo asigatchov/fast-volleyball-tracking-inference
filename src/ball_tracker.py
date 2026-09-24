@@ -93,6 +93,7 @@ class BallTracker:
         max_distance=200,
         ball_diameter_cm=21.0,
         fps=30.0,
+        frame_step=1,
     ):
         self.next_id = 0
         self.tracks: Dict[int, Track] = {}
@@ -100,6 +101,9 @@ class BallTracker:
         self.max_disappeared = max_disappeared
         self.max_distance = max_distance
         self.ball_diameter_cm = ball_diameter_cm
+        # Detections come every `frame_step` frames: the prediction has to be
+        # carried that far ahead, not a single frame.
+        self.frame_step = max(1, int(frame_step))
 
 
     def box_to_position(self, box):
@@ -123,8 +127,7 @@ class BallTracker:
         distance_matrix = np.zeros((len(active_tracks), len(unused_detections)))
         for i, (track_id, track) in enumerate(active_tracks):
             if len(track.positions) > 0:
-                last_pos = track.positions[-1][0:2]
-                last_pos = track.prediction
+                last_pos = self._predict(track, frame_number)
                 for j, det in enumerate(unused_detections):
                     center_x, center_y, diameter = self.box_to_position(det)
                     det_pos = [center_x, center_y]
@@ -163,6 +166,19 @@ class BallTracker:
                 self._add_track(det, frame_number, reason)
 
         return self._get_main_ball(deleted_tracks)
+
+    def _predict(self, track, frame_number):
+        """Position expected at `frame_number`, at most `frame_step` frames ahead.
+
+        `track.prediction` is one frame ahead of the last detection; farther
+        than the sampling step the ball is as likely to have been touched.
+        """
+        last_pos, last_frame = track.positions[-1]
+        horizon = min(max(frame_number - last_frame, 1), self.frame_step)
+        return [
+            last_pos[0] + (track.prediction[0] - last_pos[0]) * horizon,
+            last_pos[1] + (track.prediction[1] - last_pos[1]) * horizon,
+        ]
 
     def _add_track(self, detection, frame_number, reason="Unknown"):
         track = Track()

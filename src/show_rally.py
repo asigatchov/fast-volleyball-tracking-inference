@@ -8,7 +8,8 @@ Keys:
     space  play / pause          a / d   step one frame back / forward
     w / s  jump 15 frames        n / p   next / previous track
     v      save selected track video to --output_dir
-    t      ball path on/off      h       help on/off
+    h / H  one panel (video only) / video + court schema
+    t      ball path on/off      ?       help on/off
     q, ESC quit
 """
 
@@ -66,7 +67,7 @@ BALL_DIAMETER_M = 0.21
 
 HELP_LINES = [
     "space play/pause   a/d frame -1/+1   w/s +15/-15",
-    "n/p next/prev track   v save track video   b box view   t path   h help   q quit",
+    "n/p next/prev track   v save track video   h/H one panel   t path   ? help   q quit",
 ]
 
 
@@ -237,15 +238,15 @@ class RallyViewer:
 
     def run(self) -> None:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(
-            WINDOW_NAME,
-            min(1800, self._video_width * (2 if self._show_box_view else 1)),
-            min(1000, self._video_height + 160),
-        )
         LOG.info("%s", " | ".join(HELP_LINES))
 
+        window_box_view = None
         while True:
             canvas = self.render()
+            if window_box_view != self._show_box_view:
+                # The window must follow the panel count, or the video is stretched.
+                self._resize_window(canvas)
+                window_box_view = self._show_box_view
             cv2.imshow(WINDOW_NAME, canvas)
             delay = max(1, int(1000 / self._fps)) if self._playing else 30
             if not self._handle_key(cv2.waitKey(delay) & 0xFF):
@@ -257,6 +258,12 @@ class RallyViewer:
                     self._frame += 1
 
         cv2.destroyAllWindows()
+
+    @staticmethod
+    def _resize_window(canvas: np.ndarray) -> None:
+        height, width = canvas.shape[:2]
+        scale = min(1.0, 1800 / width, 1000 / height)
+        cv2.resizeWindow(WINDOW_NAME, int(width * scale), int(height * scale))
 
     def render(self) -> np.ndarray:
         if self._schematic:
@@ -719,9 +726,9 @@ class RallyViewer:
             self.save_selected_rally()
         elif key == ord("t"):
             self._show_path = not self._show_path
-        elif key == ord("b"):
+        elif key in (ord("b"), ord("h"), ord("H")):
             self._show_box_view = not self._show_box_view
-        elif key == ord("h"):
+        elif key == ord("?"):
             self._show_help = not self._show_help
         return True
 

@@ -1,0 +1,188 @@
+{
+  "format": "ravel-vb-onnx-v1",
+  "release_id": "RAVEL-VB-012",
+  "model_number": 12,
+  "model_name": "RAVEL-VB-012-9f",
+  "architecture": "tape_vb7/model_clip_yolo_v41mask.py",
+  "detects": [
+    "player",
+    "ball"
+  ],
+  "checkpoint": "/home/ubuntu/projects/vb-action/models/tape_vb7_yolo_v41mask_peak02_b1_640_9f_20ep_sl001/best_vb7ym.pt",
+  "checkpoint_source": "/home/ubuntu/projects/vb-action/models/tape_vb7_yolo_v41mask_peak02_b1_640_9f_20ep_sl001/best_vb7ym.pt",
+  "checkpoint_epoch": 13,
+  "architecture_version": 75,
+  "checkpoint_format": "tape-vb7-clip-yolo-v41mask",
+  "config": {
+    "image_height": 360,
+    "image_width": 640,
+    "input_channels": 3,
+    "clip_length": 9,
+    "patch_size": 8,
+    "embed_dim": 48,
+    "stage2_dim": 56,
+    "stage3_dim": 72,
+    "stage4_dim": 128,
+    "region_dim": 96,
+    "temporal_mixer_blocks": 5,
+    "proposal_top_k": 24,
+    "proposal_nms_kernel": 3,
+    "proposal_peak_threshold": 0.4,
+    "decoder_layers": 3,
+    "dropout": 0.0,
+    "decode_all_frames": true,
+    "temporal_distance_weight": 4.0,
+    "temporal_dustbin_prior": 0.5,
+    "player_center_prior": 0.01,
+    "player_mask_prior": 0.1,
+    "ball_center_prior": 0.01,
+    "initial_box_prior": 0.1,
+    "proposal_bands": 1,
+    "min_box_size": 0.004,
+    "stem_dim": 24,
+    "edge_refine_steps": 3,
+    "edge_refine_dim": 96,
+    "edge_refine_max_step": 0.25,
+    "geometry_neck_dim": 96,
+    "geometry_detail_dim": 32,
+    "anisotropic_stages": true,
+    "anisotropic_kernel": 7,
+    "stage_repeats": 3,
+    "temporal_stack": 3,
+    "temporal_offset": 4,
+    "temporal_stack_dropout": 0.2,
+    "reg_max": 16,
+    "sampler_points": 4,
+    "sampler_span": 0.35,
+    "body_point_prior": 0.01,
+    "head_fusion": true,
+    "head_proposal_k": 0,
+    "head_proposal_threshold": 0.4,
+    "head_proposal_box_iou": 0.6,
+    "head_rank_weight": 0.0,
+    "decoder_mixer": "patch",
+    "decoder_mixer_depth": 2,
+    "fine_mask": true,
+    "fine_mask_dim": 32,
+    "mask_refine_steps": 2,
+    "mask_refine_dim": 96,
+    "mask_refine_max_step": 0.15,
+    "band_along": 5,
+    "band_across": 5,
+    "band_span": 0.25,
+    "band_extent": 0.8,
+    "head_point_head": true,
+    "yolo_cfg": "yolo26n.yaml",
+    "ball_width_prior": 0.012,
+    "ball_height_prior": 0.021
+  },
+  "input_name": "frames",
+  "input_shape": [
+    1,
+    9,
+    3,
+    360,
+    640
+  ],
+  "actual_clip_length": 9,
+  "output_names": [
+    "logits",
+    "boxes",
+    "temporal_association",
+    "query_vectors",
+    "head_point_norm",
+    "body_point_logits",
+    "body_point_offset",
+    "ball_grid",
+    "ball_size"
+  ],
+  "weights": "FP32",
+  "opset": 17,
+  "onnx_path": "/home/ubuntu/projects/vb-action/out/ravel_onnx/RAVEL-VB-012-9f.onnx",
+  "parameters": 1895347,
+  "source_modules": [
+    {
+      "path": ".venv/lib/python3.14/site-packages/torch/nn/modules/module.py",
+      "sha256": "56a1fa39f332238e3bad87f431903a875965abef92547afee6356c1390f2b713"
+    },
+    {
+      "path": "tape_vb6/model.py",
+      "sha256": "3788c545435dea5e6a1a54e860304c91be81755607001a7d0f7f8993884ed28d"
+    },
+    {
+      "path": "tape_vb6/model_v3.py",
+      "sha256": "b973c57ad0870c09d3d21a62b4a0240827586f1b78f27351d1dccc5e7c0b6364"
+    },
+    {
+      "path": "tape_vb6/model_v4.py",
+      "sha256": "966eb26705b12b010359b46378949addc14245f9e2e19a7a52f8f585c08ec1c2"
+    },
+    {
+      "path": "tape_vb6/model_v5.py",
+      "sha256": "fc3886373f46b414f04f65a12f07add99dd62564d53baf2a344f9536ab8f5704"
+    },
+    {
+      "path": "tape_vb6/model_v7.py",
+      "sha256": "77c69434aa5c56e3fa8c49e6f1102728e35a5b06d7e8f28cbed5e77153774115"
+    },
+    {
+      "path": "tape_vb6/model_v12.py",
+      "sha256": "42cba8333f3ca0252d44585ade2c77648d7cd8b6e3d1097893ac5b47a2dc8f38"
+    },
+    {
+      "path": "tape_vb6/model_v14.py",
+      "sha256": "aed22f244cb865467593dafe26ef5860c70f0de46b21094573f78dd2cbd917a9"
+    },
+    {
+      "path": "tape_vb6/model_v22.py",
+      "sha256": "f3a70c5cab26a3270c857c7630ab3769a75a9fd4755d87df712b2cd7db0f1d22"
+    },
+    {
+      "path": "tape_vb6/model_v23.py",
+      "sha256": "2360942ebc1bc05ac09fa0c968174007004216c3a94a18b288826773846f51c1"
+    },
+    {
+      "path": "tape_vb6/ball_size.py",
+      "sha256": "261a562556f2db831edbc236b73e784fff1cbf2e2f7f6522d1811e7dbda00330"
+    },
+    {
+      "path": "tape_vb6/model_v27.py",
+      "sha256": "4885985c4b03a24bdaf4649463d26c1630f92430e89e6a243f0464a11ed41016"
+    },
+    {
+      "path": "tape_vb6/model_v29.py",
+      "sha256": "aa1786b7fad9075e90b091c52b25273830396e354caceeb8d8526d80d8213b8f"
+    },
+    {
+      "path": "tape_vb6/model_v31.py",
+      "sha256": "160c68f1b6771f4adc166a410b70b6ed5efc2aa1e1d946b9d6eafae9217f2001"
+    },
+    {
+      "path": "tape_vb6/model_v32.py",
+      "sha256": "7310c9aa39c9f65429394250a12f3ad8c61402ae673e810c7ae58ba36da701d2"
+    },
+    {
+      "path": "tape_vb6/model_v34.py",
+      "sha256": "0f3acd86e487d821b30f0fc913d894306b745979cf6cade84da9dbc6dad12b5b"
+    },
+    {
+      "path": "tape_vb6/model_v41.py",
+      "sha256": "55a6c582fda10eceecc6aaa5c13bb806dff208502f219fdd5e933d83961270eb"
+    },
+    {
+      "path": "tape_vb7/model_clip_yolo_v41mask.py",
+      "sha256": "91117cfe0df9e2419859f2304c9122961ff8b14548d3a56ae15290e0436410f3"
+    }
+  ],
+  "onnxruntime_max_difference": {
+    "logits": 1.2040138244628906e-05,
+    "boxes": 9.238719940185547e-07,
+    "temporal_association": 2.2917985916137695e-05,
+    "query_vectors": 1.6689300537109375e-06,
+    "head_point_norm": 1.3113021850585938e-06,
+    "body_point_logits": 9.5367431640625e-06,
+    "body_point_offset": 1.1622905731201172e-06,
+    "ball_grid": 8.940696716308594e-07,
+    "ball_size": 1.9744038581848145e-07
+  }
+}
