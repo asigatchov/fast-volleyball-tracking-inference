@@ -1,6 +1,5 @@
 import logging
 import os
-import shutil
 import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
@@ -39,6 +38,16 @@ celery = celery_app
 app = celery_app
 
 
+def _resolve_video_fps(video_path: Path) -> float:
+    default_fps = float(os.getenv("TRACK_VIDEO_FPS", "30"))
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return default_fps
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    cap.release()
+    return fps if fps > 0 else default_fps
+
+
 def _resolve_video_size(video_path: Path) -> tuple[int, int]:
     default_width = int(os.getenv("TRACK_VIDEO_WIDTH", "1920"))
     default_height = int(os.getenv("TRACK_VIDEO_HEIGHT", "1080"))
@@ -56,14 +65,53 @@ def _resolve_video_size(video_path: Path) -> tuple[int, int]:
     return width, height
 
 
-def _resolve_model_arg(repo_dir: Path) -> str:
-    script = repo_dir / "src" / "inference_openvino_seq_gray_v2.py"
-    if not script.exists():
-        return "--model_xml"
-    content = script.read_text(encoding="utf-8", errors="ignore")
-    if "--model_path" in content:
-        return "--model_path"
-    return "--model_xml"
+def _predictions_json_to_ball_csv(predictions_json: Path, csv_path: Path) -> None:
+    """Convert RAVEL-VB predictions JSON into the ``Frame,Visibility,X,Y,Radius`` CSV.
+
+    With ``--frame-step N`` the network only sees every N-th frame. Skipped frames
+    are filled by linear interpolation when both neighbouring shown frames have a
+    ball, otherwise they are written as invisible.
+    """
+    with predictions_json.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    frame_step = max(int(payload.get("frame_step", 1)), 1)
+    total_frames = int(payload.get("benchmark", {}).get("processed_frames", 0))
+
+    balls: dict[int, tuple[float, float, float]] = {}
+    best_score: dict[int, float] = {}
+    for item in payload.get("predictions", []):
+        if item.get("class_name") != "ball":
+            continue
+        frame = int(item["frame_index"])
+        score = float(item.get("score", 0.0))
+        if score <= best_score.get(frame, -1.0):
+            continue
+        x1, y1, x2, y2 = (float(v) for v in item["bbox_xyxy"])
+        radius = max(x2 - x1, y2 - y1) / 2
+        balls[frame] = ((x1 + x2) / 2, (y1 + y2) / 2, radius)
+        best_score[frame] = score
+
+    if not total_frames and balls:
+        total_frames = max(balls) + 1
+
+    rows = ["Frame,Visibility,X,Y,Radius"]
+    for frame in range(total_frames):
+        ball = balls.get(frame)
+        offset = frame % frame_step
+        if ball is None and offset:
+            prev_ball = balls.get(frame - offset)
+            next_ball = balls.get(frame - offset + frame_step)
+            if prev_ball is not None and next_ball is not None:
+                t = offset / frame_step
+                ball = tuple(p + (n - p) * t for p, n in zip(prev_ball, next_ball))
+        if ball is None:
+            rows.append(f"{frame},0,-1,-1,0")
+        else:
+            x, y, radius = ball
+            rows.append(f"{frame},1,{int(round(x))},{int(round(y))},{int(round(radius))}")
+
+    csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
 def _queue_status_update(project_id: str, user_id: str, status: str) -> None:
@@ -97,7 +145,7 @@ def process_uploaded_video(project_id: str, user_id: str, file_path: str, file_u
     model_xml = Path(
         os.getenv(
             "INFERENCE_MODEL_XML",
-            str(repo_dir / "ov" / "VballNetGridV2b_seq9_grayscale_20260909_001145.xml"),
+            str(repo_dir / "ov" / "RAVEL-VB-011-9f.xml"),
         )
     ).resolve()
     if not model_xml.exists():
@@ -105,23 +153,30 @@ def process_uploaded_video(project_id: str, user_id: str, file_path: str, file_u
         raise FileNotFoundError(f"OpenVINO model not found: {model_xml}")
 
     device = os.getenv("INFERENCE_DEVICE", "CPU")
+    frame_step = os.getenv("INFERENCE_FRAME_STEP", "2")
     video_uuid = video_path.stem
     output_dir = video_path.parent
     target_video_dir = output_dir / video_uuid
     target_video_dir.mkdir(parents=True, exist_ok=True)
-    model_arg = _resolve_model_arg(repo_dir)
+    predictions_json = target_video_dir / "predictions.json"
+
+    # Rally detection needs the court homography: do not start without markup.
+    court_json = target_video_dir / "court.json"
+    if not court_json.exists():
+        _queue_status_update(project_id, user_id, "new")
+        raise FileNotFoundError(f"Court markup is required before processing: {court_json}")
 
     inference_cmd = [
         "uv",
         "run",
-        "src/inference_openvino_seq_gray_v2.py",
-        "--video_path",
+        "src/inference_player_ball_openvino.py",
         str(video_path),
-        model_arg,
+        "--model",
         str(model_xml),
-        "--output_dir",
-        str(output_dir),
-        "--only_csv",
+        "--output",
+        str(predictions_json),
+        "--frame-step",
+        frame_step,
         "--device",
         device,
     ]
@@ -134,39 +189,36 @@ def process_uploaded_video(project_id: str, user_id: str, file_path: str, file_u
             f"OpenVINO inference failed: {exc.stderr[-2000:] if exc.stderr else str(exc)}"
         ) from exc
 
-    expected_csv = output_dir / f"{video_uuid}_predict_ball.csv"
-    nested_csv = output_dir / video_uuid / "ball.csv"
-    fallback_csv = output_dir / f"{video_uuid}_ball.csv"
     normalized_csv = target_video_dir / "ball.csv"
-
-    source_csv: Path | None = None
-    for candidate in (nested_csv, expected_csv, fallback_csv):
-        if candidate.exists():
-            source_csv = candidate
-            break
-    if source_csv is None:
+    if not predictions_json.exists():
         _queue_status_update(project_id, user_id, "new")
-        raise FileNotFoundError(
-            f"ball.csv not found after inference. Tried: {nested_csv}, {expected_csv}, {fallback_csv}"
-        )
-
-    if source_csv.resolve() != normalized_csv.resolve():
-        shutil.copy2(source_csv, normalized_csv)
+        raise FileNotFoundError(f"predictions.json not found after inference: {predictions_json}")
+    try:
+        _predictions_json_to_ball_csv(predictions_json, normalized_csv)
+    except Exception:
+        _queue_status_update(project_id, user_id, "new")
+        raise
 
     video_width, video_height = _resolve_video_size(video_path)
     track_cmd = [
         "uv",
         "run",
-        "src/track_calculator.py",
-        "--csv_path",
-        str(normalized_csv),
+        "src/track_calculator_with_court.py",
+        "--players_json_path",
+        str(predictions_json),
+        "--court_json_path",
+        str(court_json),
         "--output_dir",
         str(output_dir),
         "--video_width",
         str(video_width),
         "--video_height",
         str(video_height),
+        "--fps",
+        str(_resolve_video_fps(video_path)),
     ]
+    if os.getenv("INFERENCE_BEACH", "false").lower() in {"1", "true", "yes", "on"}:
+        track_cmd.append("--beach")
     logger.info("Running track command: %s", " ".join(track_cmd))
     try:
         subprocess.run(track_cmd, cwd=repo_dir, check=True, capture_output=True, text=True)
