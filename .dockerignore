@@ -9,3 +9,7 @@ __pycache__/
 .mypy_cache/
 example/
 examples/
+db-data/
+uploads/
+old_models/
+reels/
