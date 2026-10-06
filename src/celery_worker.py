@@ -125,6 +125,41 @@ def _queue_status_update(project_id: str, user_id: str, status: str) -> None:
         logger.exception("Failed to enqueue status update for project=%s user=%s status=%s", project_id, user_id, status)
 
 
+def _classify_contacts(repo_dir: Path, video_path: Path, predictions_json: Path, tracks_dir: Path, device: str) -> None:
+    """Label the detected contacts (Serve / Receive / Set / Attack) in the track files.
+
+    The rallies are complete without the labels, so a failure here is logged and
+    the import goes on: the API then types the contacts by their order.
+    """
+    if os.getenv("INFERENCE_CLASSIFY_ACTIONS", "true").lower() not in {"1", "true", "yes", "on"}:
+        return
+    model_xml = Path(
+        os.getenv("INFERENCE_ACTION_MODEL_XML", str(repo_dir / "ov" / "action_clf_r2plus1d18_pm6_player_beach_hall.xml"))
+    ).resolve()
+    if not model_xml.exists():
+        logger.warning("Action classifier not found, contacts stay unclassified: %s", model_xml)
+        return
+    classify_cmd = [
+        "uv",
+        "run",
+        "src/classify_contacts.py",
+        str(video_path),
+        "--players_json_path",
+        str(predictions_json),
+        "--tracks_dir",
+        str(tracks_dir),
+        "--model",
+        str(model_xml),
+        "--device",
+        device,
+    ]
+    logger.info("Running contact classification command: %s", " ".join(classify_cmd))
+    try:
+        subprocess.run(classify_cmd, cwd=repo_dir, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        logger.error("Contact classification failed: %s", exc.stderr[-2000:] if exc.stderr else str(exc))
+
+
 @celery_app.task(name="inference.process_uploaded_video")
 def process_uploaded_video(project_id: str, user_id: str, file_path: str, file_url: str) -> dict[str, str | bool]:
     parsed = urlparse(file_url)
@@ -229,6 +264,7 @@ def process_uploaded_video(project_id: str, user_id: str, file_path: str, file_u
         ) from exc
 
     tracks_dir = target_video_dir / "tracks"
+    _classify_contacts(repo_dir, video_path, predictions_json, tracks_dir, device)
     celery_app.send_task(
         API_IMPORT_TASK_NAME,
         args=[project_id, user_id, API_IMPORT_REPLACE_EXISTING],

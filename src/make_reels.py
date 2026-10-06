@@ -317,9 +317,15 @@ def apply_black_fade(
     fps: float,
     fade_in: bool,
     fade_out: bool,
+    duration_sec: float = BLACK_TRANSITION_SECONDS,
 ) -> np.ndarray:
     alpha = black_fade_alpha(
-        frame_index, total_frames, fps, fade_in=fade_in, fade_out=fade_out
+        frame_index,
+        total_frames,
+        fps,
+        fade_in=fade_in,
+        fade_out=fade_out,
+        duration_sec=duration_sec,
     )
     if alpha >= 1.0:
         return frame
@@ -339,6 +345,7 @@ def crop_and_save_track(
     padding: float = DEFAULT_PADDING_SECONDS,
     fade_in: bool = False,
     fade_out: bool = False,
+    fade_duration: float = BLACK_TRANSITION_SECONDS,
 ) -> None:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -415,6 +422,7 @@ def crop_and_save_track(
             fps,
             fade_in=fade_in,
             fade_out=fade_out,
+            duration_sec=fade_duration,
         )
 
         if out is not None:
@@ -445,6 +453,7 @@ def crop_and_save_track_payload(
     padding: float = DEFAULT_PADDING_SECONDS,
     fade_in: bool = False,
     fade_out: bool = False,
+    fade_duration: float = BLACK_TRANSITION_SECONDS,
 ) -> None:
     track = load_track_from_payload(track_payload)
     crop_and_save_track(
@@ -460,6 +469,7 @@ def crop_and_save_track_payload(
         padding=padding,
         fade_in=fade_in,
         fade_out=fade_out,
+        fade_duration=fade_duration,
     )
 
 
@@ -475,6 +485,7 @@ def crop_and_save_track_payloads(
     margin: float = 0.0,
     padding: float = DEFAULT_PADDING_SECONDS,
     fade_transition: bool = False,
+    fade_duration: float = BLACK_TRANSITION_SECONDS,
 ) -> None:
     if not track_payloads:
         raise ValueError("track_payloads must not be empty")
@@ -515,6 +526,7 @@ def crop_and_save_track_payloads(
                 padding=padding,
                 fade_in=fade_transition and idx > 1,
                 fade_out=fade_transition and idx < len(track_payloads),
+                fade_duration=fade_duration,
             )
             segment_files.append(segment_path)
 
@@ -545,6 +557,15 @@ def crop_and_save_track_payloads(
             ) from exc
 
 
+class FadeTransitionAction(argparse.Action):
+    """Enable the fade transition and optionally set its duration in seconds."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, True)
+        if values is not None:
+            namespace.fade_duration = values
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Visualize rally clips with ball-centered cropping."
@@ -556,12 +577,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--fade-transition",
         "--black-transition",
         dest="fade_transition",
-        action="store_true",
+        action=FadeTransitionAction,
+        nargs="?",
+        type=float,
+        default=False,
+        metavar="SECONDS",
         help=(
-            "Join --track_jsons with a 0.3s fade to black followed by a "
-            "0.3s fade from black"
+            "Join --track_jsons with a fade to black followed by a fade from "
+            "black; optional duration of each fade in seconds (default: 0.3)"
         ),
     )
+    parser.add_argument(
+        "--output_path",
+        default=None,
+        help="Output file for the combined reel (only with --track_jsons)",
+    )
+    parser.set_defaults(fade_duration=BLACK_TRANSITION_SECONDS)
     parser.add_argument("--json_dir", help="Directory with track_*.json files")
     parser.add_argument("--output_dir", default=None, help="Root output directory")
     parser.add_argument("--visualize", action="store_true", help="Show real-time cropped video")
@@ -610,6 +641,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.padding < 0:
         parser.error("--padding must be greater than or equal to 0")
+    if args.fade_duration <= 0:
+        parser.error("--fade-transition duration must be greater than 0")
+    if args.output_path and not args.track_jsons:
+        parser.error("--output_path requires --track_jsons")
     setup_logging(args.verbose)
 
     base_name = os.path.splitext(os.path.basename(args.video_path))[0]
@@ -644,7 +679,9 @@ def main() -> None:
                 raise ValueError(f"Track JSON must contain an object: {track_json_path}")
             track_payloads.append(payload)
 
-        output_path = os.path.join(reels_dir, f"reel_{base_name}_combined.mp4")
+        output_path = args.output_path or os.path.join(
+            reels_dir, f"reel_{base_name}_combined.mp4"
+        )
         crop_and_save_track_payloads(
             video_path=args.video_path,
             track_payloads=track_payloads,
@@ -657,6 +694,7 @@ def main() -> None:
             margin=args.margin,
             padding=args.padding,
             fade_transition=args.fade_transition,
+            fade_duration=args.fade_duration,
         )
         if not args.visualize:
             LOG.info("Saved combined reel: %s", output_path)
