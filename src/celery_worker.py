@@ -31,6 +31,7 @@ celery_app.conf.update(
 API_IMPORT_TASK_NAME = os.getenv("API_IMPORT_TASK_NAME", "api.import_rallies_from_tracks")
 API_SET_STATUS_TASK_NAME = os.getenv("API_SET_STATUS_TASK_NAME", "api.set_project_status")
 API_UPDATE_REEL_TASK_NAME = os.getenv("API_UPDATE_REEL_TASK_NAME", "api.update_reel_result")
+API_REFRESH_ACTIONS_TASK_NAME = os.getenv("API_REFRESH_ACTIONS_TASK_NAME", "api.refresh_actions_from_tracks")
 API_IMPORT_TASK_QUEUE = os.getenv("API_IMPORT_TASK_QUEUE", "api-import")
 API_IMPORT_REPLACE_EXISTING = os.getenv("API_IMPORT_REPLACE_EXISTING", "true").lower() in {"1", "true", "yes", "on"}
 
@@ -125,20 +126,13 @@ def _queue_status_update(project_id: str, user_id: str, status: str) -> None:
         logger.exception("Failed to enqueue status update for project=%s user=%s status=%s", project_id, user_id, status)
 
 
-def _classify_contacts(repo_dir: Path, video_path: Path, predictions_json: Path, tracks_dir: Path, device: str) -> None:
-    """Label the detected contacts (Serve / Receive / Set / Attack) in the track files.
-
-    The rallies are complete without the labels, so a failure here is logged and
-    the import goes on: the API then types the contacts by their order.
-    """
-    if os.getenv("INFERENCE_CLASSIFY_ACTIONS", "true").lower() not in {"1", "true", "yes", "on"}:
-        return
+def _run_contact_classification(repo_dir: Path, video_path: Path, predictions_json: Path, tracks_dir: Path, device: str) -> None:
+    """Label the detected contacts (Serve / Receive / Set / Attack) in the track files."""
     model_xml = Path(
-        os.getenv("INFERENCE_ACTION_MODEL_XML", str(repo_dir / "ov" / "action_clf_r2plus1d18_pm6_player_beach_hall.xml"))
+        os.getenv("INFERENCE_ACTION_MODEL_XML", str(repo_dir / "ov" / "action_clf_r2plus1d18_verified.xml"))
     ).resolve()
     if not model_xml.exists():
-        logger.warning("Action classifier not found, contacts stay unclassified: %s", model_xml)
-        return
+        raise FileNotFoundError(f"Action classifier not found: {model_xml}")
     classify_cmd = [
         "uv",
         "run",
@@ -157,7 +151,54 @@ def _classify_contacts(repo_dir: Path, video_path: Path, predictions_json: Path,
     try:
         subprocess.run(classify_cmd, cwd=repo_dir, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
-        logger.error("Contact classification failed: %s", exc.stderr[-2000:] if exc.stderr else str(exc))
+        raise RuntimeError(
+            f"Contact classification failed: {exc.stderr[-2000:] if exc.stderr else str(exc)}"
+        ) from exc
+
+
+def _classify_contacts(repo_dir: Path, video_path: Path, predictions_json: Path, tracks_dir: Path, device: str) -> None:
+    """Classification as a step of the full processing.
+
+    The rallies are complete without the labels, so a failure here is logged and
+    the import goes on: the API then types the contacts by their order.
+    """
+    if os.getenv("INFERENCE_CLASSIFY_ACTIONS", "true").lower() not in {"1", "true", "yes", "on"}:
+        return
+    try:
+        _run_contact_classification(repo_dir, video_path, predictions_json, tracks_dir, device)
+    except Exception as exc:
+        logger.error("Contacts stay unclassified: %s", exc)
+
+
+@celery_app.task(name="inference.classify_actions")
+def classify_actions(project_id: str, user_id: str, file_path: str) -> dict[str, str | None]:
+    """Run the action classifier alone over the contacts of the last detection.
+
+    The detector output (predictions.json, tracks) is reused; the API then re-types the
+    actions of the existing rallies. It is told about a failure too: it has to release the project.
+    """
+    video_path = Path(file_path).resolve()
+    target_video_dir = video_path.parent / video_path.stem
+    error: str | None = None
+    try:
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        predictions_json = target_video_dir / "predictions.json"
+        tracks_dir = target_video_dir / "tracks"
+        if not predictions_json.exists() or not tracks_dir.is_dir():
+            raise FileNotFoundError(f"Detection results not found in {target_video_dir}")
+        repo_dir = Path(os.getenv("INFERENCE_REPO_DIR", "/app")).resolve()
+        _run_contact_classification(repo_dir, video_path, predictions_json, tracks_dir, os.getenv("INFERENCE_DEVICE", "CPU"))
+    except Exception as exc:
+        logger.exception("Actions classification failed for project=%s user=%s", project_id, user_id)
+        error = str(exc)
+
+    celery_app.send_task(
+        API_REFRESH_ACTIONS_TASK_NAME,
+        args=[project_id, user_id, error],
+        queue=API_IMPORT_TASK_QUEUE,
+    )
+    return {"project_id": project_id, "user_id": user_id, "error": error}
 
 
 @celery_app.task(name="inference.process_uploaded_video")

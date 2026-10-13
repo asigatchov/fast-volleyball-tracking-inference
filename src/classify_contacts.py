@@ -22,7 +22,7 @@ import logging
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Iterator, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -31,7 +31,7 @@ import openvino as ov
 LOG = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL = ROOT / "ov" / "action_clf_r2plus1d18_pm6_player_beach_hall.xml"
+DEFAULT_MODEL = ROOT / "ov" / "action_clf_r2plus1d18_verified.xml"
 
 Box = tuple[float, float, float, float]  # cx, cy, w, h (normalized)
 # frame -> "player" / "ball" -> boxes; "player_tracks" holds the track id of every player box
@@ -201,13 +201,15 @@ def crop_plan(
     return square_crop_window(window_boxes, width, height, crop_scale)
 
 
-def read_clips(
+def iter_clips(
     video_path: str, plans: dict[int, tuple[int, int, int]], half_window: int, stored_size: int
-) -> dict[int, np.ndarray]:
-    """RGB clips ``[T, S, S, 3]`` for every centre frame of ``plans``, in one sequential pass.
+) -> Iterator[tuple[int, np.ndarray]]:
+    """RGB clips ``(centre frame, [T, S, S, 3])`` of ``plans``, in one sequential pass.
 
     Frames are decoded in order (seeking is not frame-accurate); a window that
-    sticks out of the video repeats the edge frame, as in training.
+    sticks out of the video repeats the edge frame, as in training. A clip is
+    handed over as soon as its last frame is read and is not kept: the clips of a
+    whole match do not fit into memory.
     """
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -218,21 +220,33 @@ def read_clips(
     for center in plans:
         for position, frame in enumerate(range(center - half_window, center + half_window + 1)):
             wanted[min(max(frame, 0), last)].append((center, position))
-    crops: dict[int, list[Optional[np.ndarray]]] = {center: [None] * length for center in plans}
+    crops: dict[int, list[Optional[np.ndarray]]] = {}
 
     index = 0
     final = max(wanted, default=-1)
-    while index <= final and cap.grab():
-        if index in wanted:
-            ok, image = cap.retrieve()
-            if not ok:
-                break
-            for center, position in wanted[index]:
-                x0, y0, side = plans[center]
-                crops[center][position] = crop_square(image, x0, y0, side, stored_size)[:, :, ::-1]
-        index += 1
-    cap.release()
-    return {center: np.stack(clip) for center, clip in crops.items() if all(crop is not None for crop in clip)}
+    try:
+        while index <= final and cap.grab():
+            if index in wanted:
+                ok, image = cap.retrieve()
+                if not ok:
+                    break
+                for center, position in wanted[index]:
+                    x0, y0, side = plans[center]
+                    clip = crops.setdefault(center, [None] * length)
+                    clip[position] = crop_square(image, x0, y0, side, stored_size)[:, :, ::-1]
+                for center in {center for center, _ in wanted[index]}:
+                    if all(crop is not None for crop in crops[center]):
+                        yield center, np.stack(crops.pop(center))
+            index += 1
+    finally:
+        cap.release()
+
+
+def read_clips(
+    video_path: str, plans: dict[int, tuple[int, int, int]], half_window: int, stored_size: int
+) -> dict[int, np.ndarray]:
+    """All the clips of ``iter_clips`` at once, by centre frame: for a short video only."""
+    return dict(iter_clips(video_path, plans, half_window, stored_size))
 
 
 class ActionClassifier:
@@ -302,13 +316,20 @@ def classify_tracks(
             if plan is not None:
                 plans[int(contact["frame"])] = plan
 
-    clips = read_clips(video_path, plans, classifier.half_window, classifier.stored_size)
-    centers = sorted(clips)
     probabilities: dict[int, np.ndarray] = {}
-    for start in range(0, len(centers), batch_size):
-        batch = centers[start : start + batch_size]
-        for center, row in zip(batch, classifier(np.stack([clips[center] for center in batch]))):
+    batch: list[tuple[int, np.ndarray]] = []
+
+    def classify_batch() -> None:
+        for (center, _), row in zip(batch, classifier(np.stack([clip for _, clip in batch]))):
             probabilities[center] = row
+        batch.clear()
+
+    for item in iter_clips(video_path, plans, classifier.half_window, classifier.stored_size):
+        batch.append(item)
+        if len(batch) >= batch_size:
+            classify_batch()
+    if batch:
+        classify_batch()
 
     counts: dict[str, int] = defaultdict(int)
     for path, track in tracks.items():
