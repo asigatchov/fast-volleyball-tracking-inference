@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -26,7 +28,15 @@ import openvino as ov
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
+try:
+    from .predictions_io import FIELDS, FORMAT_V1, FORMAT_V3, dump_line, expand_frame, frame_record, iter_records
+except ImportError:
+    from predictions_io import FIELDS, FORMAT_V1, FORMAT_V3, dump_line, expand_frame, frame_record, iter_records
+
 ROOT = Path(__file__).resolve().parent.parent
+# A JSONL run leaves a checkpoint every this many clips (about 30 s of video at the
+# defaults): after a crash the detector redoes at most that much.
+CHECKPOINT_EVERY_CLIPS = 50
 DEFAULT_MODEL = ROOT / "ov" / "RAVEL-VB-012-9f.xml"
 
 # Точки голов -- как в ``infer_tape_vb6_v31``: пики карты ``body_point_logits``
@@ -354,6 +364,17 @@ class PlayerHysteresis:
         self.tracks: dict[int, dict] = {}
         self.next_track_id = 0
 
+    def state(self) -> dict:
+        """What a resumed run needs to go on with the same track ids."""
+        return {
+            "next_track_id": self.next_track_id,
+            "tracks": [[track_id, state] for track_id, state in self.tracks.items()],
+        }
+
+    def restore(self, state: dict) -> None:
+        self.next_track_id = int(state["next_track_id"])
+        self.tracks = {int(track_id): track for track_id, track in state["tracks"]}
+
     @staticmethod
     def _center_distance(left: list[float], right: list[float]) -> float:
         left_x, left_y = (left[0] + left[2]) / 2, (left[1] + left[3]) / 2
@@ -653,7 +674,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
     parser.add_argument(
         "--output",
-        help="write predictions to this JSON file or directory",
+        help=(
+            "write predictions to this file or directory: a .jsonl is written "
+            "frame by frame as the video goes, a .json once at the end"
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "with a .jsonl output: go on from the last checkpoint of an unfinished "
+            "run with the same settings; a finished one is left as it is"
+        ),
     )
     parser.add_argument("--output-video", help="write annotated video to this file")
     parser.add_argument(
@@ -759,6 +791,32 @@ def main() -> None:
         raise FileNotFoundError(f"video not found: {video_path}")
     if not model_path.is_file():
         raise FileNotFoundError(f"OpenVINO model not found: {model_path}")
+    settings = {
+        "model": str(model_path),
+        "video": str(video_path),
+        "stride": args.stride,
+        "frame_step": args.frame_step,
+        "score_threshold": args.score_threshold,
+        "ball_threshold": args.ball_threshold,
+        "head_threshold": args.head_threshold,
+        "close_threshold": None if args.no_player_hysteresis else args.close_threshold,
+        "hysteresis_frames": 0 if args.no_player_hysteresis else args.hysteresis_frames,
+        "include_features": bool(args.include_features),
+    }
+    # The detector streams into a plain .jsonl only; it is packed once the processing is over.
+    streaming = output_path is not None and output_path.name.endswith(".jsonl")
+    if args.resume and not streaming:
+        raise ValueError("--resume needs a .jsonl --output")
+    resume_from: dict | None = None
+    resume_offset = 0
+    if args.resume and output_path.is_file():
+        state, resume_from, resume_offset = _resume_point(output_path, settings)
+        if state == "complete":
+            print(json.dumps({"output": str(output_path), "complete": True}, ensure_ascii=False))
+            return
+        if state == "fresh":
+            print(f"{output_path}: no checkpoint of the same settings, starting over", file=sys.stderr)
+
     model = RavelVBOpenVINO(
         model_path, args.num_threads, args.performance_hint, args.device
     )
@@ -789,8 +847,11 @@ def main() -> None:
     frames: deque[np.ndarray] = deque(maxlen=clip_length)
     indices: deque[int] = deque(maxlen=clip_length)
     raw_by_frame: dict[int, list[dict]] = defaultdict(list)
+    # Only drawing needs the predictions of past frames; a JSONL run keeps nothing else.
+    keep_frames = args.show or output_video_path is not None
     predictions_by_frame: dict[int, list[dict]] = defaultdict(list)
     predictions: list[dict] = []
+    written_predictions = 0
     hysteresis = (
         None
         if args.no_player_hysteresis
@@ -809,11 +870,49 @@ def main() -> None:
     last_clip_start: int | None = None
     inference_runs = 0
     model_elapsed = 0.0
+    earlier_pipeline_seconds = 0.0
     candidate_threshold = (
         args.score_threshold
         if args.no_player_hysteresis
         else args.close_threshold
     )
+
+    output_handle = None
+    if streaming:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if resume_from is not None:
+            # The lines after the checkpoint are redone: the run goes on from there.
+            output_handle = open(output_path, "r+b")
+            output_handle.truncate(resume_offset)
+            output_handle.seek(resume_offset)
+            next_finalize_frame = int(resume_from["next_frame"])
+            last_clip_start = resume_from["last_clip_start"]
+            shown = next_finalize_frame // args.frame_step
+            inference_runs = int(resume_from["inference_runs"])
+            model_elapsed = float(resume_from["model_seconds"])
+            earlier_pipeline_seconds = float(resume_from["pipeline_seconds"])
+            written_predictions = int(resume_from["predictions"])
+            for frame, items in resume_from["raw_pending"]:
+                raw_by_frame[int(frame)] = items
+            if hysteresis is not None and resume_from.get("hysteresis") is not None:
+                hysteresis.restore(resume_from["hysteresis"])
+            if output_video_path is not None:
+                for frame, items in _written_frames(output_path):
+                    predictions_by_frame[frame] = items
+        else:
+            output_handle = open(output_path, "wb")
+            header = {
+                "type": "header",
+                "format": FORMAT_V3,
+                **settings,
+                "source_size": {"width": width, "height": height},
+                "fps": fps,
+                "clip_length": clip_length,
+                "reported_frames": reported_total,
+                "fields": FIELDS,
+            }
+            output_handle.write(dump_line(header).encode("utf-8"))
+            _sync(output_handle)
 
     def infer_clip(
         clip_frames: list[np.ndarray],
@@ -885,7 +984,7 @@ def main() -> None:
 
     def finalize_frames(end_frame: int) -> None:
         """Finalize frames that cannot be affected by a later inference clip."""
-        nonlocal next_finalize_frame, show_active, show_window_open
+        nonlocal next_finalize_frame, show_active, show_window_open, written_predictions
         while next_finalize_frame < end_frame:
             current_frame = next_finalize_frame
             if current_frame % args.frame_step:
@@ -904,6 +1003,7 @@ def main() -> None:
                     if item["class_name"] != "player"
                     or float(item["score"]) >= args.score_threshold
                 ]
+            frame_items: list[dict] = []
             for filtered_item in filtered:
                 item = dict(filtered_item)
                 x1, y1, x2, y2 = item.pop("bbox_xyxy_norm")
@@ -915,16 +1015,46 @@ def main() -> None:
                     round(x2 * width, 2),
                     round(y2 * height, 2),
                 ]
-                predictions.append(item)
-                predictions_by_frame[current_frame].append(item)
+                frame_items.append(item)
+            written_predictions += len(frame_items)
+            if output_handle is not None:
+                output_handle.write(dump_line(frame_record(current_frame, frame_items)).encode("utf-8"))
+            else:
+                predictions.extend(frame_items)
+            if keep_frames:
+                predictions_by_frame[current_frame] = frame_items
 
             _show_frame(current_frame)
+            if keep_frames and output_video_path is None:
+                predictions_by_frame.pop(current_frame - args.frame_step, None)
             next_finalize_frame += 1
+
+    def write_checkpoint() -> None:
+        """State at a clip boundary: a resumed run decodes again from ``next_frame``."""
+        checkpoint = {
+            "type": "checkpoint",
+            "next_frame": next_finalize_frame,
+            "last_clip_start": last_clip_start,
+            "inference_runs": inference_runs,
+            "model_seconds": round(model_elapsed, 6),
+            "pipeline_seconds": round(earlier_pipeline_seconds + time.perf_counter() - pipeline_started, 6),
+            "predictions": written_predictions,
+            "hysteresis": hysteresis.state() if hysteresis is not None else None,
+            # Predictions of the next frames from the overlap of the last clip.
+            "raw_pending": [[frame, items] for frame, items in sorted(raw_by_frame.items())],
+        }
+        output_handle.write(dump_line(checkpoint).encode("utf-8"))
+        _sync(output_handle)
 
     pipeline_started = time.perf_counter()
     with tqdm(
         total=reported_total or None, desc="RAVEL-VB", unit="frame"
     ) as progress:
+        if next_finalize_frame:
+            # Resumed: frames before the checkpoint are only decoded (seeking is not frame-accurate).
+            while frame_index < next_finalize_frame and capture.grab():
+                frame_index += 1
+            progress.update(frame_index)
         while True:
             ok, bgr = capture.read()
             if not ok:
@@ -946,6 +1076,11 @@ def main() -> None:
                 infer_clip(list(frames), current_indices, clip_length)
                 last_clip_start = current_indices[0]
                 finalize_frames(last_clip_start + args.stride * args.frame_step)
+                if output_handle is not None:
+                    if inference_runs % CHECKPOINT_EVERY_CLIPS == 0:
+                        write_checkpoint()
+                    else:
+                        output_handle.flush()
             frame_index += 1
             progress.update(1)
     total = frame_index
@@ -972,7 +1107,7 @@ def main() -> None:
     finalize_frames(total)
     if args.show:
         cv2.destroyAllWindows()
-    pipeline_elapsed = time.perf_counter() - pipeline_started
+    pipeline_elapsed = earlier_pipeline_seconds + time.perf_counter() - pipeline_started
     benchmark = {
         "processed_frames": total,
         "inference_runs": inference_runs,
@@ -989,6 +1124,18 @@ def main() -> None:
         ),
         "device": model.device,
     }
+    if output_handle is not None:
+        # The explicit flag for the readers: the video is over, nothing more will come.
+        end = {
+            "type": "end",
+            "last_frame": total - 1,
+            "processed_frames": total,
+            "predictions": written_predictions,
+            "benchmark": benchmark,
+        }
+        output_handle.write(dump_line(end).encode("utf-8"))
+        _sync(output_handle)
+        output_handle.close()
 
     if output_video_path is not None:
         render_capture = cv2.VideoCapture(str(video_path))
@@ -1023,28 +1170,24 @@ def main() -> None:
                 writer.release()
             render_capture.release()
 
-    payload = {
-        "format": "ravel-vb-predictions-v1",
-        "model": str(model_path),
-        "video": str(video_path),
-        "source_size": {"width": width, "height": height},
-        "fps": fps,
-        "clip_length": clip_length,
-        "stride": args.stride,
-        "frame_step": args.frame_step,
-        "score_threshold": args.score_threshold,
-        "ball_threshold": args.ball_threshold,
-        "head_threshold": args.head_threshold,
-        "close_threshold": (
-            None if args.no_player_hysteresis else args.close_threshold
-        ),
-        "hysteresis_frames": (
-            0 if args.no_player_hysteresis else args.hysteresis_frames
-        ),
-        "benchmark": benchmark,
-        "predictions": predictions,
-    }
-    if output_path is not None:
+    if output_path is not None and not streaming:
+        payload = {
+            "format": FORMAT_V1,
+            "model": str(model_path),
+            "video": str(video_path),
+            "source_size": {"width": width, "height": height},
+            "fps": fps,
+            "clip_length": clip_length,
+            "stride": args.stride,
+            "frame_step": args.frame_step,
+            "score_threshold": args.score_threshold,
+            "ball_threshold": args.ball_threshold,
+            "head_threshold": args.head_threshold,
+            "close_threshold": settings["close_threshold"],
+            "hysteresis_frames": settings["hysteresis_frames"],
+            "benchmark": benchmark,
+            "predictions": predictions,
+        }
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1056,12 +1199,47 @@ def main() -> None:
                 "output_video": (
                     str(output_video_path) if output_video_path else None
                 ),
-                "predictions": len(predictions),
+                "predictions": written_predictions,
                 "benchmark": benchmark,
             },
             ensure_ascii=False,
         )
     )
+
+
+def _sync(handle: Any) -> None:
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _resume_point(path: Path, settings: dict) -> tuple[str, dict | None, int]:
+    """``("complete" | "resume" | "fresh", last checkpoint, byte offset after it)``.
+
+    A run of other settings (model, video, sampling, thresholds) is not resumed.
+    """
+    header: dict | None = None
+    checkpoint: dict | None = None
+    offset = 0
+    for line_end, record in iter_records(path):
+        kind = record.get("type")
+        if kind == "header":
+            header = record if record.get("format") == FORMAT_V3 else None
+        elif kind == "checkpoint":
+            checkpoint, offset = record, line_end
+        elif kind == "end":
+            if header is not None and all(header.get(key) == value for key, value in settings.items()):
+                return "complete", None, 0
+    if header is None or any(header.get(key) != value for key, value in settings.items()):
+        return "fresh", None, 0
+    if checkpoint is None:
+        return "fresh", None, 0
+    return "resume", checkpoint, offset
+
+
+def _written_frames(path: Path):
+    for _, record in iter_records(path):
+        if record.get("type") == "frame":
+            yield int(record["frame_index"]), expand_frame(record)
 
 
 if __name__ == "__main__":

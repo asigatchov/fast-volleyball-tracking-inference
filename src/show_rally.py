@@ -28,6 +28,7 @@ import numpy as np
 
 from court_transformer import CourtTransformer
 from player_contacts import PlayerStore
+from predictions_io import find_predictions
 
 LOG = logging.getLogger(__name__)
 
@@ -797,6 +798,11 @@ def discover_auxiliary_json(tracks_dir: str) -> tuple[Optional[str], Optional[st
     """Find prediction/court JSON files produced next to a clip's tracks folder."""
     clip_dir = os.path.dirname(os.path.abspath(os.path.normpath(tracks_dir)))
     output_dir = os.path.dirname(clip_dir)
+    # The portal layout: <project>/predictions.jsonl (or .json) and court.json beside <project>/tracks.
+    portal_predictions = find_predictions(clip_dir)
+    if portal_predictions is not None:
+        court = os.path.join(clip_dir, "court.json")
+        return str(portal_predictions), court if os.path.isfile(court) else None
     stem = os.path.basename(clip_dir)
     # Prediction exports commonly put tracks under ``<clip>_predict/tracks``
     # while the sidecar files remain ``<clip>_predict.json`` and

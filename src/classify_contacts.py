@@ -28,6 +28,11 @@ import cv2
 import numpy as np
 import openvino as ov
 
+try:
+    from .predictions_io import iter_frames
+except ImportError:
+    from predictions_io import iter_frames
+
 LOG = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,18 +46,18 @@ BALL_POINT_SIZE_PX = 20.0
 
 
 def load_boxes(path: Path, width: int, height: int) -> Boxes:
-    """Player and ball boxes of a detector predictions JSON, normalized to the frame size."""
-    data = json.loads(path.read_text(encoding="utf-8"))
+    """Player and ball boxes of the detector predictions (JSONL or JSON), normalized to the frame size."""
     boxes: Boxes = defaultdict(lambda: {"player": [], "ball": [], "player_tracks": []})
-    for item in data["predictions"]:
-        name = item.get("class_name")
-        if name not in ("player", "ball") or "bbox_xyxy" not in item:
-            continue
-        x1, y1, x2, y2 = item["bbox_xyxy"]
-        box = ((x1 + x2) / 2 / width, (y1 + y2) / 2 / height, (x2 - x1) / width, (y2 - y1) / height)
-        boxes[int(item["frame_index"])][name].append(box)
-        if name == "player":
-            boxes[int(item["frame_index"])]["player_tracks"].append(item.get("track_id"))
+    for frame, items in iter_frames(path):
+        for item in items:
+            name = item.get("class_name")
+            if name not in ("player", "ball") or "bbox_xyxy" not in item:
+                continue
+            x1, y1, x2, y2 = item["bbox_xyxy"]
+            box = ((x1 + x2) / 2 / width, (y1 + y2) / 2 / height, (x2 - x1) / width, (y2 - y1) / height)
+            boxes[frame][name].append(box)
+            if name == "player":
+                boxes[frame]["player_tracks"].append(item.get("track_id"))
     return boxes
 
 

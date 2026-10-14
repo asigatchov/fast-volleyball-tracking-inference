@@ -22,6 +22,11 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 
+try:
+    from .predictions_io import read_predictions
+except ImportError:
+    from predictions_io import read_predictions
+
 LOG = logging.getLogger(__name__)
 
 PLAYER_CLASS_IDS = (0,)
@@ -568,8 +573,13 @@ class PlayerStore:
         ball_score_threshold: float = DEFAULT_BALL_SCORE_THRESHOLD,
         source_width: Optional[int] = None,
         source_height: Optional[int] = None,
+        frame_start: Optional[int] = None,
+        frame_end: Optional[int] = None,
     ) -> None:
+        """``frame_start`` / ``frame_end`` load only the detections of those frames (inclusive)."""
         self._court = court
+        self._frame_start = frame_start
+        self._frame_end = frame_end
         self._score_threshold = score_threshold
         self._ball_score_threshold = ball_score_threshold
         self._by_frame: Dict[int, Tuple[PlayerBox, ...]] = {}
@@ -721,13 +731,11 @@ class PlayerStore:
             return
 
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
+            meta, predictions = read_predictions(path, self._frame_start, self._frame_end)
         except (OSError, json.JSONDecodeError) as exc:
             LOG.warning("Cannot read players JSON %s: %s", path, exc)
             return
 
-        predictions, meta = self._extract_predictions(payload)
         if not predictions:
             LOG.warning("Players JSON %s has no predictions", path)
             return
