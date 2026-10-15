@@ -1,5 +1,6 @@
 import json
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -281,6 +282,97 @@ def test_serve_struck_off_a_toss_at_head_height_is_a_serve(tmp_path) -> None:
     assert serves[0].depth_ratio > 0.0  # struck at head height, not above it
     assert analysis.rally_state["phase"] == "serve_flight"
     assert analysis.rally_state["serving_side"] == serves[0].side
+
+
+def toss_and_strike(gravity: float, x: float = 940.0, toss_frames: int = 30):
+    """Ball lowered in the hand, tossed up, falling back and struck away."""
+    lowered = [BallSample(frame=frame, x=x, y=320.0 + 2.0 * frame) for frame in range(0, 10)]
+    speed = 0.5 * gravity * toss_frames
+    tossed = [
+        BallSample(frame=10 + t, x=x, y=338.0 - speed * t + 0.5 * gravity * t * t)
+        for t in range(1, toss_frames + 1)
+    ]
+    struck_at = 10 + toss_frames
+    struck = [
+        BallSample(frame=struck_at + t, x=x - 25.0 * t, y=338.0 - 4.0 * t)
+        for t in range(1, 13)
+    ]
+    return lowered + tossed + struck, struck_at
+
+
+def serving_detector(tmp_path, boxes, name: str) -> ContactDetector:
+    return ContactDetector(PlayerStore(write_players(tmp_path, boxes, name), court=FakeCourt()), FakeCourt(), FPS)
+
+
+def test_toss_and_strike_of_one_player_are_one_serve(tmp_path) -> None:
+    detector = serving_detector(tmp_path, player_boxes(940.0, range(0, 60)), "toss.json")
+    samples, struck_at = toss_and_strike(detector.gravity_px_per_frame2)
+    raw = detector._detect_choices(samples)
+    assert [choice.best.player_track_id for choice in raw[:2]] == [7, 7]  # the toss and the strike
+
+    analysis = detector.analyze(samples)
+
+    assert analysis.contacts[0].contact_type == CONTACT_SERVE
+    assert abs(analysis.contacts[0].frame - struck_at) <= 2
+    assert len(analysis.contacts) == len(raw) - 1
+    assert sum(contact.contact_type == CONTACT_SERVE for contact in analysis.contacts) == 1
+
+
+def test_touches_of_two_players_are_not_a_toss(tmp_path) -> None:
+    detector = serving_detector(tmp_path, player_boxes(940.0, range(0, 60)), "two.json")
+    samples, _ = toss_and_strike(detector.gravity_px_per_frame2)
+    choices = detector._detect_choices(samples)
+    other = replace(choices[1], best=replace(choices[1].best, player_track_id=8))
+
+    merged = detector._merge_serve_toss([choices[0], other, *choices[2:]], samples)
+
+    assert len(merged) == len(choices)
+
+
+def test_two_touches_without_the_ball_going_up_are_not_a_toss(tmp_path) -> None:
+    detector = serving_detector(tmp_path, player_boxes(940.0, range(0, 60)), "flat.json")
+    samples, _ = toss_and_strike(detector.gravity_px_per_frame2)
+    choices = detector._detect_choices(samples)
+    flat = [sample for sample in samples if not choices[0].best.frame < sample.frame < choices[1].best.frame]
+    flat += [
+        BallSample(frame=frame, x=940.0, y=choices[0].best.ball_y + 1.0)
+        for frame in range(choices[0].best.frame + 1, choices[1].best.frame)
+    ]
+
+    merged = detector._merge_serve_toss(choices, sorted(flat, key=lambda sample: sample.frame))
+
+    assert len(merged) == len(choices)
+
+
+def test_server_touches_right_after_the_serve_are_one_serve(tmp_path) -> None:
+    detector = make_detector(tmp_path)
+    contacts = [
+        make_contact(10, 9, "far", CONTACT_SERVE),  # the toss, marked as the serve
+        replace(make_contact(24, 9, "far"), velocity_residual_px_frame=60.0),  # the strike
+        make_contact(40, 9, "far"),  # the ball leaving the hand
+        make_contact(60, 3, "near"),
+        make_contact(90, 9, "far"),  # after somebody else played it: a real touch
+    ]
+
+    settled, kept = detector._settle_serve(contacts)
+
+    assert kept == [1, 3, 4]
+    assert [(contact.frame, contact.contact_type) for contact in settled] == [
+        (24, CONTACT_SERVE),
+        (60, CONTACT_DIG),
+        (90, CONTACT_DIG),
+    ]
+
+
+def test_server_touch_long_after_the_serve_is_kept(tmp_path) -> None:
+    detector = make_detector(tmp_path)
+    late = 10 + int(FPS * 2.5)  # the return was not seen, the ball had time to come back
+    contacts = [make_contact(10, 9, "far", CONTACT_SERVE), make_contact(late, 9, "far")]
+
+    settled, kept = detector._settle_serve(contacts)
+
+    assert kept == [0, 1]
+    assert [contact.contact_type for contact in settled] == [CONTACT_SERVE, CONTACT_DIG]
 
 
 def test_fast_ball_deflected_in_the_serving_zone_is_not_a_serve(tmp_path) -> None:

@@ -7,7 +7,8 @@
 Keys:
     space  play / pause          a / d   step one frame back / forward
     w / s  jump 15 frames        n / p   next / previous track
-    v      save selected track video to --output_dir
+    v      video frame on/off (the schema alone, on black)
+    o      save selected track video to --output_dir
     h / H  one panel (video only) / video + court schema
     t      ball path on/off      ?       help on/off
     q, ESC quit
@@ -68,7 +69,7 @@ BALL_DIAMETER_M = 0.21
 
 HELP_LINES = [
     "space play/pause   a/d frame -1/+1   w/s +15/-15",
-    "n/p next/prev track   v save track video   h/H one panel   t path   ? help   q quit",
+    "n/p next/prev track   v video on/off   o save track video   h/H one panel   t path   ? help   q quit",
 ]
 
 
@@ -724,6 +725,8 @@ class RallyViewer:
         elif key == ord("p"):
             self.select(self._index - 1)
         elif key == ord("v"):
+            self._schematic = not self._schematic
+        elif key == ord("o"):
             self.save_selected_rally()
         elif key == ord("t"):
             self._show_path = not self._show_path

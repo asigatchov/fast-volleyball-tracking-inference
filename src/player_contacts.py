@@ -74,6 +74,18 @@ START_ATTACH_SECONDS = 0.5
 # A serve is struck right after the trajectory starts at the serving player.
 SERVE_WINDOW_SECONDS = 1.0
 SERVE_MIN_SPEED_GAIN = 1.2
+# A serve off a toss shows as two touches of the server: the ball leaves the hand
+# upwards, comes down and is struck. The toss of a jump serve lasts about two seconds.
+TOSS_MAX_SECONDS = 2.5
+# Up and down by at least this many ball diameters: a toss, not a wobble of the track.
+TOSS_MIN_RISE_DIAMETERS = 2.0
+TOSS_FALLBACK_RADIUS_PX = 10.0
+# The server cannot play the ball again until somebody else has: touches of the
+# server right after the serve are one action with it (toss, strike, the ball
+# leaving the hand). The window keeps a real touch of the server after a return
+# nobody was seen to make: the ball needs longer to fly over the net and back.
+SERVER_REPEAT_SECONDS = 2.0
+
 # The rally starts when the ball leaves the hands it was handled in: it must
 # then stay out of everybody's reach for a while, and the handling before it
 # must have lasted long enough to be a preparation rather than a normal start.
@@ -981,13 +993,15 @@ class ContactDetector:
 
         ordered = sorted(samples, key=lambda item: item.frame)
         start = self.detect_start(ordered)
-        choices = self._detect_choices(ordered)
+        choices = self._merge_serve_toss(self._detect_choices(ordered), ordered)
 
         # Serves are marked before the sides are resolved: a serve tells the
         # possession pass that the ball has to change sides next.
         typed = self._refine_serves([choice.best for choice in choices], start)
         rally_start = self.find_rally_start(ordered, typed)
         typed = self._mark_serve_at_rally_start(typed, rally_start)
+        typed, keep = self._settle_serve(typed)
+        choices = [choices[index] for index in keep]
         state_machine = RallyContactStateMachine(self._court, self._fps, ordered, start)
         contacts = state_machine.resolve(choices, typed)
 
@@ -1088,6 +1102,8 @@ class ContactDetector:
         """
         if not contacts:
             return []
+        if any(contact.contact_type == CONTACT_SERVE for contact in contacts):
+            return list(contacts)  # the serve off a toss, already found
 
         served = self._find_serve(contacts, start)
         return [
@@ -1096,6 +1112,77 @@ class ContactDetector:
             else contact
             for index, contact in enumerate(contacts)
         ]
+
+    def _settle_serve(self, contacts: Sequence[Contact]) -> tuple[list[Contact], list[int]]:
+        """One serve per run of the server's touches: ``(contacts left, their indices)``.
+
+        Until another player touches the ball the server cannot play it again, so the
+        serve and the server's touches right after it are one action: the toss, the
+        strike, the ball leaving the hand. The strike is the touch that changes the
+        ball's motion the most; the serve as marked is often the toss before it.
+        """
+        serve_at = next(
+            (index for index, contact in enumerate(contacts) if contact.contact_type == CONTACT_SERVE), None
+        )
+        everything = list(range(len(contacts)))
+        if serve_at is None or contacts[serve_at].player_track_id is None:
+            return list(contacts), everything
+        serve = contacts[serve_at]
+        group = [serve_at]
+        for index in range(serve_at + 1, len(contacts)):
+            contact = contacts[index]
+            if (
+                contact.player_track_id != serve.player_track_id
+                or contact.frame - serve.frame > self._fps * SERVER_REPEAT_SECONDS
+            ):
+                break
+            group.append(index)
+        if len(group) == 1:
+            return list(contacts), everything
+
+        strike = max(group, key=lambda index: contacts[index].velocity_residual_px_frame)
+        keep = [index for index in everything if index not in group or index == strike]
+        settled = [
+            replace(contacts[index], contact_type=CONTACT_SERVE) if index == strike else contacts[index]
+            for index in keep
+        ]
+        return settled, keep
+
+    def _merge_serve_toss(
+        self,
+        choices: Sequence[ContactChoice],
+        samples: Sequence[BallSample],
+    ) -> list[ContactChoice]:
+        """The toss and the strike of a serve are one action: the serve.
+
+        The first two touches of a trajectory are the toss and the serve when one
+        player makes both, shortly one after the other, and the ball goes up and
+        comes down between them. The toss is dropped, the strike is the serve.
+        """
+        if len(choices) < 2:
+            return list(choices)
+        toss, strike = choices[0].best, choices[1].best
+        if toss.player_track_id is None or toss.player_track_id != strike.player_track_id:
+            return list(choices)
+        if strike.frame - toss.frame > self._fps * TOSS_MAX_SECONDS:
+            return list(choices)
+
+        between = [sample for sample in samples if toss.frame < sample.frame < strike.frame]
+        if not between:
+            return list(choices)
+        apex_y = min(sample.y for sample in between)
+        radii = sorted(float(sample.radius_px) for sample in between if sample.radius_px)
+        radius = radii[len(radii) // 2] if radii else TOSS_FALLBACK_RADIUS_PX
+        min_rise = TOSS_MIN_RISE_DIAMETERS * 2.0 * radius
+        # Image y grows downwards: the apex is above both touches.
+        if toss.ball_y - apex_y < min_rise or strike.ball_y - apex_y < min_rise:
+            return list(choices)
+
+        served = ContactChoice(
+            best=replace(strike, contact_type=CONTACT_SERVE),
+            alternatives=choices[1].alternatives,
+        )
+        return [served, *choices[2:]]
 
     def _find_serve(
         self,
