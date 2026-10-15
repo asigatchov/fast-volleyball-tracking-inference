@@ -46,6 +46,8 @@ INFERENCE_MAX_ATTEMPTS = max(int(os.getenv("INFERENCE_MAX_ATTEMPTS", "3")), 1)
 HOT_POLL_SECONDS = float(os.getenv("INFERENCE_HOT_POLL_SECONDS", "15"))
 API_IMPORT_TASK_QUEUE = os.getenv("API_IMPORT_TASK_QUEUE", "api-import")
 API_IMPORT_REPLACE_EXISTING = os.getenv("API_IMPORT_REPLACE_EXISTING", "true").lower() in {"1", "true", "yes", "on"}
+# Action classifiers a task may ask for by name (see _resolve_action_model_xml); the API offers the same list.
+ACTION_MODELS = {"action_clf_slowfast_r50_verified", "action_clf_r2plus1d18_verified"}
 
 celery = celery_app
 app = celery_app
@@ -136,11 +138,31 @@ def _queue_status_update(project_id: str, user_id: str, status: str) -> None:
         logger.exception("Failed to enqueue status update for project=%s user=%s status=%s", project_id, user_id, status)
 
 
-def _run_contact_classification(repo_dir: Path, video_path: Path, predictions_json: Path, tracks_dir: Path, device: str) -> None:
-    """Label the detected contacts (Serve / Receive / Set / Attack) in the track files."""
-    model_xml = Path(
+def _resolve_action_model_xml(repo_dir: Path, action_model: str | None) -> Path:
+    """The classifier .xml for a run: the requested model, or the env/default one when none is given."""
+    if action_model:
+        if action_model not in ACTION_MODELS:
+            raise ValueError(f"Unknown action model: {action_model}")
+        model_xml = (repo_dir / "ov" / f"{action_model}.xml").resolve()
+        ov_dir = (repo_dir / "ov").resolve()
+        if model_xml.parent != ov_dir:
+            raise ValueError(f"Action model escapes the ov directory: {action_model}")
+        return model_xml
+    return Path(
         os.getenv("INFERENCE_ACTION_MODEL_XML", str(repo_dir / "ov" / "action_clf_r2plus1d18_verified.xml"))
     ).resolve()
+
+
+def _run_contact_classification(
+    repo_dir: Path,
+    video_path: Path,
+    predictions_json: Path,
+    tracks_dir: Path,
+    device: str,
+    action_model: str | None = None,
+) -> None:
+    """Label the detected contacts (Serve / Receive / Set / Attack) in the track files."""
+    model_xml = _resolve_action_model_xml(repo_dir, action_model)
     if not model_xml.exists():
         raise FileNotFoundError(f"Action classifier not found: {model_xml}")
     classify_cmd = [
@@ -167,7 +189,7 @@ def _run_contact_classification(repo_dir: Path, video_path: Path, predictions_js
 
 
 @celery_app.task(name="inference.classify_actions")
-def classify_actions(project_id: str, user_id: str, file_path: str) -> dict[str, str | None]:
+def classify_actions(project_id: str, user_id: str, file_path: str, action_model: str | None = None) -> dict[str, str | None]:
     """Run the action classifier alone over the contacts of the last detection.
 
     The detector output (predictions.json, tracks) is reused; the API then re-types the
@@ -184,7 +206,7 @@ def classify_actions(project_id: str, user_id: str, file_path: str) -> dict[str,
         if predictions_json is None or not tracks_dir.is_dir():
             raise FileNotFoundError(f"Detection results not found in {target_video_dir}")
         repo_dir = Path(os.getenv("INFERENCE_REPO_DIR", "/app")).resolve()
-        _run_contact_classification(repo_dir, video_path, predictions_json, tracks_dir, os.getenv("INFERENCE_DEVICE", "CPU"))
+        _run_contact_classification(repo_dir, video_path, predictions_json, tracks_dir, os.getenv("INFERENCE_DEVICE", "CPU"), action_model)
     except Exception as exc:
         logger.exception("Actions classification failed for project=%s user=%s", project_id, user_id)
         error = str(exc)
@@ -259,7 +281,9 @@ def _run_detector(
 
 
 @celery_app.task(name="inference.process_uploaded_video")
-def process_uploaded_video(project_id: str, user_id: str, file_path: str, file_url: str) -> dict[str, str | bool]:
+def process_uploaded_video(
+    project_id: str, user_id: str, file_path: str, file_url: str, action_model: str | None = None
+) -> dict[str, str | bool]:
     """Detection, then rallies with their touches, then the types of the actions.
 
     The detector streams its predictions into ``predictions.jsonl``. While it runs,
@@ -408,7 +432,7 @@ def process_uploaded_video(project_id: str, user_id: str, file_path: str, file_u
     error: str | None = None
     if os.getenv("INFERENCE_CLASSIFY_ACTIONS", "true").lower() in {"1", "true", "yes", "on"}:
         try:
-            _run_contact_classification(repo_dir, video_path, predictions_in_use, tracks_dir, device)
+            _run_contact_classification(repo_dir, video_path, predictions_in_use, tracks_dir, device, action_model)
         except Exception as exc:
             logger.exception("Actions classification failed for project=%s", project_id)
             error = str(exc)
