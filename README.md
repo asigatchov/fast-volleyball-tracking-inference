@@ -68,6 +68,36 @@ uv run src/make_reels.py \
   --output_dir "$OUT"
 ```
 
+## Docker + GPU
+
+`Dockerfile.gpu` is `./Dockerfile` with the CPU `onnxruntime` swapped for
+`onnxruntime-gpu` (CUDA 13 + cuDNN 9 arrive as `nvidia-*` wheels, so the base
+image stays `python:3.14-slim`). `docker-compose.gpu.yml` runs the quick start
+step 1 on the GPU:
+
+```bash
+docker compose -f docker-compose.gpu.yml build
+docker compose -f docker-compose.gpu.yml run --rm inference   # detection on the GPU
+docker compose -f docker-compose.gpu.yml run --rm shell       # bash for the rest of the pipeline
+```
+
+`./output` is mounted, so `output/gtu_20250316_002/ball.csv` appears in the repo.
+The startup log confirms the device: `ONNX Runtime 1.29.0, providers:
+['CUDAExecutionProvider', 'CPUExecutionProvider']`.
+
+Host prerequisites - an NVIDIA driver and `nvidia-container-toolkit`, checked with:
+
+```bash
+docker run --rm --gpus all nvidia/cuda:13.0.0-base-ubuntu24.04 nvidia-smi -L
+```
+
+Notes:
+- OpenVINO (`src/inference_player_ball_openvino.py`, `src/classify_contacts.py`,
+  the celery worker) has no NVIDIA backend. In the GPU image it still runs on the
+  CPU plugin: keep `--device CPU` / `INFERENCE_DEVICE=CPU`.
+- `UV_NO_SYNC=1` is set in the image so `uv run` does not swap the GPU build of
+  onnxruntime back to the CPU one pinned in `uv.lock`.
+
 ## Output structure
 ```text
 output/gtu_20250316_002/

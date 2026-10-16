@@ -315,9 +315,17 @@ def process_uploaded_video(
     ).resolve()
     if not model_xml.exists():
         _queue_status_update(project_id, user_id, "new")
-        raise FileNotFoundError(f"OpenVINO model not found: {model_xml}")
+        raise FileNotFoundError(f"Detector model not found: {model_xml}")
+    # An .onnx release runs on ONNX Runtime (CUDA in the GPU image), an .xml on OpenVINO.
+    detector_script = (
+        "src/inference_player_ball_onnx.py"
+        if model_xml.suffix == ".onnx"
+        else "src/inference_player_ball_openvino.py"
+    )
 
     device = os.getenv("INFERENCE_DEVICE", "CPU")
+    # The action classifier stays on OpenVINO (CPU only); the detector may run elsewhere.
+    detector_device = os.getenv("INFERENCE_DETECTOR_DEVICE", device)
     frame_step = os.getenv("INFERENCE_FRAME_STEP", "2")
     target_video_dir = video_path.parent / video_path.stem
     target_video_dir.mkdir(parents=True, exist_ok=True)
@@ -403,7 +411,7 @@ def process_uploaded_video(
             detector_cmd = [
                 "uv",
                 "run",
-                "src/inference_player_ball_openvino.py",
+                detector_script,
                 str(video_path),
                 "--model",
                 str(model_xml),
@@ -413,7 +421,7 @@ def process_uploaded_video(
                 "--frame-step",
                 frame_step,
                 "--device",
-                device,
+                detector_device,
             ]
             logger.info("Running inference command: %s", " ".join(detector_cmd))
             _run_detector(detector_cmd, repo_dir, target_video_dir / "detector.log", commit_ready, HOT_POLL_SECONDS)

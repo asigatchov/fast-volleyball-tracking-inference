@@ -666,12 +666,14 @@ def _draw_heads(canvas: np.ndarray, predictions: list[dict]) -> None:
     )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(
+    default_model: Path = DEFAULT_MODEL, default_device: str = "CPU"
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Detect and track volleyball players and the ball with RAVEL-VB."
     )
     parser.add_argument("video", help="input video")
-    parser.add_argument("--model", default=str(DEFAULT_MODEL))
+    parser.add_argument("--model", default=str(default_model))
     parser.add_argument(
         "--output",
         help=(
@@ -739,8 +741,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         choices=("CPU", "GPU", "AUTO"),
-        default="CPU",
-        help="OpenVINO device used for inference",
+        default=default_device,
+        help="inference device; the ONNX runner reads GPU as CUDA",
     )
     parser.add_argument(
         "--performance-hint",
@@ -750,8 +752,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def main(
+    runtime: type | None = None,
+    default_model: Path = DEFAULT_MODEL,
+    default_device: str = "CPU",
+) -> None:
+    """Run the detector; ``runtime`` is the class that executes the model.
+
+    ``inference_player_ball_onnx.py`` passes its ONNX Runtime class here, so both
+    runtimes share the arguments, the decoding and the output format.
+    """
+    runtime = runtime or RavelVBOpenVINO
+    args = parse_args(default_model, default_device)
     if args.stride < 1:
         raise ValueError("--stride must be >= 1")
     if args.frame_step < 1:
@@ -790,7 +802,7 @@ def main() -> None:
     if not video_path.is_file():
         raise FileNotFoundError(f"video not found: {video_path}")
     if not model_path.is_file():
-        raise FileNotFoundError(f"OpenVINO model not found: {model_path}")
+        raise FileNotFoundError(f"model not found: {model_path}")
     settings = {
         "model": str(model_path),
         "video": str(video_path),
@@ -817,7 +829,7 @@ def main() -> None:
         if state == "fresh":
             print(f"{output_path}: no checkpoint of the same settings, starting over", file=sys.stderr)
 
-    model = RavelVBOpenVINO(
+    model = runtime(
         model_path, args.num_threads, args.performance_hint, args.device
     )
     config = model.config
