@@ -1,4 +1,5 @@
 import argparse
+import gzip
 import json
 import logging
 import math
@@ -20,14 +21,27 @@ except Exception:  # pragma: no cover - optional dependency
 
 try:
     from .constants import DEFAULT_CROP_ASPECT_RATIO, DEFAULT_FPS, DEFAULT_SMOOTH_WINDOW
+    from .predictions_io import iter_frames
 except ImportError:
     from constants import DEFAULT_CROP_ASPECT_RATIO, DEFAULT_FPS, DEFAULT_SMOOTH_WINDOW
+    from predictions_io import iter_frames
 
 LOG = logging.getLogger(__name__)
 WATERMARK_TEXT = "vb-ai.ru"
 WATERMARK_FONT_PATH = Path(__file__).resolve().parent / "fonts" / "PlayfairDisplay-MediumItalic.ttf"
 BLACK_TRANSITION_SECONDS = 0.3
 DEFAULT_PADDING_SECONDS = 0.33
+# The player of a highlighted action: green corners around the box, blinking 5 frames on / 5 off,
+# from a moment before the contact to a moment after it.
+PLAYER_MARK_COLOR = (0, 255, 0)
+PLAYER_MARK_BLINK_FRAMES = 5
+PLAYER_MARK_BEFORE_SECONDS = 1.5
+PLAYER_MARK_AFTER_SECONDS = 0.5
+# The detector writes every other frame or so: a box is held this many frames over a gap.
+PLAYER_MARK_HOLD_FRAMES = 4
+# Where the detector gave the actor another track id: the box overlapping the last one this much.
+PLAYER_MARK_MIN_OVERLAP = 0.3
+Box = Tuple[float, float, float, float]
 
 
 try:
@@ -332,6 +346,151 @@ def apply_black_fade(
     return cv2.convertScaleAbs(frame, alpha=alpha, beta=0)
 
 
+def _predictions_frame_size(predictions_path: str) -> Optional[Tuple[int, int]]:
+    """``source_size`` of the predictions header: the frame size of the boxes."""
+    opener = gzip.open if str(predictions_path).endswith(".gz") else open
+    try:
+        with opener(predictions_path, "rt", encoding="utf-8") as handle:
+            header = json.loads(handle.readline())
+        size = header.get("source_size") or {}
+        return int(size["width"]), int(size["height"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _actor_track(players: List[Tuple[Optional[int], Box]], track_id: Optional[int], ball: Optional[list]) -> Optional[int]:
+    """Index of the acting player: by the action's track id, else the box nearest to the ball."""
+    if track_id is not None:
+        for index, (track, _) in enumerate(players):
+            if track == track_id:
+                return index
+    if not ball or not players:
+        return None
+    bx, by = float(ball[0]), float(ball[1])
+
+    def distance(box: Box) -> float:
+        return float(np.hypot(max(box[0] - bx, 0.0, bx - box[2]), max(box[1] - by, 0.0, by - box[3])))
+
+    return min(range(len(players)), key=lambda i: distance(players[i][1]))
+
+
+def _overlap(a: Box, b: Box) -> float:
+    """Intersection over union of two ``x1, y1, x2, y2`` boxes."""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    if w <= 0 or h <= 0:
+        return 0.0
+    inter = w * h
+    return inter / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+
+
+def _follow_actor(
+    players_by_frame: Dict[int, List[Tuple[Optional[int], Box]]],
+    frames: List[int],
+    track: Optional[int],
+    box: Box,
+) -> Dict[int, Box]:
+    """The actor's box on ``frames`` (in walking order from the contact): by its track id, and where
+    the detector gave the person another id, by the box that overlaps the last one most."""
+    boxes: Dict[int, Box] = {}
+    for frame in frames:
+        players = players_by_frame.get(frame)
+        if not players:
+            continue
+        same = next((b for t, b in players if track is not None and t == track), None)
+        if same is None:
+            best = max(players, key=lambda p: _overlap(p[1], box))
+            if _overlap(best[1], box) < PLAYER_MARK_MIN_OVERLAP:
+                continue
+            track, same = best
+        box = same
+        boxes[frame] = box
+    return boxes
+
+
+def player_mark_boxes(
+    predictions_path: str,
+    highlights: List[Dict],
+    fps: float,
+    video_size: Tuple[int, int],
+) -> Dict[int, Box]:
+    """``frame -> box`` (video pixels) of the player to mark, on the frames the blinking mark is on.
+
+    ``highlights``: ``{"frame", "track_id"?, "ball"?: [x, y]}`` of each action. The actor is found at
+    the contact frame and followed from there both ways; where the ranges of two actions meet, a
+    frame belongs to the nearer contact.
+    """
+    if not highlights:
+        return {}
+    before = int(round(PLAYER_MARK_BEFORE_SECONDS * fps))
+    after = int(round(PLAYER_MARK_AFTER_SECONDS * fps))
+    frames = sorted(int(h["frame"]) for h in highlights)
+    players_by_frame: Dict[int, List[Tuple[Optional[int], Box]]] = {}
+    first = max(frames[0] - before - PLAYER_MARK_HOLD_FRAMES, 0)
+    for frame, items in iter_frames(predictions_path, first, frames[-1] + after + PLAYER_MARK_HOLD_FRAMES):
+        players_by_frame[frame] = [
+            (item.get("track_id"), tuple(float(v) for v in item["bbox_xyxy"]))
+            for item in items
+            if item.get("class_name") == "player"
+        ]
+    if not players_by_frame:
+        return {}
+
+    source = _predictions_frame_size(predictions_path)
+    scale_x = video_size[0] / source[0] if source else 1.0
+    scale_y = video_size[1] / source[1] if source else 1.0
+    known = sorted(players_by_frame)
+
+    marks: Dict[int, Tuple[int, Box]] = {}
+    for highlight in highlights:
+        contact = int(highlight["frame"])
+        # The contact frame itself may be one the detector skipped: the nearest written one.
+        nearest = min(known, key=lambda f: abs(f - contact))
+        if abs(nearest - contact) > PLAYER_MARK_HOLD_FRAMES:
+            continue
+        players = players_by_frame[nearest]
+        index = _actor_track(players, highlight.get("track_id"), highlight.get("ball"))
+        if index is None:
+            continue
+        track, contact_box = players[index]
+        start = contact - before
+        actor = _follow_actor(players_by_frame, list(range(nearest, contact + after + 1)), track, contact_box)
+        actor.update(_follow_actor(players_by_frame, list(range(nearest, start - PLAYER_MARK_HOLD_FRAMES - 1, -1)), track, contact_box))
+
+        held: Optional[Box] = None
+        held_at = start - PLAYER_MARK_HOLD_FRAMES - 1
+        for frame in range(start - PLAYER_MARK_HOLD_FRAMES, contact + after + 1):
+            if frame in actor:
+                held, held_at = actor[frame], frame
+            if frame < start or held is None or frame - held_at > PLAYER_MARK_HOLD_FRAMES:
+                continue
+            if (frame - start) // PLAYER_MARK_BLINK_FRAMES % 2:
+                continue
+            distance = abs(frame - contact)
+            if frame in marks and marks[frame][0] <= distance:
+                continue
+            x1, y1, x2, y2 = held
+            marks[frame] = (distance, (x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y))
+    return {frame: box for frame, (_, box) in marks.items()}
+
+
+def draw_player_mark(frame: np.ndarray, box: Box, color: Tuple[int, int, int] = PLAYER_MARK_COLOR) -> np.ndarray:
+    """Sight-like corners around ``box``: four L-shaped strokes, a quarter of the shorter side long."""
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = box
+    pad = 0.08 * max(x2 - x1, y2 - y1)
+    x1, y1 = int(max(0, x1 - pad)), int(max(0, y1 - pad))
+    x2, y2 = int(min(width - 1, x2 + pad)), int(min(height - 1, y2 + pad))
+    if x2 <= x1 or y2 <= y1:
+        return frame
+    arm = max(4, int(0.25 * min(x2 - x1, y2 - y1)))
+    thickness = max(2, int(round(height / 250)))
+    for cx, cy, dx, dy in ((x1, y1, 1, 1), (x2, y1, -1, 1), (x1, y2, 1, -1), (x2, y2, -1, -1)):
+        cv2.line(frame, (cx, cy), (cx + dx * arm, cy), color, thickness, cv2.LINE_AA)
+        cv2.line(frame, (cx, cy), (cx, cy + dy * arm), color, thickness, cv2.LINE_AA)
+    return frame
+
+
 def crop_and_save_track(
     video_path: str,
     track: Dict,
@@ -346,6 +505,8 @@ def crop_and_save_track(
     fade_in: bool = False,
     fade_out: bool = False,
     fade_duration: float = BLACK_TRANSITION_SECONDS,
+    highlights: Optional[List[Dict]] = None,
+    predictions_path: Optional[str] = None,
 ) -> None:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -389,6 +550,11 @@ def crop_and_save_track(
 
     total_frames = end_frame - start_frame + 1
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    player_marks = (
+        player_mark_boxes(predictions_path, highlights, fps, (frame_width, frame_height))
+        if highlights and predictions_path
+        else {}
+    )
 
     for i, frame_idx in enumerate(
         tqdm(
@@ -402,6 +568,9 @@ def crop_and_save_track(
         if not ret:
             LOG.warning("Frame %s not read - video ended early.", frame_idx)
             break
+
+        if frame_idx in player_marks:
+            draw_player_mark(frame, player_marks[frame_idx])
 
         center_x = int(x_smooth[i])
         if margin:
@@ -454,6 +623,7 @@ def crop_and_save_track_payload(
     fade_in: bool = False,
     fade_out: bool = False,
     fade_duration: float = BLACK_TRANSITION_SECONDS,
+    predictions_path: Optional[str] = None,
 ) -> None:
     track = load_track_from_payload(track_payload)
     crop_and_save_track(
@@ -470,6 +640,8 @@ def crop_and_save_track_payload(
         fade_in=fade_in,
         fade_out=fade_out,
         fade_duration=fade_duration,
+        highlights=track_payload.get("highlights"),
+        predictions_path=predictions_path,
     )
 
 
@@ -486,6 +658,7 @@ def crop_and_save_track_payloads(
     padding: float = DEFAULT_PADDING_SECONDS,
     fade_transition: bool = False,
     fade_duration: float = BLACK_TRANSITION_SECONDS,
+    predictions_path: Optional[str] = None,
 ) -> None:
     if not track_payloads:
         raise ValueError("track_payloads must not be empty")
@@ -502,6 +675,7 @@ def crop_and_save_track_payloads(
             smooth_polyorder=smooth_polyorder,
             margin=margin,
             padding=padding,
+            predictions_path=predictions_path,
         )
         return
 
@@ -527,6 +701,7 @@ def crop_and_save_track_payloads(
                 fade_in=fade_transition and idx > 1,
                 fade_out=fade_transition and idx < len(track_payloads),
                 fade_duration=fade_duration,
+                predictions_path=predictions_path,
             )
             segment_files.append(segment_path)
 

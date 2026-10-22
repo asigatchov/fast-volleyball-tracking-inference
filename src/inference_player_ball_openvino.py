@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import time
+from urllib.parse import urlparse
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
@@ -785,7 +786,10 @@ def main(
         raise ValueError("frame counts and thread count must be non-negative")
 
     model_path = Path(args.model).expanduser().resolve()
-    video_path = Path(args.video).expanduser().resolve()
+    # An http(s) URL is read by OpenCV's FFmpeg straight from the network (an outside node).
+    video_is_url = urlparse(args.video).scheme in {"http", "https"}
+    video_path = Path(urlparse(args.video).path) if video_is_url else Path(args.video).expanduser().resolve()
+    video_source = args.video if video_is_url else str(video_path)
     output_path = None
     if args.output:
         output_arg = args.output
@@ -799,13 +803,13 @@ def main(
         if args.output_video
         else None
     )
-    if not video_path.is_file():
+    if not video_is_url and not video_path.is_file():
         raise FileNotFoundError(f"video not found: {video_path}")
     if not model_path.is_file():
         raise FileNotFoundError(f"model not found: {model_path}")
     settings = {
         "model": str(model_path),
-        "video": str(video_path),
+        "video": video_source,
         "stride": args.stride,
         "frame_step": args.frame_step,
         "score_threshold": args.score_threshold,
@@ -849,9 +853,9 @@ def main(
     for _ in range(args.warmup_runs):
         model.infer(warmup)
 
-    capture = cv2.VideoCapture(str(video_path))
+    capture = cv2.VideoCapture(video_source)
     if not capture.isOpened():
-        raise ValueError(f"cannot open video: {video_path}")
+        raise ValueError(f"cannot open video: {video_source}")
     fps = float(capture.get(cv2.CAP_PROP_FPS)) or 30.0
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1150,7 +1154,7 @@ def main(
         output_handle.close()
 
     if output_video_path is not None:
-        render_capture = cv2.VideoCapture(str(video_path))
+        render_capture = cv2.VideoCapture(video_source)
         if not render_capture.isOpened():
             raise ValueError("cannot open the input video for rendering")
         writer = None
@@ -1186,7 +1190,7 @@ def main(
         payload = {
             "format": FORMAT_V1,
             "model": str(model_path),
-            "video": str(video_path),
+            "video": video_source,
             "source_size": {"width": width, "height": height},
             "fps": fps,
             "clip_length": clip_length,

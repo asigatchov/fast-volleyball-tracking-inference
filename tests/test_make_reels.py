@@ -146,3 +146,55 @@ def test_cli_padding_is_seconds_with_033_default() -> None:
     assert build_parser().parse_args(["--video_path", "v.mp4"]).padding == pytest.approx(0.33)
     args = build_parser().parse_args(["--video_path", "v.mp4", "--padding", "1.5"])
     assert args.padding == pytest.approx(1.5)
+
+
+def write_predictions(path, boxes_by_frame: dict[int, list[list[float]]], size=(200, 100)) -> None:
+    """A predictions.jsonl with ``[track_id, x1, y1, x2, y2]`` players per frame."""
+    lines = [{"type": "header", "source_size": {"width": size[0], "height": size[1]}}]
+    for frame, rows in sorted(boxes_by_frame.items()):
+        lines.append({"type": "frame", "frame_index": frame, "players": [[r[0], 0.9, *r[1:]] for r in rows]})
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+
+def test_player_mark_follows_the_actor_and_blinks_5_on_5_off(tmp_path) -> None:
+    predictions = tmp_path / "predictions.jsonl"
+    # Written every other frame; the actor (track 7) walks right, someone else stands by the ball.
+    write_predictions(
+        predictions,
+        {f: [[7, 10 + f, 10, 30 + f, 60], [8, 150, 10, 170, 60]] for f in range(0, 41, 2)},
+    )
+    highlights = [{"frame": 30, "track_id": 7, "ball": [160, 20]}]
+    # 10 fps: from 15 frames before the contact to 5 after; 2x the detector's frame size.
+    marks = make_reels.player_mark_boxes(str(predictions), highlights, 10.0, (400, 200))
+
+    on = sorted(marks)
+    assert on == [*range(15, 20), *range(25, 30), *range(35, 36)]
+    # The odd frames hold the box of the frame before; scaled to the video.
+    assert marks[15] == (2 * 24, 20, 2 * 44, 120)
+    assert marks[25] == (2 * 34, 20, 2 * 54, 120)
+
+    # Without the track id: the player nearest to the ball at the contact, followed by its track.
+    by_ball = make_reels.player_mark_boxes(
+        str(predictions), [{"frame": 30, "track_id": None, "ball": [160, 20]}], 10.0, (200, 100)
+    )
+    assert by_ball[25] == (150, 10, 170, 60)
+
+
+def test_player_mark_draws_green_corners_only() -> None:
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    make_reels.draw_player_mark(frame, (20, 20, 80, 80))
+    green = (frame[:, :, 1] > 0) & (frame[:, :, 0] == 0) & (frame[:, :, 2] == 0)
+    assert green[16, 16] and green[84, 84]
+    # The middle of each side and the inside stay clear.
+    assert not green[16, 50] and not green[50, 50]
+
+
+def test_player_mark_keeps_the_actor_when_the_detector_renumbers_it(tmp_path) -> None:
+    predictions = tmp_path / "predictions.jsonl"
+    # The actor is track 3 until frame 20, then track 9; a far player stays track 4.
+    write_predictions(
+        predictions,
+        {f: [[3 if f < 20 else 9, 10 + f, 10, 30 + f, 60], [4, 150, 10, 170, 60]] for f in range(0, 41, 2)},
+    )
+    marks = make_reels.player_mark_boxes(str(predictions), [{"frame": 30, "track_id": 9}], 10.0, (200, 100))
+    assert marks[15] == (24, 10, 44, 60)

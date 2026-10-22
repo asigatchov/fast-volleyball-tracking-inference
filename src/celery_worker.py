@@ -1,21 +1,26 @@
 import logging
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
 from urllib.parse import urlparse
 import json
-from typing import Any
+from typing import Any, Callable
 
 from celery import Celery
 import cv2
 
 try:
     from .hot_tracks import HotTracks
+    from .jersey_numbers import NumberReader
+    from .player_reid import VECTORS_FILE, ReidEncoder, assign_players
     from .make_reels import crop_and_save_track_payload, crop_and_save_track_payloads
     from .predictions_io import JSONL_NAME, find_predictions, iter_frames, pack, read_meta
 except ImportError:
     from hot_tracks import HotTracks
+    from jersey_numbers import NumberReader
+    from player_reid import VECTORS_FILE, ReidEncoder, assign_players
     from make_reels import crop_and_save_track_payload, crop_and_save_track_payloads
     from predictions_io import JSONL_NAME, find_predictions, iter_frames, pack, read_meta
 
@@ -38,6 +43,7 @@ API_SET_STATUS_TASK_NAME = os.getenv("API_SET_STATUS_TASK_NAME", "api.set_projec
 API_UPDATE_REEL_TASK_NAME = os.getenv("API_UPDATE_REEL_TASK_NAME", "api.update_reel_result")
 API_REFRESH_ACTIONS_TASK_NAME = os.getenv("API_REFRESH_ACTIONS_TASK_NAME", "api.refresh_actions_from_tracks")
 API_ADD_RALLIES_TASK_NAME = os.getenv("API_ADD_RALLIES_TASK_NAME", "api.add_rallies_from_tracks")
+API_IMPORT_PLAYERS_TASK_NAME = os.getenv("API_IMPORT_PLAYERS_TASK_NAME", "api.import_player_assignment")
 # Rallies are added while the detector runs (see hot_tracks.py); off: once at the end.
 INFERENCE_HOT_TRACKS = os.getenv("INFERENCE_HOT_TRACKS", "true").lower() in {"1", "true", "yes", "on"}
 # A detector killed (out of memory, a restart) goes on from its last checkpoint this many times.
@@ -53,7 +59,7 @@ celery = celery_app
 app = celery_app
 
 
-def _resolve_video_fps(video_path: Path) -> float:
+def _resolve_video_fps(video_path: str | Path) -> float:
     default_fps = float(os.getenv("TRACK_VIDEO_FPS", "30"))
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -63,7 +69,7 @@ def _resolve_video_fps(video_path: Path) -> float:
     return fps if fps > 0 else default_fps
 
 
-def _resolve_video_size(video_path: Path) -> tuple[int, int]:
+def _resolve_video_size(video_path: str | Path) -> tuple[int, int]:
     default_width = int(os.getenv("TRACK_VIDEO_WIDTH", "1920"))
     default_height = int(os.getenv("TRACK_VIDEO_HEIGHT", "1080"))
 
@@ -155,7 +161,7 @@ def _resolve_action_model_xml(repo_dir: Path, action_model: str | None) -> Path:
 
 def _run_contact_classification(
     repo_dir: Path,
-    video_path: Path,
+    video_path: str | Path,
     predictions_json: Path,
     tracks_dir: Path,
     device: str,
@@ -220,6 +226,115 @@ def classify_actions(project_id: str, user_id: str, file_path: str, action_model
     return {"project_id": project_id, "user_id": user_id, "error": error}
 
 
+@celery_app.task(name="inference.assign_players")
+def assign_players_task(
+    project_id: str,
+    user_id: str,
+    file_path: str,
+    actions: list[dict[str, Any]],
+    k: int = 12,
+    side: str = "near",
+    run_id: str = "latest",
+    read_numbers: bool = True,
+    candidates: list[str] | None = None,
+) -> dict[str, Any]:
+    """Sort the actions of one half into players (src/player_reid.py).
+
+    With ``read_numbers`` the jersey numbers are read (src/jersey_numbers.py, pose + PP-OCRv6)
+    and become the players, limited to ``candidates`` when given; without them, or when the
+    numbers can not be read, the actions are clustered by appearance (re-id) into ``k`` players.
+
+    ``actions`` come from the API (``frame``, ``track_id``, ``ball``, ``side``); the result is
+    ``<project>/players/<run_id>/players.json`` with a crop per action (a directory per run, so
+    the browser never shows the crops of an earlier run), and the API is told to read it (or
+    about the error).
+    """
+    video_path = Path(file_path).resolve()
+    target_video_dir = video_path.parent / video_path.stem
+    error: str | None = None
+    try:
+        predictions = find_predictions(target_video_dir)
+        court_path = target_video_dir / "court.json"
+        if predictions is None or not court_path.is_file():
+            raise FileNotFoundError(f"Detection results or court markup not found in {target_video_dir}")
+        repo_dir = Path(os.getenv("INFERENCE_REPO_DIR", "/app")).resolve()
+        model_xml = Path(os.getenv("INFERENCE_REID_MODEL_XML", str(repo_dir / "ov" / "person-reidentification-retail-0287.xml")))
+        result = assign_players(
+            str(video_path),
+            str(predictions),
+            json.loads(court_path.read_text(encoding="utf-8")),
+            actions,
+            target_video_dir / "players" / Path(run_id).name,
+            ReidEncoder(model_xml, os.getenv("INFERENCE_DEVICE", "CPU")),
+            k=k,
+            side=side,
+            numbers=NumberReader(device=os.getenv("INFERENCE_DEVICE", "CPU")) if read_numbers else None,
+            candidates=candidates or None,
+        )
+        logger.info(
+            "Players assigned project=%s (%s): %d actions, %d skipped",
+            project_id, result["mode"], len(result["assignments"]), len(result["skipped"]),
+        )
+    except Exception as exc:
+        logger.exception("Player assignment failed for project=%s user=%s", project_id, user_id)
+        error = str(exc)
+
+    celery_app.send_task(
+        API_IMPORT_PLAYERS_TASK_NAME,
+        args=[project_id, user_id, run_id, error],
+        queue=API_IMPORT_TASK_QUEUE,
+    )
+    return {"project_id": project_id, "user_id": user_id, "error": error}
+
+
+@celery_app.task(name="inference.player_vectors")
+def player_vectors_task(
+    project_id: str,
+    user_id: str,
+    file_path: str,
+    actions: list[dict[str, Any]],
+    side: str = "near",
+    run_id: str = "latest",
+) -> dict[str, Any]:
+    """Re-id vectors of the actors of an earlier run (made before runs kept them), no number reading.
+
+    Writes ``<project>/players/<run_id>/vectors.npz`` (or ``vectors_error.txt``) and removes the
+    API's ``vectors_pending`` marker; the API ranks actions by likeness from it.
+    """
+    video_path = Path(file_path).resolve()
+    target_video_dir = video_path.parent / video_path.stem
+    run_dir = target_video_dir / "players" / Path(run_id).name
+    scratch = run_dir / "_vectors"
+    error: str | None = None
+    try:
+        predictions = find_predictions(target_video_dir)
+        court_path = target_video_dir / "court.json"
+        if predictions is None or not court_path.is_file():
+            raise FileNotFoundError(f"Detection results or court markup not found in {target_video_dir}")
+        repo_dir = Path(os.getenv("INFERENCE_REPO_DIR", "/app")).resolve()
+        model_xml = Path(os.getenv("INFERENCE_REID_MODEL_XML", str(repo_dir / "ov" / "person-reidentification-retail-0287.xml")))
+        assign_players(
+            str(video_path),
+            str(predictions),
+            json.loads(court_path.read_text(encoding="utf-8")),
+            actions,
+            scratch,
+            ReidEncoder(model_xml, os.getenv("INFERENCE_DEVICE", "CPU")),
+            side=side,
+        )
+        (scratch / VECTORS_FILE).replace(run_dir / VECTORS_FILE)
+        (run_dir / "vectors_error.txt").unlink(missing_ok=True)
+    except Exception as exc:
+        logger.exception("Player vectors failed for project=%s user=%s", project_id, user_id)
+        error = str(exc)
+        if run_dir.is_dir():
+            (run_dir / "vectors_error.txt").write_text(error[:2000], encoding="utf-8")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+        (run_dir / "vectors_pending").unlink(missing_ok=True)
+    return {"project_id": project_id, "user_id": user_id, "error": error}
+
+
 def _queue_rallies(project_id: str, user_id: str, file_names: list[str], reset: bool = False) -> None:
     """Hand committed track files to the API; ``reset`` first drops the rallies of an earlier run."""
     if not file_names and not reset:
@@ -244,7 +359,7 @@ def _completed_detection(target_dir: Path, model_xml: Path, frame_step: str) -> 
     return path if same and meta.get("complete") else None
 
 
-def _resumable_detection(predictions: Path, model_xml: Path, video_path: Path, frame_step: str) -> bool:
+def _resumable_detection(predictions: Path, model_xml: Path, video_path: str | Path, frame_step: str) -> bool:
     """An unfinished JSONL of the same run: the detector goes on from its last checkpoint."""
     if not predictions.is_file():
         return False
@@ -263,14 +378,23 @@ def _resumable_detection(predictions: Path, model_xml: Path, video_path: Path, f
 def _run_detector(
     detector_cmd: list[str], repo_dir: Path, log_path: Path, on_progress, poll_seconds: float
 ) -> None:
-    """Runs the detector, resuming it after a crash; ``on_progress`` is called while it works."""
+    """Runs the detector, resuming it after a crash; ``on_progress`` is called while it works.
+
+    What ``on_progress`` raises kills the detector and ends the run.
+    """
     for attempt in range(1, INFERENCE_MAX_ATTEMPTS + 1):
         with log_path.open("ab") as log:
             process = subprocess.Popen(detector_cmd, cwd=repo_dir, stdout=log, stderr=log)
-            while process.poll() is None:
-                time.sleep(poll_seconds)
-                if process.poll() is None:
-                    on_progress()
+            try:
+                while process.poll() is None:
+                    time.sleep(poll_seconds)
+                    if process.poll() is None:
+                        on_progress()
+            except BaseException:
+                # The run is stopped (cancelled, the worker shuts down): the detector goes with it.
+                process.kill()
+                process.wait()
+                raise
         if process.returncode == 0:
             return
         logger.warning(
@@ -280,31 +404,38 @@ def _run_detector(
     raise RuntimeError(f"OpenVINO inference failed with exit code {process.returncode}: {tail}")
 
 
-@celery_app.task(name="inference.process_uploaded_video")
-def process_uploaded_video(
-    project_id: str, user_id: str, file_path: str, file_url: str, action_model: str | None = None
-) -> dict[str, str | bool]:
+def is_url(video: str) -> bool:
+    return urlparse(video).scheme in {"http", "https"}
+
+
+def run_video_pipeline(
+    video: str,
+    target_video_dir: Path,
+    action_model: str | None,
+    on_rallies: Callable[[list[str], bool], None],
+    on_progress: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     """Detection, then rallies with their touches, then the types of the actions.
 
-    The detector streams its predictions into ``predictions.jsonl``. While it runs,
-    the rallies that are already final are found window by window and added to the
-    project; the end line of the JSONL is the flag that the last frame is done.
-    A run that died goes on from where it stopped; a finished detection with the
-    same model is not repeated, only the rallies are found again.
-    """
-    parsed = urlparse(file_url)
-    if parsed.scheme not in {"http", "https"}:
-        _queue_status_update(project_id, user_id, "new")
-        raise ValueError("file_url must start with http:// or https://")
+    ``video`` is a local file or an http(s) URL (an outside node reads the portal's
+    video over the network); everything goes to ``target_video_dir``, which holds
+    ``court.json``. The detector streams its predictions into ``predictions.jsonl``.
+    While it runs, the rallies that are already final are found window by window and
+    handed to ``on_rallies(file_names, reset)``; the end line of the JSONL is the flag
+    that the last frame is done. A run that died goes on from where it stopped; a
+    finished detection with the same model is not repeated, only the rallies are found
+    again. ``on_progress`` is called while the detector works; what it raises stops
+    the detector.
 
-    video_path = Path(file_path).resolve()
-    if not video_path.exists():
-        _queue_status_update(project_id, user_id, "new")
-        raise FileNotFoundError(f"Video file not found: {video_path}")
+    Raises when the detection fails; a failed classifier is only reported in ``error``.
+    """
+    if not is_url(video):
+        video = str(Path(video).resolve())
+        if not Path(video).exists():
+            raise FileNotFoundError(f"Video file not found: {video}")
 
     repo_dir = Path(os.getenv("INFERENCE_REPO_DIR", "/app")).resolve()
     if not repo_dir.exists():
-        _queue_status_update(project_id, user_id, "new")
         raise FileNotFoundError(f"Inference repo not found: {repo_dir}")
 
     model_xml = Path(
@@ -314,7 +445,6 @@ def process_uploaded_video(
         )
     ).resolve()
     if not model_xml.exists():
-        _queue_status_update(project_id, user_id, "new")
         raise FileNotFoundError(f"Detector model not found: {model_xml}")
     # An .onnx release runs on ONNX Runtime (CUDA in the GPU image), an .xml on OpenVINO.
     detector_script = (
@@ -327,17 +457,15 @@ def process_uploaded_video(
     # The action classifier stays on OpenVINO (CPU only); the detector may run elsewhere.
     detector_device = os.getenv("INFERENCE_DETECTOR_DEVICE", device)
     frame_step = os.getenv("INFERENCE_FRAME_STEP", "2")
-    target_video_dir = video_path.parent / video_path.stem
     target_video_dir.mkdir(parents=True, exist_ok=True)
 
     # Rally detection needs the court homography: do not start without markup.
     court_json = target_video_dir / "court.json"
     if not court_json.exists():
-        _queue_status_update(project_id, user_id, "new")
         raise FileNotFoundError(f"Court markup is required before processing: {court_json}")
 
-    video_width, video_height = _resolve_video_size(video_path)
-    fps = _resolve_video_fps(video_path)
+    video_width, video_height = _resolve_video_size(video)
+    fps = _resolve_video_fps(video)
     beach = os.getenv("INFERENCE_BEACH", "false").lower() in {"1", "true", "yes", "on"}
     tracks_dir = target_video_dir / "tracks"
     predictions = target_video_dir / JSONL_NAME
@@ -352,7 +480,7 @@ def process_uploaded_video(
             "--court_json_path",
             str(court_json),
             "--output_dir",
-            str(video_path.parent),
+            str(target_video_dir.parent),
             "--tracks_dir",
             str(window_dir),
             "--frame_start",
@@ -378,71 +506,68 @@ def process_uploaded_video(
 
     hot = HotTracks(target_video_dir, fps, run_window)
     reused = _completed_detection(target_video_dir, model_xml, frame_step)
-    resumed = reused is None and _resumable_detection(predictions, model_xml, video_path, frame_step)
+    resumed = reused is None and _resumable_detection(predictions, model_xml, video, frame_step)
     predictions_in_use = reused or predictions
     if not resumed:
         # A new run: the rallies of the earlier one go as soon as it starts.
         hot.reset()
-        _queue_rallies(project_id, user_id, [], reset=True)
+        on_rallies([], True)
     if reused is None:
         # The detection is redone: earlier predictions would be taken for its result.
         for stale in (target_video_dir / "predictions.jsonl.gz", target_video_dir / "predictions.json"):
             stale.unlink(missing_ok=True)
     logger.info(
-        "Processing project=%s: detection %s",
-        project_id,
+        "Processing %s: detection %s",
+        target_video_dir,
         "reused" if reused else "resumed" if resumed else "started",
     )
 
     def commit_ready() -> None:
         """Called while the detector runs: adds the rallies that are already final."""
+        if on_progress is not None:
+            on_progress()
         if not INFERENCE_HOT_TRACKS or not predictions.is_file():
             return
         try:
             last_frame = read_meta(predictions)["last_frame"]
             if hot.due(last_frame):
-                _queue_rallies(project_id, user_id, hot.advance(last_frame))
+                on_rallies(hot.advance(last_frame), False)
         except Exception:
             # The final pass at the end covers whatever a window missed.
-            logger.exception("Hot track window failed for project=%s", project_id)
+            logger.exception("Hot track window failed for %s", target_video_dir)
 
-    try:
-        if reused is None:
-            detector_cmd = [
-                "uv",
-                "run",
-                detector_script,
-                str(video_path),
-                "--model",
-                str(model_xml),
-                "--output",
-                str(predictions),
-                "--resume",
-                "--frame-step",
-                frame_step,
-                "--device",
-                detector_device,
-            ]
-            logger.info("Running inference command: %s", " ".join(detector_cmd))
-            _run_detector(detector_cmd, repo_dir, target_video_dir / "detector.log", commit_ready, HOT_POLL_SECONDS)
-        meta = read_meta(predictions_in_use)
-        if not meta.get("complete"):
-            raise RuntimeError(f"Predictions are not complete: {predictions_in_use}")
-        normalized_csv = target_video_dir / "ball.csv"
-        _predictions_json_to_ball_csv(predictions_in_use, normalized_csv)
-        _queue_rallies(project_id, user_id, hot.advance(int(meta["last_frame"]), final=True))
-    except Exception:
-        _queue_status_update(project_id, user_id, "new")
-        raise
+    if reused is None:
+        detector_cmd = [
+            "uv",
+            "run",
+            detector_script,
+            video,
+            "--model",
+            str(model_xml),
+            "--output",
+            str(predictions),
+            "--resume",
+            "--frame-step",
+            frame_step,
+            "--device",
+            detector_device,
+        ]
+        logger.info("Running inference command: %s", " ".join(detector_cmd))
+        _run_detector(detector_cmd, repo_dir, target_video_dir / "detector.log", commit_ready, HOT_POLL_SECONDS)
+    meta = read_meta(predictions_in_use)
+    if not meta.get("complete"):
+        raise RuntimeError(f"Predictions are not complete: {predictions_in_use}")
+    normalized_csv = target_video_dir / "ball.csv"
+    _predictions_json_to_ball_csv(predictions_in_use, normalized_csv)
+    on_rallies(hot.advance(int(meta["last_frame"]), final=True), False)
 
-    # The actions are typed by the classifier over all the rallies at once; the API
-    # re-types the touches it added and releases the project.
+    # The actions are typed by the classifier over all the rallies at once.
     error: str | None = None
     if os.getenv("INFERENCE_CLASSIFY_ACTIONS", "true").lower() in {"1", "true", "yes", "on"}:
         try:
-            _run_contact_classification(repo_dir, video_path, predictions_in_use, tracks_dir, device, action_model)
+            _run_contact_classification(repo_dir, video, predictions_in_use, tracks_dir, device, action_model)
         except Exception as exc:
-            logger.exception("Actions classification failed for project=%s", project_id)
+            logger.exception("Actions classification failed for %s", target_video_dir)
             error = str(exc)
     if predictions_in_use == predictions:
         # Nothing reads the plain file any more: about a third of it gzipped.
@@ -450,9 +575,43 @@ def process_uploaded_video(
             predictions_in_use = pack(predictions)
         except OSError:
             logger.exception("Failed to pack %s", predictions)
+    return {
+        "predictions": predictions_in_use,
+        "ball_csv": normalized_csv,
+        "tracks_dir": tracks_dir,
+        "error": error,
+    }
+
+
+@celery_app.task(name="inference.process_uploaded_video")
+def process_uploaded_video(
+    project_id: str, user_id: str, file_path: str, file_url: str, action_model: str | None = None
+) -> dict[str, str | bool]:
+    """The pipeline (``run_video_pipeline``) over a video of the shared uploads directory.
+
+    The rallies go to the API as they are found; at the end the API re-types the
+    touches it added and releases the project.
+    """
+    parsed = urlparse(file_url)
+    if parsed.scheme not in {"http", "https"}:
+        _queue_status_update(project_id, user_id, "new")
+        raise ValueError("file_url must start with http:// or https://")
+
+    video_path = Path(file_path).resolve()
+    try:
+        result = run_video_pipeline(
+            str(video_path),
+            video_path.parent / video_path.stem,
+            action_model,
+            lambda file_names, reset: _queue_rallies(project_id, user_id, file_names, reset),
+        )
+    except Exception:
+        _queue_status_update(project_id, user_id, "new")
+        raise
+
     celery_app.send_task(
         API_REFRESH_ACTIONS_TASK_NAME,
-        args=[project_id, user_id, error],
+        args=[project_id, user_id, result["error"]],
         kwargs={"context": "detection"},
         queue=API_IMPORT_TASK_QUEUE,
     )
@@ -462,10 +621,10 @@ def process_uploaded_video(
         "file_path": str(video_path),
         "file_url": file_url,
         "exists": video_path.exists(),
-        "predictions": str(predictions_in_use),
-        "ball_csv": str(normalized_csv),
-        "tracks_dir": str(tracks_dir),
-        "tracks_exists": tracks_dir.exists(),
+        "predictions": str(result["predictions"]),
+        "ball_csv": str(result["ball_csv"]),
+        "tracks_dir": str(result["tracks_dir"]),
+        "tracks_exists": result["tracks_dir"].exists(),
     }
 
 
@@ -559,12 +718,15 @@ def make_reels_task(
                     video_path=str(video_path),
                     track_payload=track_payloads[0],
                     output_path=str(output_path),
+                    predictions_path=item.get("predictions_path"),
                 )
             else:
                 crop_and_save_track_payloads(
                     video_path=str(video_path),
                     track_payloads=track_payloads,
                     output_path=str(output_path),
+                    fade_transition=bool(item.get("fade_transition")),
+                    predictions_path=item.get("predictions_path"),
                 )
             web_output_path = reels_dir / f"{reel_id}_web.mp4"
             ffmpeg_cmd = [
