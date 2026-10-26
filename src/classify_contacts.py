@@ -29,8 +29,10 @@ import numpy as np
 import openvino as ov
 
 try:
+    from .frame_seek import SeekingReader, seek_enabled
     from .predictions_io import iter_frames
 except ImportError:
+    from frame_seek import SeekingReader, seek_enabled
     from predictions_io import iter_frames
 
 LOG = logging.getLogger(__name__)
@@ -211,13 +213,15 @@ def iter_clips(
 ) -> Iterator[tuple[int, np.ndarray]]:
     """RGB clips ``(centre frame, [T, S, S, 3])`` of ``plans``, in one sequential pass.
 
-    Frames are decoded in order (seeking is not frame-accurate); a window that
-    sticks out of the video repeats the edge frame, as in training. A clip is
-    handed over as soon as its last frame is read and is not kept: the clips of a
-    whole match do not fit into memory.
+    Frames are decoded in order; with ``INFERENCE_VIDEO_SEEK`` the reader seeks to the
+    keyframe before each window instead of decoding everything in between
+    (``frame_seek.SeekingReader``). A window that sticks out of the video repeats the
+    edge frame, as in training. A clip is handed over as soon as its last frame is
+    read and is not kept: the clips of a whole match do not fit into memory.
     """
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
     last = max(total - 1, 0)
     length = 2 * half_window + 1
     # frame -> (centre, position in the clip) for every clip that needs the frame
@@ -227,24 +231,32 @@ def iter_clips(
             wanted[min(max(frame, 0), last)].append((center, position))
     crops: dict[int, list[Optional[np.ndarray]]] = {}
 
-    index = 0
-    final = max(wanted, default=-1)
-    try:
-        while index <= final and cap.grab():
-            if index in wanted:
-                ok, image = cap.retrieve()
-                if not ok:
-                    break
-                for center, position in wanted[index]:
-                    x0, y0, side = plans[center]
-                    clip = crops.setdefault(center, [None] * length)
-                    clip[position] = crop_square(image, x0, y0, side, stored_size)[:, :, ::-1]
-                for center in {center for center, _ in wanted[index]}:
-                    if all(crop is not None for crop in crops[center]):
-                        yield center, np.stack(crops.pop(center))
-            index += 1
-    finally:
-        cap.release()
+    def frame_source() -> Iterator[tuple[int, np.ndarray]]:
+        if seek_enabled():
+            yield from SeekingReader(video_path).frames(wanted)
+            return
+        cap = cv2.VideoCapture(video_path)
+        index = 0
+        final = max(wanted, default=-1)
+        try:
+            while index <= final and cap.grab():
+                if index in wanted:
+                    ok, image = cap.retrieve()
+                    if not ok:
+                        break
+                    yield index, image
+                index += 1
+        finally:
+            cap.release()
+
+    for index, image in frame_source():
+        for center, position in wanted[index]:
+            x0, y0, side = plans[center]
+            clip = crops.setdefault(center, [None] * length)
+            clip[position] = crop_square(image, x0, y0, side, stored_size)[:, :, ::-1]
+        for center in {center for center, _ in wanted[index]}:
+            if all(crop is not None for crop in crops[center]):
+                yield center, np.stack(crops.pop(center))
 
 
 def read_clips(

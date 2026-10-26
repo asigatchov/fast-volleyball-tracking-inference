@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from urllib.parse import urlparse
@@ -450,6 +451,149 @@ class PlayerHysteresis:
         return output
 
 
+# Limited (TV) range luma -> the full range OpenCV's YUV->BGR conversion yields; a grey model
+# fed the Y plane straight from the decoder must see the same scale as the BGR->grey path.
+_TV_TO_FULL_LUT = np.clip((np.arange(256) - 16) * 255.0 / 219.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+class YuvFrame:
+    """A decoded 4:2:0 frame (``i420`` planar or ``nv12`` from NVDEC): the Y plane for grey
+    models, BGR made only when asked for."""
+
+    __slots__ = ("buffer", "width", "height", "limited_range", "layout")
+
+    def __init__(self, buffer: np.ndarray, width: int, height: int, limited_range: bool, layout: str = "i420") -> None:
+        self.buffer = buffer
+        self.width = width
+        self.height = height
+        self.limited_range = limited_range
+        self.layout = layout
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (self.height, self.width, 3)
+
+    @property
+    def y(self) -> np.ndarray:
+        return self.buffer[: self.width * self.height].reshape(self.height, self.width)
+
+    def bgr(self) -> np.ndarray:
+        code = cv2.COLOR_YUV2BGR_NV12 if self.layout == "nv12" else cv2.COLOR_YUV2BGR_I420
+        return cv2.cvtColor(self.buffer.reshape(self.height * 3 // 2, self.width), code)
+
+
+def to_bgr(frame: "np.ndarray | YuvFrame") -> np.ndarray:
+    return frame.bgr() if isinstance(frame, YuvFrame) else frame
+
+
+def _color_range(source: str) -> str:
+    """``tv`` / ``pc`` / ``unknown`` as ffprobe reports the first video stream."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=color_range",
+             "-of", "csv=p=0", source],
+            capture_output=True, text=True, timeout=60, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return out or "unknown"
+
+
+class FfmpegYuvSource:
+    """Frames decoded by an ffmpeg process as yuv420p, read over a pipe.
+
+    OpenCV's ``read()`` converts every full-size frame to BGR; this hands over the raw
+    planes and leaves the conversion to the few places that need colour (``YuvFrame.bgr``).
+    The subset of ``cv2.VideoCapture`` the detector loop uses: ``isOpened``, ``get``,
+    ``grab``, ``read``, ``release``.
+
+    ``hwaccel="cuda"`` decodes on the NVIDIA card (NVDEC, ``-hwaccel cuda``) and downloads
+    the frames as ``nv12``; the CPU then only resizes the Y plane. Needs ``libnvcuvid`` from
+    the host driver: in Docker ``NVIDIA_DRIVER_CAPABILITIES`` must include ``video``.
+    """
+
+    def __init__(self, source: str, threads: int = 0, hwaccel: str = "none") -> None:
+        probe = cv2.VideoCapture(source)
+        self.fps = float(probe.get(cv2.CAP_PROP_FPS) or 0.0)
+        self.width = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.frame_count = int(probe.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        probe.release()
+        self.limited_range = _color_range(source) != "pc"
+        self.hwaccel = hwaccel if hwaccel and hwaccel != "none" else None
+        # NVDEC hands over nv12 (interleaved chroma); asking for yuv420p would add a conversion.
+        self.layout = "nv12" if self.hwaccel else "i420"
+        self._size = self.width * self.height * 3 // 2
+        self._process: subprocess.Popen | None = None
+        if self.width and self.height:
+            decode = ["-hwaccel", self.hwaccel] if self.hwaccel else ["-threads", str(threads)]
+            self._process = subprocess.Popen(
+                ["ffmpeg", "-v", "error", "-nostdin", *decode, "-i", source, "-map", "0:v:0",
+                 "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "nv12" if self.hwaccel else "yuv420p", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+            )
+
+    def isOpened(self) -> bool:
+        return self._process is not None
+
+    def get(self, prop: int) -> float:
+        return {
+            cv2.CAP_PROP_FPS: self.fps,
+            cv2.CAP_PROP_FRAME_WIDTH: float(self.width),
+            cv2.CAP_PROP_FRAME_HEIGHT: float(self.height),
+            cv2.CAP_PROP_FRAME_COUNT: float(self.frame_count),
+        }.get(prop, 0.0)
+
+    _returned_any = False
+
+    def _next(self) -> np.ndarray | None:
+        if self._process is None or self._process.stdout is None:
+            return None
+        buffer = np.empty(self._size, dtype=np.uint8)
+        view = memoryview(buffer)
+        filled = 0
+        while filled < self._size:
+            got = self._process.stdout.readinto(view[filled:])
+            if not got:
+                return None
+            filled += got
+        self._returned_any = True
+        return buffer
+
+    def grab(self) -> bool:
+        if self._next() is None:
+            self._check_failure()
+            return False
+        return True
+
+    def read(self) -> tuple[bool, YuvFrame | None]:
+        buffer = self._next()
+        if buffer is None:
+            self._check_failure()
+            return False, None
+        return True, YuvFrame(buffer, self.width, self.height, self.limited_range, self.layout)
+
+    def _check_failure(self) -> None:
+        """An ffmpeg that died before the first frame (no NVDEC, bad file) must not look like an empty video."""
+        if self._process is None or self._process.stderr is None:
+            return
+        code = self._process.wait()
+        message = self._process.stderr.read().decode("utf-8", "replace").strip()
+        if code and not self._returned_any:
+            raise RuntimeError(f"ffmpeg decoder failed (exit {code}): {message[-1500:]}")
+        if message:
+            print(f"ffmpeg: {message[-1500:]}", file=sys.stderr)
+
+    def release(self) -> None:
+        if self._process is not None:
+            for stream in (self._process.stdout, self._process.stderr):
+                if stream is not None:
+                    stream.close()
+            self._process.kill()
+            self._process.wait()
+            self._process = None
+
+
 class RavelVBOpenVINO:
     def __init__(
         self,
@@ -515,8 +659,11 @@ class RavelVBOpenVINO:
             self.ball_width = self.ball_height = 0.0
         self.outputs = {name: compiled.output(name) for name in output_names}
 
-    def preprocess(self, bgr: np.ndarray) -> np.ndarray:
+    def preprocess(self, frame: "np.ndarray | YuvFrame") -> np.ndarray:
         """Кадр -> тензор модели: размер, число каналов и шкала [0, 1].
+
+        ``YuvFrame`` (reader ``ffmpeg``) с серой моделью: берётся плоскость Y без
+        конверсии в BGR, с переводом TV-диапазона в полный, как делает OpenCV.
 
         Уменьшение идёт через ``INTER_AREA`` -- тем же способом, каким нарезаны
         кадры обучающего датасета; при увеличении area не годится, и тогда
@@ -525,6 +672,16 @@ class RavelVBOpenVINO:
         """
         width = int(self.config["image_width"])
         height = int(self.config["image_height"])
+        if isinstance(frame, YuvFrame) and int(self.config["input_channels"]) == 1:
+            plane = frame.y
+            shrinking = width <= plane.shape[1] and height <= plane.shape[0]
+            grey = cv2.resize(
+                plane, (width, height), interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
+            )
+            if frame.limited_range:
+                grey = cv2.LUT(grey, _TV_TO_FULL_LUT)
+            return np.ascontiguousarray(grey[None].astype(np.float32) / 255.0)
+        bgr = to_bgr(frame)
         shrinking = width <= bgr.shape[1] and height <= bgr.shape[0]
         resized = cv2.resize(
             bgr,
@@ -740,6 +897,23 @@ def parse_args(
     parser.add_argument("--warmup-runs", type=int, default=3)
     parser.add_argument("--num-threads", type=int, default=0)
     parser.add_argument(
+        "--reader",
+        choices=("opencv", "ffmpeg"),
+        default=os.getenv("INFERENCE_READER", "opencv"),
+        help="opencv: cv2.VideoCapture, every frame converted to BGR; "
+        "ffmpeg: yuv420p over a pipe, the grey model reads the Y plane (no conversion)",
+    )
+    parser.add_argument(
+        "--decode-threads", type=int, default=int(os.getenv("INFERENCE_DECODE_THREADS", "0")),
+        help="ffmpeg decoder threads for --reader ffmpeg (0: auto)",
+    )
+    parser.add_argument(
+        "--decode-hwaccel",
+        choices=("none", "cuda"),
+        default=os.getenv("INFERENCE_DECODE_HWACCEL", "none"),
+        help="hardware decoder for --reader ffmpeg: cuda = NVDEC (needs the video capability of the NVIDIA driver)",
+    )
+    parser.add_argument(
         "--device",
         choices=("CPU", "GPU", "AUTO"),
         default=default_device,
@@ -853,7 +1027,11 @@ def main(
     for _ in range(args.warmup_runs):
         model.infer(warmup)
 
-    capture = cv2.VideoCapture(video_source)
+    capture = (
+        FfmpegYuvSource(video_source, args.decode_threads, args.decode_hwaccel)
+        if args.reader == "ffmpeg"
+        else cv2.VideoCapture(video_source)
+    )
     if not capture.isOpened():
         raise ValueError(f"cannot open video: {video_source}")
     fps = float(capture.get(cv2.CAP_PROP_FPS)) or 30.0
@@ -1076,7 +1254,7 @@ def main(
             if not ok:
                 break
             if show_active:
-                show_frames[frame_index] = bgr.copy()
+                show_frames[frame_index] = to_bgr(bgr).copy()
             # ``--frame-step`` выбрасывает кадры до сборки клипа: сеть видит те
             # же девять слотов, растянутые на большее время, а у невыбранного
             # кадра предсказаний нет вовсе.
@@ -1139,6 +1317,8 @@ def main(
             total / max(pipeline_elapsed, 1e-9), 3
         ),
         "device": model.device,
+        "reader": args.reader,
+        "decode_hwaccel": args.decode_hwaccel if args.reader == "ffmpeg" else None,
     }
     if output_handle is not None:
         # The explicit flag for the readers: the video is over, nothing more will come.

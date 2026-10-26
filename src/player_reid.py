@@ -26,9 +26,11 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 try:
+    from .frame_seek import SeekingReader, seek_enabled
     from .jersey_numbers import decide_number
     from .predictions_io import iter_frames
 except ImportError:
+    from frame_seek import SeekingReader, seek_enabled
     from jersey_numbers import decide_number
     from predictions_io import iter_frames
 
@@ -203,8 +205,11 @@ def _track_views(
 
 
 def _read_frames(video_path: str, frames: Iterable[int]) -> Iterable[tuple[int, np.ndarray]]:
-    """BGR images of ``frames``, decoded in one sequential pass (seeking is not frame-accurate)."""
+    """BGR images of ``frames`` in order: one sequential pass, or keyframe seeks with ``INFERENCE_VIDEO_SEEK``."""
     wanted = set(frames)
+    if seek_enabled():
+        yield from SeekingReader(video_path).frames(wanted)
+        return
     final = max(wanted, default=-1)
     cap = cv2.VideoCapture(video_path)
     index = 0
