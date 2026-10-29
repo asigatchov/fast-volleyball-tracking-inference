@@ -7,8 +7,11 @@ clustered into ``k`` identities under one rule: two people seen at the same mome
 different players (each moment is a Hungarian assignment to the cluster centres). Track ids
 mean nothing across rallies, so they are not used for the clustering.
 
+The clusters are not players: a cluster that mixes two alike people was a pain to clean up. They
+only group the actions the user sorts by hand (``clusters``: frame -> group 1..k, the biggest
+first); the players come from the jersey numbers read, or the user makes them.
+
 Out: ``<out_dir>/players.json`` and a crop of the actor per action, ``<out_dir>/<frame>.jpg``.
-Players are numbered 1..k, the one with the most actions first.
 
     uv run src/player_reid.py VIDEO PREDICTIONS COURT_JSON ACTIONS_JSON OUT_DIR [--k 12] [--side near]
 """
@@ -38,7 +41,10 @@ REID_HEIGHT, REID_WIDTH = 256, 128
 # OSNet (torchreid) wants RGB 0..1 normalised by ImageNet; the Open Model Zoo models take BGR 0..255 as is.
 REID_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 REID_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-CROP_HEIGHT = 160
+# The crop shown for an action in the players dialog: the whole box with a margin, tall enough
+# to tell players apart by eye (faces, hair, shoes), not only by the number.
+CROP_HEIGHT = 320
+CROP_PAD = 0.15
 # A person's vector is the mean over his track around the contact (+-0.75 s, every 3rd reported
 # frame: 7 views), not the contact frame alone (blur, arms up, back to the camera). On two
 # hand-sorted matches (206 and 188 actions), the nearest player right / seconds per match:
@@ -269,30 +275,6 @@ def _numbers_by_track(actors: dict[int, dict[str, Any]], read: dict[int, str]) -
     return out
 
 
-# Clusters without a number read are numbered from here: no jersey number is that big.
-UNNAMED_CLUSTER_BASE = 100
-
-
-def _numbers_by_cluster(
-    cluster_of: dict[int, int], known: dict[int, str], min_votes: int = 2, min_share: float = 0.7
-) -> dict[int, str]:
-    """The number of each appearance cluster: the one most of its read actions carry.
-
-    Only with ``min_votes`` reads of that number and ``min_share`` of the cluster's reads: a
-    cluster that mixes two people gets no number, its actions stay a cluster of their own.
-    """
-    votes: dict[int, Counter] = defaultdict(Counter)
-    for frame, number in known.items():
-        if frame in cluster_of:
-            votes[cluster_of[frame]][number] += 1
-    named = {}
-    for cluster_id, counter in votes.items():
-        number, count = counter.most_common(1)[0]
-        if count >= min_votes and count / sum(counter.values()) >= min_share:
-            named[cluster_id] = number
-    return named
-
-
 def assign_players(
     video_path: str,
     predictions_path: str,
@@ -310,20 +292,13 @@ def assign_players(
     appearance_step: int = APPEARANCE_STEP,
     fill_by_appearance: bool = False,
     min_numbered: int = 5,
-    min_votes: int = 2,
-    min_share: float = 0.7,
-    name_clusters: bool = True,
     debug_path: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Players of ``actions`` (``{"frame", "track_id"?, "ball"?: [x, y], "side"?, "rally"?}``) on ``side``; writes players.json.
 
-    Two passes. First every action is clustered by appearance (re-id) into ``k`` players. Then,
-    with ``numbers``, the jersey numbers are read and refine it (``mode: "mixed"``): an action
-    keeps the number read on it (``source: "number"``) or on its track in the rally (``"track"``);
-    the rest take the number of their cluster (``"cluster_number"``) when most of the cluster's
-    reads agree on one (``_numbers_by_cluster``); a cluster without one stays a player numbered
-    from ``UNNAMED_CLUSTER_BASE`` + 1 (``"cluster"``). Any read number is enough for it; without
-    one it is the clusters alone, numbered 1..k (``mode: "cluster"``).
+    Every action is clustered by appearance (re-id) into ``k`` groups (``clusters``: frame ->
+    group 1..k, the one with the most actions first); the groups only order the actions without a
+    player for the user, they never make players.
 
     With ``numbers`` (a ``jersey_numbers.NumberReader``) the jersey number of each actor is read
     on its track (+-``window`` frames, every ``step``-th) and the players are the numbers read
@@ -333,7 +308,8 @@ def assign_players(
     ``fill_by_appearance`` gives it the number it looks like (re-id): in one kit colour that was
     right 4 times of 12 on the first set of 30a64638, against 36 of 38 for the read numbers. When the
     numbers can not be read (``mode: "cluster"``: fewer than ``min_numbered`` and 15% of the
-    actions, e.g. a kit without numbers on the back, and no ``candidates``), the actions are clustered by appearance into ``k`` players numbered 1..k.
+    actions, e.g. a kit without numbers on the back, and no ``candidates``), no action gets a
+    player: the user makes them and fills them with the help of the groups and the likeness hints.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     line = centre_line(court)
@@ -416,7 +392,7 @@ def assign_players(
                 pending.append((person, crop))
         actor = actors.get(frame)
         if actor is not None and "row" in actor:
-            thumb = _crop(image, people[actor["row"]][0][1], pad=0.08)
+            thumb = _crop(image, people[actor["row"]][0][1], pad=CROP_PAD)
             scale = CROP_HEIGHT / max(thumb.shape[0], 1)
             thumb = cv2.resize(thumb, (max(int(thumb.shape[1] * scale), 1), CROP_HEIGHT), interpolation=cv2.INTER_AREA)
             cv2.imwrite(str(out_dir / f"{frame}.jpg"), thumb, [cv2.IMWRITE_JPEG_QUALITY, 88])
@@ -446,33 +422,14 @@ def assign_players(
                 shares[frame] = share
     enough = numbers is not None and (bool(candidates) and len(read) > 0 or len(read) >= max(min_numbered, 0.15 * len(actor_rows)))
 
-    labels, margins = cluster(vectors, [g for g in groups if g], k)
+    labels, _ = cluster(vectors, [g for g in groups if g], k)
     cluster_of = {f: int(labels[row]) for f, row in actor_rows.items()}
     # Number the clusters by how many actions they took, 1 = the most.
     taken = Counter(cluster_of.values())
     order = sorted(range(k), key=lambda c: (-taken.get(c, 0), c))
     rank = {cluster_id: position + 1 for position, cluster_id in enumerate(order)}
 
-    # The clusters cover every action, so any reads may name them (the votes guard each name):
-    # no ``min_numbered`` here, it is for the numbers standing alone.
-    if read and name_clusters:
-        mode = "mixed"
-        by_track = {f: n for f, n in _numbers_by_track(actors, read).items() if f in actor_rows}
-        named = _numbers_by_cluster(cluster_of, {**read, **by_track}, min_votes, min_share)
-        assignments = []
-        for f, row in sorted(actor_rows.items()):
-            c = cluster_of[f]
-            if f in read:
-                item = {"number": read[f], "source": "number", "margin": round(shares[f], 4)}
-            elif f in by_track:
-                item = {"number": by_track[f], "source": "track", "margin": None}
-            elif c in named:
-                item = {"number": named[c], "source": "cluster_number", "margin": round(float(margins[row]), 4)}
-            else:
-                item = {"number": str(UNNAMED_CLUSTER_BASE + rank[c]), "source": "cluster", "margin": round(float(margins[row]), 4)}
-            assignments.append({"frame": f, **item, "crop": f"{f}.jpg"})
-        players = sorted({a["number"] for a in assignments} | {str(c) for c in candidates or []}, key=lambda n: int(n))
-    elif enough:
+    if enough:
         mode = "number"
         by_track = {f: n for f, n in _numbers_by_track(actors, read).items() if f in actor_rows}
         by_look = _numbers_by_appearance(vectors, actor_rows, {**read, **by_track}) if fill_by_appearance else {}
@@ -488,15 +445,13 @@ def assign_players(
         players = sorted({a["number"] for a in assignments} | {str(c) for c in candidates or []}, key=lambda n: int(n))
     else:
         mode = "cluster"
-        assignments = [
-            {"frame": f, "number": str(rank[cluster_of[f]]), "source": "cluster", "margin": round(float(margins[row]), 4), "crop": f"{f}.jpg"}
-            for f, row in sorted(actor_rows.items())
-        ]
-        players = [str(n) for n in range(1, k + 1)]
+        assignments = []
+        players = sorted({str(c) for c in candidates or []}, key=lambda n: int(n))
     assigned = {a["frame"] for a in assignments}
     result = {"mode": mode, "k": k, "side": side, "model": getattr(encoder, "name", ""), "players": players,
               "assignments": assignments, "skipped": [f for f in frames if f not in assigned],
-              "numbersRead": len(read), "people": len(people)}
+              "numbersRead": len(read), "people": len(people),
+              "clusters": {str(f): rank[c] for f, c in sorted(cluster_of.items())}}
     (out_dir / "players.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
     # The actors' vectors: the portal ranks the actions by likeness to the ones sorted by hand.
     save_vectors(out_dir / VECTORS_FILE, {f: vectors[row] for f, row in actor_rows.items()}, getattr(encoder, "name", ""))
@@ -524,9 +479,6 @@ def main() -> None:
     parser.add_argument("--device", default="CPU")
     parser.add_argument("--numbers", action="store_true", help="read the jersey numbers (pose + PP-OCRv6)")
     parser.add_argument("--candidates", nargs="*", default=None, help="the team's numbers")
-    parser.add_argument("--numbers-only", action="store_true", help="no cluster pass: only the actions whose number was read")
-    parser.add_argument("--min-votes", type=int, default=2)
-    parser.add_argument("--min-share", type=float, default=0.7)
     parser.add_argument("--debug", default=None, help="json with the actors' vectors, tracks and reads")
     args = parser.parse_args()
     reader = None
@@ -546,9 +498,6 @@ def main() -> None:
         numbers=reader,
         candidates=args.candidates,
         debug_path=Path(args.debug) if args.debug else None,
-        name_clusters=not args.numbers_only,
-        min_votes=args.min_votes,
-        min_share=args.min_share,
     )
     per_player = defaultdict(int)
     for item in result["assignments"]:

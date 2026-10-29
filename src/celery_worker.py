@@ -241,8 +241,9 @@ def assign_players_task(
     """Sort the actions of one half into players (src/player_reid.py).
 
     With ``read_numbers`` the jersey numbers are read (src/jersey_numbers.py, pose + PP-OCRv6)
-    and become the players, limited to ``candidates`` when given; without them, or when the
-    numbers can not be read, the actions are clustered by appearance (re-id) into ``k`` players.
+    and become the players, limited to ``candidates`` when given. The actions are also grouped
+    by appearance (re-id) into ``k`` groups, which only order the unsorted ones for the user:
+    without numbers read no action gets a player.
 
     ``actions`` come from the API (``frame``, ``track_id``, ``ball``, ``side``); the result is
     ``<project>/players/<run_id>/players.json`` with a crop per action (a directory per run, so
@@ -711,6 +712,14 @@ def make_reels_task(
             if not track_payloads:
                 raise ValueError("No valid track payloads found")
 
+            # "full": the whole frame with the ball arcs of the sets, else the vertical crop.
+            full_frame = item.get("format") == "full"
+            set_trails = [
+                (int(trail[0]), int(trail[1]))
+                for trail in item.get("set_trails") or []
+                if isinstance(trail, (list, tuple)) and len(trail) == 2
+            ] if full_frame else None
+
             file_name = f"{reel_id}.mp4"
             output_path = reels_dir / file_name
             if len(track_payloads) == 1:
@@ -719,6 +728,8 @@ def make_reels_task(
                     track_payload=track_payloads[0],
                     output_path=str(output_path),
                     predictions_path=item.get("predictions_path"),
+                    full_frame=full_frame,
+                    set_trails=set_trails,
                 )
             else:
                 crop_and_save_track_payloads(
@@ -727,6 +738,8 @@ def make_reels_task(
                     output_path=str(output_path),
                     fade_transition=bool(item.get("fade_transition")),
                     predictions_path=item.get("predictions_path"),
+                    full_frame=full_frame,
+                    set_trails=set_trails,
                 )
             web_output_path = reels_dir / f"{reel_id}_web.mp4"
             ffmpeg_cmd = [

@@ -198,3 +198,35 @@ def test_player_mark_keeps_the_actor_when_the_detector_renumbers_it(tmp_path) ->
     )
     marks = make_reels.player_mark_boxes(str(predictions), [{"frame": 30, "track_id": 9}], 10.0, (200, 100))
     assert marks[15] == (24, 10, 44, 60)
+
+
+def test_set_trails_keep_the_sets_inside_the_pieces_in_video_pixels() -> None:
+    track = load_track_from_payload(proxy_track_payload())
+
+    trails = make_reels.set_trail_points([track], [(10, 12), (40, 50)], (1920, 1080))
+
+    # The set at frame 40 is outside the piece 10..12: not in the pool.
+    assert trails == [(10, [(10, 480.0, 270.0), (12, 960.0, 540.0)])]
+
+
+def test_set_trails_draw_only_up_to_the_frame_and_keep_the_last_ten() -> None:
+    points = [(frame, 10.0 + frame, 20.0) for frame in range(0, 5)]
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    make_reels.draw_set_trails(frame, [(0, points)], 0)
+    # One point up to frame 0: no line yet.
+    assert not frame.any()
+
+    make_reels.draw_set_trails(frame, [(0, points)], 4)
+    assert frame[20, 10:15].any()
+
+    trails = [(index, [(index, 50.0, 50.0), (index + 1, 60.0, 50.0)]) for index in range(12)]
+    drawn: list = []
+    original = make_reels.cv2.polylines
+    make_reels.cv2.polylines = lambda img, lines, *args, **kwargs: drawn.append(args[1]) or img
+    try:
+        make_reels.draw_set_trails(np.zeros((100, 100, 3), dtype=np.uint8), trails, 20)
+    finally:
+        make_reels.cv2.polylines = original
+    # Ten arcs: the nine old ones and the two layers of the newest.
+    assert len(drawn) == 11
+    assert drawn[-1] == make_reels.SET_TRAIL_NEWEST_COLOR

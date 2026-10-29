@@ -48,7 +48,7 @@ class PlayerReidTests(unittest.TestCase):
         self.assertEqual(labels[0], labels[4])
         self.assertTrue((margin >= 0).all())
 
-    def test_assign_players_numbers_the_players_and_writes_crops(self):
+    def test_assign_players_groups_by_appearance_and_writes_crops(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             video = str(root / "video.mp4")
@@ -71,12 +71,16 @@ class PlayerReidTests(unittest.TestCase):
                 {"frame": 9, "track_id": 3},  # far side: not ours
             ]
             result = assign_players(video, str(predictions), COURT, actions, root / "players", ColourEncoder(), k=2)
-            numbers = {a["frame"]: a["number"] for a in result["assignments"]}
-            self.assertEqual(numbers[2], numbers[8])
-            self.assertNotEqual(numbers[2], numbers[5])
-            self.assertEqual(numbers[2], "1")  # two actions: the first number
+            # No numbers: nobody gets a player, the actions are only grouped by appearance.
             self.assertEqual(result["mode"], "cluster")
-            self.assertEqual(result["skipped"], [9])
+            self.assertEqual(result["assignments"], [])
+            self.assertEqual(result["players"], [])
+            self.assertEqual(result["skipped"], [2, 5, 8, 9])
+            groups = result["clusters"]
+            self.assertEqual(set(groups), {"2", "5", "8"})
+            self.assertEqual(groups["2"], groups["8"])
+            self.assertNotEqual(groups["2"], groups["5"])
+            self.assertEqual(groups["2"], 1)  # two actions: the first group
             self.assertTrue((root / "players" / "2.jpg").is_file())
             self.assertTrue((root / "players" / "players.json").is_file())
             saved = np.load(root / "players" / "vectors.npz")
@@ -86,21 +90,11 @@ class PlayerReidTests(unittest.TestCase):
             # The numbers on the shirts are read: the players are those numbers, an action whose
             # number was not read stays without a player.
             result = assign_players(video, str(predictions), COURT, actions, root / "numbers", ColourEncoder(), k=2,
-                                    numbers=FakeNumbers({RED: "17", BLUE: None}), window=2, step=1, min_numbered=1,
-                                    name_clusters=False)
+                                    numbers=FakeNumbers({RED: "17", BLUE: None}), window=2, step=1, min_numbered=1)
             self.assertEqual(result["mode"], "number")
             self.assertEqual([(a["frame"], a["number"], a["source"]) for a in result["assignments"]], [(2, "17", "number"), (8, "17", "number")])
             self.assertEqual(result["players"], ["17"])
             self.assertEqual(result["skipped"], [5, 9])
-
-            # Two passes: every action is clustered, the cluster read as 17 is 17, the one nobody's number
-            # was read on stays a player of its own, numbered from 101.
-            result = assign_players(video, str(predictions), COURT, actions, root / "mixed", ColourEncoder(), k=2,
-                                    numbers=FakeNumbers({RED: "17", BLUE: None}), window=2, step=1, min_numbered=1)
-            self.assertEqual(result["mode"], "mixed")
-            self.assertEqual([(a["frame"], a["number"], a["source"]) for a in result["assignments"]],
-                             [(2, "17", "number"), (5, "102", "cluster"), (8, "17", "number")])
-            self.assertEqual(result["skipped"], [9])
 
             # The team's numbers: a read outside them is dropped, the ones not read are still players.
             result = assign_players(video, str(predictions), COURT, actions, root / "candidates", ColourEncoder(), k=2,

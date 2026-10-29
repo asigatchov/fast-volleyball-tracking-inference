@@ -42,6 +42,14 @@ PLAYER_MARK_HOLD_FRAMES = 4
 # Where the detector gave the actor another track id: the box overlapping the last one this much.
 PLAYER_MARK_MIN_OVERLAP = 0.3
 Box = Tuple[float, float, float, float]
+# The full-frame reel draws the ball arcs of the sets: the last SET_TRAIL_POOL started, the newest
+# yellow with a glow, the older ones grey and fainter with age (as the annotate page shows them).
+SET_TRAIL_POOL = 10
+SET_TRAIL_MAX_GAP_FRAMES = 10
+SET_TRAIL_NEWEST_COLOR = (21, 204, 250)
+SET_TRAIL_OLD_COLOR = (240, 232, 226)
+# A set: (its frame, the ball points (frame, x, y) up to the attack).
+SetTrail = Tuple[int, List[Tuple[int, float, float]]]
 
 
 try:
@@ -491,6 +499,75 @@ def draw_player_mark(frame: np.ndarray, box: Box, color: Tuple[int, int, int] = 
     return frame
 
 
+def set_trail_points(
+    tracks: List[Dict],
+    windows: List[Tuple[int, int]],
+    frame_size: Tuple[int, int],
+) -> List[SetTrail]:
+    """The ball points of each set window, in the pixels of the video.
+
+    The points come from the ball tracks of the reel's pieces; a set outside of every piece is
+    left out, so the pool counts only the sets the reel shows.
+    """
+    positions: Dict[int, Tuple[float, float]] = {}
+    for track in tracks:
+        for x, y, frame in scale_track_to_video(track, *frame_size)["positions"]:
+            if x >= 0 and y >= 0:
+                positions[frame] = (x, y)
+    frames = sorted(positions)
+    trails: List[SetTrail] = []
+    for start, end in sorted(windows):
+        if not any(track["start_frame"] <= start <= track["last_frame"] for track in tracks):
+            continue
+        trails.append((start, [(f, *positions[f]) for f in frames if start <= f <= end]))
+    return trails
+
+
+def draw_set_trails(frame: np.ndarray, trails: List[SetTrail], frame_idx: int) -> np.ndarray:
+    """The arcs of the last sets up to ``frame_idx``; the arc of a set in flight ends at it."""
+    started = [trail for trail in trails if trail[0] <= frame_idx][-SET_TRAIL_POOL:]
+    height = frame.shape[0]
+    for index, (_, points) in enumerate(started):
+        # A gap in the track breaks the line.
+        lines: List[List[Tuple[int, int]]] = []
+        last_frame: Optional[int] = None
+        for f, x, y in points:
+            if f > frame_idx:
+                break
+            if last_frame is None or f - last_frame > SET_TRAIL_MAX_GAP_FRAMES:
+                lines.append([])
+            lines[-1].append((int(round(x)), int(round(y))))
+            last_frame = f
+        polylines = [np.array(line, dtype=np.int32) for line in lines if len(line) > 1]
+        if not polylines:
+            continue
+        age = len(started) - 1 - index
+        newest = age == 0
+        width = max(2, int(round(height / (220 if newest else 360))))
+        layers = (
+            [(SET_TRAIL_NEWEST_COLOR, width * 3, 0.35), (SET_TRAIL_NEWEST_COLOR, width, 1.0)]
+            if newest
+            else [(SET_TRAIL_OLD_COLOR, width, max(0.2, 0.7 - age * 0.06))]
+        )
+        # Blend inside the bounding box of the arc only: a full-frame blend per arc is slow.
+        all_points = np.concatenate(polylines)
+        pad = width * 3 + 2
+        x1, y1 = np.maximum(all_points.min(axis=0) - pad, 0)
+        x2, y2 = np.minimum(all_points.max(axis=0) + pad, (frame.shape[1] - 1, height - 1))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        roi = frame[y1:y2 + 1, x1:x2 + 1]
+        shifted = [line - (x1, y1) for line in polylines]
+        for color, thickness, alpha in layers:
+            if alpha >= 1.0:
+                cv2.polylines(roi, shifted, False, color, thickness, cv2.LINE_AA)
+                continue
+            overlay = roi.copy()
+            cv2.polylines(overlay, shifted, False, color, thickness, cv2.LINE_AA)
+            cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0, dst=roi)
+    return frame
+
+
 def crop_and_save_track(
     video_path: str,
     track: Dict,
@@ -507,7 +584,16 @@ def crop_and_save_track(
     fade_duration: float = BLACK_TRANSITION_SECONDS,
     highlights: Optional[List[Dict]] = None,
     predictions_path: Optional[str] = None,
+    full_frame: bool = False,
+    set_trails: Optional[List[Tuple[int, int]]] = None,
+    trail_tracks: Optional[List[Dict]] = None,
 ) -> None:
+    """``full_frame``: the whole frame instead of the vertical crop that follows the ball.
+
+    ``set_trails`` are the (set frame, attack frame) windows whose ball arcs are drawn, with the
+    points from ``trail_tracks`` (the tracks of all pieces of the reel, so the pool of arcs goes
+    on from one piece to the next) or from ``track``.
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Failed to open video: {video_path}")
@@ -523,8 +609,11 @@ def crop_and_save_track(
         raise ValueError("Failed to read first video frame")
 
     frame_height, frame_width = frame.shape[:2]
+    trails = (
+        set_trail_points(trail_tracks or [track], set_trails, (frame_width, frame_height)) if set_trails else []
+    )
     track = scale_track_to_video(track, frame_width, frame_height)
-    crop_width = min(int(frame_height * DEFAULT_CROP_ASPECT_RATIO), frame_width)
+    crop_width = frame_width if full_frame else min(int(frame_height * DEFAULT_CROP_ASPECT_RATIO), frame_width)
     crop_height = frame_height
 
     out = None
@@ -571,6 +660,8 @@ def crop_and_save_track(
 
         if frame_idx in player_marks:
             draw_player_mark(frame, player_marks[frame_idx])
+        if trails:
+            draw_set_trails(frame, trails, frame_idx)
 
         center_x = int(x_smooth[i])
         if margin:
@@ -624,6 +715,9 @@ def crop_and_save_track_payload(
     fade_out: bool = False,
     fade_duration: float = BLACK_TRANSITION_SECONDS,
     predictions_path: Optional[str] = None,
+    full_frame: bool = False,
+    set_trails: Optional[List[Tuple[int, int]]] = None,
+    trail_tracks: Optional[List[Dict]] = None,
 ) -> None:
     track = load_track_from_payload(track_payload)
     crop_and_save_track(
@@ -642,6 +736,9 @@ def crop_and_save_track_payload(
         fade_duration=fade_duration,
         highlights=track_payload.get("highlights"),
         predictions_path=predictions_path,
+        full_frame=full_frame,
+        set_trails=set_trails,
+        trail_tracks=trail_tracks,
     )
 
 
@@ -659,6 +756,8 @@ def crop_and_save_track_payloads(
     fade_transition: bool = False,
     fade_duration: float = BLACK_TRANSITION_SECONDS,
     predictions_path: Optional[str] = None,
+    full_frame: bool = False,
+    set_trails: Optional[List[Tuple[int, int]]] = None,
 ) -> None:
     if not track_payloads:
         raise ValueError("track_payloads must not be empty")
@@ -676,8 +775,12 @@ def crop_and_save_track_payloads(
             margin=margin,
             padding=padding,
             predictions_path=predictions_path,
+            full_frame=full_frame,
+            set_trails=set_trails,
         )
         return
+
+    trail_tracks = [load_track_from_payload(payload) for payload in track_payloads] if set_trails else None
 
     output_target = Path(output_path).resolve()
     output_target.parent.mkdir(parents=True, exist_ok=True)
@@ -702,6 +805,9 @@ def crop_and_save_track_payloads(
                 fade_out=fade_transition and idx < len(track_payloads),
                 fade_duration=fade_duration,
                 predictions_path=predictions_path,
+                full_frame=full_frame,
+                set_trails=set_trails,
+                trail_tracks=trail_tracks,
             )
             segment_files.append(segment_path)
 

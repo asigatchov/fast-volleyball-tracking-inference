@@ -7,7 +7,8 @@ the box reads 7 of 70 instead of 38), reads voted by confidence with single digi
 weight to the two-digit number they are part of -> 38 right, 3 wrong.
 
 Both models run on OpenVINO from ``ov/``:
-- ``yolo26m_pose.xml`` -- end-to-end YOLO pose, [N, 300, 57]: box, score, class, 17 keypoints;
+- ``rtmpose_s_vaa_ft.xml`` -- RTMPose-s top-down (``~/projects/pose``, fine-tuned on players): the
+  person crop warped to 192x256 -> SimCC logits of the 17 COCO keypoints;
 - ``ppocrv6_medium_rec.xml`` + ``.json`` -- PP-OCRv6 text-line recognizer and its characters.
 """
 
@@ -24,7 +25,7 @@ import cv2
 import numpy as np
 
 OV_DIR = Path(__file__).resolve().parents[1] / "ov"
-POSE_XML = OV_DIR / "yolo26m_pose.xml"
+POSE_XML = OV_DIR / "rtmpose_s_vaa_ft.xml"
 OCR_XML = OV_DIR / "ppocrv6_medium_rec.xml"
 DIGITS = re.compile(r"^\d{1,2}$")
 # COCO keypoints: 5/6 shoulders, 11/12 hips.
@@ -40,8 +41,14 @@ def person_crop(image: np.ndarray, box: Box) -> Optional[np.ndarray]:
     return crop if crop.size and crop.shape[0] >= 40 else None
 
 
-def torso_crop(person: np.ndarray, keypoints: np.ndarray, min_conf: float = 0.5) -> Optional[np.ndarray]:
-    """Shoulders-to-hips box of one person crop (``keypoints`` [17, 3] in crop pixels), 15% wider each side."""
+def torso_crop(person: np.ndarray, keypoints: np.ndarray, min_conf: float = 0.3) -> Optional[np.ndarray]:
+    """The number's patch of one person crop (``keypoints`` [17, 3] in crop pixels): from the shoulders
+    down 80% of the way to the hips, 15% wider each side.
+
+    The cut is tight on purpose: the OCR resizes the patch to a 48 px line, so every strip of shorts
+    or space above the shoulders shrinks the digits. On 239 legible crops of four matches the old
+    cut (5% above the shoulders, down to the hips) read digits in 59%, this one in 81%.
+    """
     points = keypoints[TORSO_POINTS]
     if (points[:, 2] < min_conf).any():
         return None
@@ -51,37 +58,61 @@ def torso_crop(person: np.ndarray, keypoints: np.ndarray, min_conf: float = 0.5)
     if width < 8 or height < 12:
         return None
     h, w = person.shape[:2]
-    crop = person[int(max(y0 - 0.05 * height, 0)) : int(min(y1, h)), int(max(x0 - 0.15 * width, 0)) : int(min(x1 + 0.15 * width, w))]
+    crop = person[int(max(y0, 0)) : int(min(y1 - 0.2 * height, h)), int(max(x0 - 0.15 * width, 0)) : int(min(x1 + 0.15 * width, w))]
     return crop if crop.size else None
 
 
 class PoseModel:
-    """YOLO pose on one person crop: the keypoints of the biggest person found, or None."""
+    """RTMPose on one person crop: the keypoints [17, 3] (x, y in crop pixels, SimCC score) of the person it frames.
 
-    def __init__(self, model_xml: Path = POSE_XML, device: str = "CPU", size: int = 320, min_score: float = 0.25) -> None:
+    Top-down: the whole crop is the person's box (``person_crop`` already adds the margins), padded
+    by ``padding`` and warped to the model input as mmpose does. SimCC scores run lower than YOLO's
+    keypoint confidences (a clear torso point sits at 0.3-0.6), hence the lower ``torso_crop`` threshold.
+    """
+
+    # ImageNet statistics on RGB, as the model was trained (mmpose data preprocessor).
+    MEAN = np.array([123.675, 116.28, 103.53], np.float32)
+    STD = np.array([58.395, 57.12, 57.375], np.float32)
+
+    def __init__(self, model_xml: Path = POSE_XML, device: str = "CPU", padding: float = 1.25) -> None:
         import openvino as ov
 
         self._model = ov.Core().compile_model(str(model_xml), device)
-        self.size = size
-        self.min_score = min_score
+        shape = self._model.input(0).shape
+        self.input_size = (int(shape[3]), int(shape[2]))  # (w, h)
+        self.split_ratio = self._model.output(0).shape[2] / self.input_size[0]
+        self.padding = padding
+
+    def _warp(self, h: float, w: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Affine matrix of the box (0, 0, w, h) onto the input, with the box's centre and padded size."""
+        in_w, in_h = self.input_size
+        center = np.array([w / 2, h / 2], np.float32)
+        box_w, box_h = w * self.padding, h * self.padding
+        # The same aspect ratio as the input: the box is widened or heightened, never squeezed.
+        if box_w > box_h * in_w / in_h:
+            box_h = box_w * in_h / in_w
+        else:
+            box_w = box_h * in_w / in_h
+        scale = np.array([box_w, box_h], np.float32)
+        src = np.float32([center, center + [-box_w / 2, 0], center + [0, -box_w / 2]])
+        dst = np.float32([[in_w / 2, in_h / 2], [0, in_h / 2], [in_w / 2, in_h / 2 - in_w / 2]])
+        return cv2.getAffineTransform(src, dst), center, scale
 
     def __call__(self, person_bgr: np.ndarray) -> Optional[np.ndarray]:
         h, w = person_bgr.shape[:2]
-        scale = self.size / max(h, w)
-        nh, nw = max(1, round(h * scale)), max(1, round(w * scale))
-        ph, pw = math.ceil(nh / 32) * 32, math.ceil(nw / 32) * 32
-        canvas = np.full((ph, pw, 3), 114, np.uint8)
-        top, left = (ph - nh) // 2, (pw - nw) // 2
-        canvas[top : top + nh, left : left + nw] = cv2.resize(person_bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        x = canvas[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
-        detections = self._model(np.ascontiguousarray(x))[0][0]  # [300, 57]
-        detections = detections[detections[:, 4] >= self.min_score]
-        if not len(detections):
+        if h < 2 or w < 2:
             return None
-        areas = (detections[:, 2] - detections[:, 0]) * (detections[:, 3] - detections[:, 1])
-        keypoints = detections[int(areas.argmax()), 6:].reshape(17, 3).copy()
-        keypoints[:, 0] = (keypoints[:, 0] - left) / scale
-        keypoints[:, 1] = (keypoints[:, 1] - top) / scale
+        matrix, center, scale = self._warp(h, w)
+        crop = cv2.warpAffine(person_bgr, matrix, self.input_size, flags=cv2.INTER_LINEAR)
+        x = ((crop[:, :, ::-1].astype(np.float32) - self.MEAN) / self.STD).transpose(2, 0, 1)[None]
+        simcc_x, simcc_y = (out[0] for out in self._model(np.ascontiguousarray(x)).values())  # [17, w*r], [17, h*r]
+        px, py = simcc_x.argmax(1) / self.split_ratio, simcc_y.argmax(1) / self.split_ratio
+        scores = np.minimum(simcc_x.max(1), simcc_y.max(1))
+        # Input pixels back to crop pixels: the input covers the padded box around the centre.
+        in_w, in_h = self.input_size
+        keypoints = np.stack(
+            [px / in_w * scale[0] + center[0] - scale[0] / 2, py / in_h * scale[1] + center[1] - scale[1] / 2, scores], 1
+        ).astype(np.float32)
         return keypoints
 
 
