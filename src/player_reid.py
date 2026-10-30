@@ -11,7 +11,9 @@ The clusters are not players: a cluster that mixes two alike people was a pain t
 only group the actions the user sorts by hand (``clusters``: frame -> group 1..k, the biggest
 first); the players come from the jersey numbers read, or the user makes them.
 
-Out: ``<out_dir>/players.json`` and a crop of the actor per action, ``<out_dir>/<frame>.jpg``.
+Out: ``<out_dir>/players.json``, a crop of the actor per action, ``<out_dir>/<frame>.jpg``, and a
+short clip of him around the contact, ``<out_dir>/<frame>.mp4`` (a player standing sideways at the
+contact turns within half a second; the dialog plays it on hover).
 
     uv run src/player_reid.py VIDEO PREDICTIONS COURT_JSON ACTIONS_JSON OUT_DIR [--k 12] [--side near]
 """
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -61,6 +64,13 @@ APPEARANCE_STEP = 6
 # A frame where another player overlaps the box would mix the two people.
 APPEARANCE_MAX_OVERLAP = 0.1
 ENCODE_BATCH = 512
+# The clip of the actor: every 3rd frame from -15 to +15 around the contact (11 frames, 1 s at
+# 30 fps), cut by one window over the whole clip so the picture does not jump, played at 6 fps.
+CLIP_OFFSETS = tuple(range(-15, 16, 3))
+CLIP_FPS = 6
+CLIP_HEIGHT = 320
+# H.264 at this quality was ~7 times smaller than a GIF of the same frames (see clip_formats in the notes).
+CLIP_FORMAT = "mp4"
 VECTORS_FILE = "vectors.npz"
 DEFAULT_MODEL = Path(__file__).resolve().parents[1] / "ov" / "person-reidentification-retail-0287.xml"
 Box = tuple[float, float, float, float]
@@ -210,6 +220,73 @@ def _track_views(
     return views
 
 
+def encode_clip(images: list[np.ndarray], path: Path, fmt: str = CLIP_FORMAT, fps: int = CLIP_FPS) -> None:
+    """Write BGR ``images`` of one size as a looping clip: ``mp4`` (H.264), ``gif`` or ``webp``."""
+    height, width = images[0].shape[:2]
+    codec = {
+        "mp4": ["-c:v", "libx264", "-preset", "slow", "-crf", "28", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+        "gif": ["-vf", "split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4", "-loop", "0"],
+        "webp": ["-c:v", "libwebp_anim", "-quality", "60", "-loop", "0"],
+    }[fmt]
+    command = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", str(fps),
+               "-i", "-", "-an", *codec, str(path)]
+    subprocess.run(command, input=b"".join(np.ascontiguousarray(i).tobytes() for i in images), check=True)
+
+
+class ClipCollector:
+    """Clips of the actors (``actors``: contact frame -> (track, box at the contact)) gathered from one pass over the video.
+
+    ``frames`` are the frames to read; feed each with ``add`` in order, then ``finish``. A clip is
+    written as soon as its last frame went by, so only a few are held in memory.
+    """
+
+    def __init__(self, out_dir: Path, boxes: dict[int, list[tuple[Optional[int], Box]]],
+                 actors: dict[int, tuple[Optional[int], Box]], fmt: str = CLIP_FORMAT) -> None:
+        self.out_dir, self.fmt = out_dir, fmt
+        self.windows: dict[int, Box] = {}
+        self.at: dict[int, list[int]] = defaultdict(list)  # frame -> contacts whose clip shows it
+        for contact, (track, contact_box) in actors.items():
+            seen = [contact_box]
+            for offset in CLIP_OFFSETS:
+                frame = contact + offset
+                if frame < 0:
+                    continue
+                self.at[frame].append(contact)
+                box = next((b for t, b in boxes.get(frame, []) if track is not None and t == track), None)
+                if box is not None:
+                    seen.append(box)
+            x0, y0 = min(b[0] for b in seen), min(b[1] for b in seen)
+            x1, y1 = max(b[2] for b in seen), max(b[3] for b in seen)
+            self.windows[contact] = (x0, y0, x1, y1)
+        self.frames = set(self.at)
+        self.open: dict[int, list[np.ndarray]] = {}
+
+    def add(self, frame: int, image: np.ndarray) -> None:
+        for contact in self.at.get(frame, []):
+            crop = _crop(image, self.windows[contact], pad=CROP_PAD)
+            if not crop.size:
+                continue
+            frames = self.open.setdefault(contact, [])
+            if frames:
+                size = (frames[0].shape[1], frames[0].shape[0])
+            else:
+                # H.264 with 4:2:0 wants even sides.
+                width = max(2, int(round(crop.shape[1] * CLIP_HEIGHT / max(crop.shape[0], 1) / 2)) * 2)
+                size = (width, CLIP_HEIGHT)
+            frames.append(cv2.resize(crop, size, interpolation=cv2.INTER_AREA))
+        for contact in [c for c in self.open if c + CLIP_OFFSETS[-1] <= frame]:
+            self._write(contact)
+
+    def finish(self) -> None:
+        for contact in list(self.open):
+            self._write(contact)
+
+    def _write(self, contact: int) -> None:
+        frames = self.open.pop(contact)
+        if len(frames) >= 2:
+            encode_clip(frames, self.out_dir / f"{contact}.{self.fmt}", self.fmt)
+
+
 def _read_frames(video_path: str, frames: Iterable[int]) -> Iterable[tuple[int, np.ndarray]]:
     """BGR images of ``frames`` in order: one sequential pass, or keyframe seeks with ``INFERENCE_VIDEO_SEEK``."""
     wanted = set(frames)
@@ -275,6 +352,53 @@ def _numbers_by_track(actors: dict[int, dict[str, Any]], read: dict[int, str]) -
     return out
 
 
+def _player_boxes(predictions_path: str, frames: list[int], reach: int) -> dict[int, list[tuple[Optional[int], Box]]]:
+    """The detector's players (track id, box) per frame, from ``reach`` before the first of ``frames`` to after the last."""
+    boxes: dict[int, list[tuple[Optional[int], Box]]] = {}
+    if frames:
+        for frame, items in iter_frames(predictions_path, max(frames[0] - reach, 0), frames[-1] + reach):
+            boxes[frame] = [
+                (item.get("track_id"), tuple(float(v) for v in item["bbox_xyxy"]))
+                for item in items
+                if item.get("class_name") == "player"
+            ]
+    return boxes
+
+
+def _actors(actions: list[dict[str, Any]], boxes: dict[int, list[tuple[Optional[int], Box]]], line, side: str) -> dict[int, dict[str, Any]]:
+    """The actor of each action on ``side``: frame -> index into that frame's players, his track, the rally."""
+    actors: dict[int, dict[str, Any]] = {}
+    for action in actions:
+        frame = int(action["frame"])
+        players = boxes.get(frame, [])
+        index = pick_actor(players, action.get("track_id"), action.get("ball"))
+        # The pipeline's own side of the contact ("near"/"far", it follows the rally) beats the feet of one
+        # frame: a player jumping at the net has them above the centre line.
+        actor_side = action.get("side") or (half_of(players[index][1], line) if index is not None else None)
+        if index is not None and actor_side == side:
+            actors[frame] = {"index": index, "track": players[index][0], "rally": action.get("rally")}
+    return actors
+
+
+def write_actor_clips(
+    video_path: str, predictions_path: str, court: dict[str, Any], actions: list[dict[str, Any]], out_dir: Path,
+    side: str = "near", fmt: str = CLIP_FORMAT, only: Optional[set[int]] = None,
+) -> int:
+    """The clips alone, for a run made before they were written (``only``: the contact frames to do)."""
+    frames = sorted({int(a["frame"]) for a in actions})
+    boxes = _player_boxes(predictions_path, frames, max(-CLIP_OFFSETS[0], CLIP_OFFSETS[-1]))
+    actors = {
+        f: (a["track"], boxes[f][a["index"]][1])
+        for f, a in _actors(actions, boxes, centre_line(court), side).items()
+        if only is None or f in only
+    }
+    clips = ClipCollector(out_dir, boxes, actors, fmt)
+    for frame, image in _read_frames(video_path, clips.frames):
+        clips.add(frame, image)
+    clips.finish()
+    return len(actors)
+
+
 def assign_players(
     video_path: str,
     predictions_path: str,
@@ -293,6 +417,7 @@ def assign_players(
     fill_by_appearance: bool = False,
     min_numbered: int = 5,
     debug_path: Optional[Path] = None,
+    write_clips: bool = True,
 ) -> dict[str, Any]:
     """Players of ``actions`` (``{"frame", "track_id"?, "ball"?: [x, y], "side"?, "rally"?}``) on ``side``; writes players.json.
 
@@ -314,27 +439,10 @@ def assign_players(
     out_dir.mkdir(parents=True, exist_ok=True)
     line = centre_line(court)
     frames = sorted({int(a["frame"]) for a in actions})
-    reach = max(window if numbers is not None else 0, appearance_window)
-    boxes: dict[int, list[tuple[Optional[int], Box]]] = {}
-    if frames:
-        for frame, items in iter_frames(predictions_path, max(frames[0] - reach, 0), frames[-1] + reach):
-            boxes[frame] = [
-                (item.get("track_id"), tuple(float(v) for v in item["bbox_xyxy"]))
-                for item in items
-                if item.get("class_name") == "player"
-            ]
+    reach = max(window if numbers is not None else 0, appearance_window, -CLIP_OFFSETS[0], CLIP_OFFSETS[-1])
+    boxes = _player_boxes(predictions_path, frames, reach)
 
-    # actor of each action (index into that frame's players), and the people of the half per frame
-    actors: dict[int, dict[str, Any]] = {}
-    for action in actions:
-        frame = int(action["frame"])
-        players = boxes.get(frame, [])
-        index = pick_actor(players, action.get("track_id"), action.get("ball"))
-        # The pipeline's own side of the contact ("near"/"far", it follows the rally) beats the feet of one
-        # frame: a player jumping at the net has them above the centre line.
-        actor_side = action.get("side") or (half_of(players[index][1], line) if index is not None else None)
-        if index is not None and actor_side == side:
-            actors[frame] = {"index": index, "track": players[index][0], "rally": action.get("rally")}
+    actors = _actors(actions, boxes, line, side)
     # frames of the actors' tracks where the number is read
     track_frames: dict[int, list[int]] = defaultdict(list)  # frame -> contact frames whose track is read there
     if numbers is not None:
@@ -364,6 +472,10 @@ def assign_players(
         for f, box in views:
             views_at[f].append((person, box))
 
+    clips = ClipCollector(
+        out_dir, boxes, {f: (a["track"], people[a["row"]][0][1]) for f, a in actors.items() if "row" in a}
+    ) if write_clips else None
+
     torsos: list[np.ndarray] = []
     torso_owner: list[int] = []
     sums = np.zeros((len(people), 0), dtype=np.float32)
@@ -379,7 +491,9 @@ def assign_players(
         np.add.at(sums, [person for person, _ in pending], encoded)
         pending.clear()
 
-    for frame, image in _read_frames(video_path, set(views_at) | set(track_frames)):
+    for frame, image in _read_frames(video_path, set(views_at) | set(track_frames) | (clips.frames if clips else set())):
+        if clips is not None:
+            clips.add(frame, image)
         for contact in track_frames.get(frame, []):
             box = next((b for t, b in boxes.get(frame, []) if t == actors[contact]["track"]), None)
             torso = numbers.torso(image, box) if box is not None else None
@@ -399,6 +513,8 @@ def assign_players(
         if len(pending) >= ENCODE_BATCH:
             encode_pending()
     encode_pending()
+    if clips is not None:
+        clips.finish()
 
     if sums.shape[1] == 0:
         sums = np.zeros((len(people), 256), dtype=np.float32)

@@ -322,6 +322,7 @@ def player_vectors_task(
             scratch,
             ReidEncoder(model_xml, os.getenv("INFERENCE_DEVICE", "CPU")),
             side=side,
+            write_clips=False,
         )
         (scratch / VECTORS_FILE).replace(run_dir / VECTORS_FILE)
         (run_dir / "vectors_error.txt").unlink(missing_ok=True)
