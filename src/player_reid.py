@@ -69,7 +69,7 @@ ENCODE_BATCH = 512
 CLIP_OFFSETS = tuple(range(-15, 16, 3))
 CLIP_FPS = 6
 CLIP_HEIGHT = 320
-# H.264 at this quality was ~7 times smaller than a GIF of the same frames (see clip_formats in the notes).
+# On 20 actions of 4f28016c: H.264 ~28 KB a clip, WebP ~50 KB, GIF ~450 KB.
 CLIP_FORMAT = "mp4"
 VECTORS_FILE = "vectors.npz"
 DEFAULT_MODEL = Path(__file__).resolve().parents[1] / "ov" / "person-reidentification-retail-0287.xml"
