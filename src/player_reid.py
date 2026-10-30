@@ -233,6 +233,18 @@ def encode_clip(images: list[np.ndarray], path: Path, fmt: str = CLIP_FORMAT, fp
     subprocess.run(command, input=b"".join(np.ascontiguousarray(i).tobytes() for i in images), check=True)
 
 
+CLIP_MARK_COLOR = (80, 220, 80)  # BGR green
+
+
+def _draw_corners(image: np.ndarray, box: Box, share: float = 0.22, thickness: int = 2) -> None:
+    """Green corners of ``box`` on ``image`` (in place): the box stays visible, the player under it too."""
+    x0, y0, x1, y1 = (int(round(v)) for v in box)
+    length = max(4, int(min(x1 - x0, y1 - y0) * share))
+    for x, y, dx, dy in ((x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)):
+        cv2.line(image, (x, y), (x + dx * length, y), CLIP_MARK_COLOR, thickness, cv2.LINE_AA)
+        cv2.line(image, (x, y), (x, y + dy * length), CLIP_MARK_COLOR, thickness, cv2.LINE_AA)
+
+
 class ClipCollector:
     """Clips of the actors (``actors``: contact frame -> (track, box at the contact)) gathered from one pass over the video.
 
@@ -245,6 +257,8 @@ class ClipCollector:
         self.out_dir, self.fmt = out_dir, fmt
         self.windows: dict[int, Box] = {}
         self.at: dict[int, list[int]] = defaultdict(list)  # frame -> contacts whose clip shows it
+        # The actor's box in each frame of his clip, outlined so a box on the wrong player shows.
+        self.marks: dict[tuple[int, int], Box] = {}
         for contact, (track, contact_box) in actors.items():
             seen = [contact_box]
             for offset in CLIP_OFFSETS:
@@ -252,9 +266,15 @@ class ClipCollector:
                 if frame < 0:
                     continue
                 self.at[frame].append(contact)
-                box = next((b for t, b in boxes.get(frame, []) if track is not None and t == track), None)
+                # The detector does not report every frame: the track's box of the nearest one within 2.
+                box = contact_box if offset == 0 else next(
+                    (b for near in (frame, frame - 1, frame + 1, frame - 2, frame + 2)
+                     for t, b in boxes.get(near, []) if track is not None and t == track),
+                    None,
+                )
                 if box is not None:
                     seen.append(box)
+                    self.marks[(contact, frame)] = box
             x0, y0 = min(b[0] for b in seen), min(b[1] for b in seen)
             x1, y1 = max(b[2] for b in seen), max(b[3] for b in seen)
             self.windows[contact] = (x0, y0, x1, y1)
@@ -273,7 +293,15 @@ class ClipCollector:
                 # H.264 with 4:2:0 wants even sides.
                 width = max(2, int(round(crop.shape[1] * CLIP_HEIGHT / max(crop.shape[0], 1) / 2)) * 2)
                 size = (width, CLIP_HEIGHT)
-            frames.append(cv2.resize(crop, size, interpolation=cv2.INTER_AREA))
+            picture = cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
+            box = self.marks.get((contact, frame))
+            if box is not None:
+                # Where _crop put the window's corner, then into the resized picture.
+                x0, y0, x1, y1 = self.windows[contact]
+                left, top = int(max(x0 - (x1 - x0) * CROP_PAD, 0)), int(max(y0 - (y1 - y0) * CROP_PAD, 0))
+                sx, sy = size[0] / crop.shape[1], size[1] / crop.shape[0]
+                _draw_corners(picture, ((box[0] - left) * sx, (box[1] - top) * sy, (box[2] - left) * sx, (box[3] - top) * sy))
+            frames.append(picture)
         for contact in [c for c in self.open if c + CLIP_OFFSETS[-1] <= frame]:
             self._write(contact)
 
