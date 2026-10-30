@@ -64,9 +64,9 @@ APPEARANCE_STEP = 6
 # A frame where another player overlaps the box would mix the two people.
 APPEARANCE_MAX_OVERLAP = 0.1
 ENCODE_BATCH = 512
-# The clip of the actor: every 3rd frame from -15 to +15 around the contact (11 frames, 1 s at
+# The clip of the actor: every 4th frame from -16 to +16 around the contact (9 frames, ~1 s at
 # 30 fps), cut by one window over the whole clip so the picture does not jump, played at 6 fps.
-CLIP_OFFSETS = tuple(range(-15, 16, 3))
+CLIP_OFFSETS = tuple(range(-16, 17, 4))
 CLIP_FPS = 6
 CLIP_HEIGHT = 320
 # On 20 actions of 4f28016c: H.264 ~28 KB a clip, WebP ~50 KB, GIF ~450 KB.
