@@ -6,7 +6,7 @@
 
 High-speed pipeline for volleyball ball detection, rally extraction, and automatic generation of 9:16 reels.
 
-[![src/ball_tracker.py](examples/ball-tracking.jpg)](https://www.youtube.com/watch?v=TBDrTMFMoFA)
+[![RAVEL-VB-013: players + touch](examples/player-touch.gif)](https://youtu.be/1ha7WU9sH2k)
 
 ## Pipeline
 1. `src/inference_onnx_seq_gray_v2.py` -> detects ball and writes `ball.csv` (and optional `predict.mp4`).
@@ -67,6 +67,36 @@ uv run src/make_reels.py \
   --json_dir "$OUT/gtu_20250316_002/tracks" \
   --output_dir "$OUT"
 ```
+
+## Docker + GPU
+
+`Dockerfile.gpu` is `./Dockerfile` with the CPU `onnxruntime` swapped for
+`onnxruntime-gpu` (CUDA 13 + cuDNN 9 arrive as `nvidia-*` wheels, so the base
+image stays `python:3.14-slim`). `docker-compose.gpu.yml` runs the quick start
+step 1 on the GPU:
+
+```bash
+docker compose -f docker-compose.gpu.yml build
+docker compose -f docker-compose.gpu.yml run --rm inference   # detection on the GPU
+docker compose -f docker-compose.gpu.yml run --rm shell       # bash for the rest of the pipeline
+```
+
+`./output` is mounted, so `output/gtu_20250316_002/ball.csv` appears in the repo.
+The startup log confirms the device: `ONNX Runtime 1.29.0, providers:
+['CUDAExecutionProvider', 'CPUExecutionProvider']`.
+
+Host prerequisites - an NVIDIA driver and `nvidia-container-toolkit`, checked with:
+
+```bash
+docker run --rm --gpus all nvidia/cuda:13.0.0-base-ubuntu24.04 nvidia-smi -L
+```
+
+Notes:
+- OpenVINO (`src/inference_player_ball_openvino.py`, `src/classify_contacts.py`,
+  the celery worker) has no NVIDIA backend. In the GPU image it still runs on the
+  CPU plugin: keep `--device CPU` / `INFERENCE_DEVICE=CPU`.
+- `UV_NO_SYNC=1` is set in the image so `uv run` does not swap the GPU build of
+  onnxruntime back to the CPU one pinned in `uv.lock`.
 
 ## Output structure
 ```text
@@ -145,6 +175,10 @@ uv run src/inference_player_ball_openvino.py ./examples/gtu_20250316_002.mp4 \
 # RAVEL-VB-011: v45 dense grid, 1024x576 grayscale, players + ball, ~2.5x faster on CPU
 uv run src/inference_player_ball_openvino.py ./examples/gtu_20250316_002.mp4 \
   --model ./ov/RAVEL-VB-011-9f.xml --output ./demo-result/
+
+# RAVEL-VB-013: RAVEL-VB-012 + touch head, 640x360 RGB, players + ball + heads + who touches the ball
+uv run src/inference_player_ball_openvino.py ./examples/gtu_20250316_002.mp4 \
+  --model ./ov/RAVEL-VB-013-9f.xml --action-threshold 0.5 --output ./demo-result/
 ```
 - `--output` - JSON file or directory (a directory gets `<video>_predictions.json`).
 - `--output-video` - annotated video; `--show` - live window (`Esc`/`q` to stop).
@@ -152,11 +186,18 @@ uv run src/inference_player_ball_openvino.py ./examples/gtu_20250316_002.mp4 \
   player open/close thresholds and how many frames a lost player is held.
 - `--ball-threshold 0.35`, `--head-threshold 0.30` - separate thresholds for the
   ball and head points (heads come only from RAVEL-VB-012).
+- `--action-threshold 0.5` - only for a release with `action_logits` (RAVEL-VB-013,
+  `action_names` `["Touch", "none"]` in the sidecar): a player whose
+  touch probability reaches it gets `action` and `action_score` (in the JSONL they ride
+  in the player's extra dict). A touch lasts several frames around the contact, so the
+  event is the peak of `action_score` along a track; boxes held by the hysteresis
+  (`interpolated`) carry no action. The portal touch check used 0.7.
 - `--stride 9` - clip step; `--frame-step 2` feeds every second frame (faster, coarser).
 - `--device {CPU,GPU,AUTO}`, `--num-threads N`.
 - Input size, channels and clip length are read from the model's sidecar `.json`,
   so any release in `ov/` runs without extra flags. ONNX copies of the same
-  releases are in `models/RAVEL-VB-01{1,2}-9f.onnx`.
+  releases are in `models/RAVEL-VB-01{1,2,3}-9f.onnx`: one release number is one
+  network, whatever the format.
 
 ## Available ONNX models
 Benchmark setup:

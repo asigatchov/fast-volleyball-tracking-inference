@@ -4,9 +4,9 @@
   "model_number": 11,
   "model_name": "RAVEL-VB-011-9f",
   "architecture": "tape_vb6/model_v45.py",
-  "checkpoint": "/home/ubuntu/projects/vb-action/RAVEL-VB/models/RAVEL-VB-011-9f.pt",
-  "checkpoint_source": "/home/ubuntu/projects/vb-action/models/tape_vb6_beach_v45_grid_s16_step2_9f_40ep/best_v45.pt",
-  "checkpoint_epoch": 34,
+  "checkpoint": "/home/ubuntu/projects/vb-action/models/tape_vb6_beach_v45_grid_s16_step2_9f_zoom3_30ep_20261016_074205/best_v45.pt",
+  "checkpoint_source": "/home/ubuntu/projects/vb-action/models/tape_vb6_beach_v45_grid_s16_step2_9f_zoom3_30ep_20261016_074205/best_v45.pt",
+  "checkpoint_epoch": 30,
   "architecture_version": 45,
   "config": {
     "clip_length": 9,
@@ -46,12 +46,22 @@
   ],
   "weights": "FP32",
   "source_snapshot": null,
-  "openvino_xml": "/home/ubuntu/projects/vb-action/RAVEL-VB/models/RAVEL-VB-011-9f.xml",
-  "openvino_bin": "/home/ubuntu/projects/vb-action/RAVEL-VB/models/RAVEL-VB-011-9f.bin",
+  "openvino_xml": "/home/ubuntu/projects/vb-action/out/RAVEL-VB-011-zoom3_export_20261016_115842/ov/RAVEL-VB-011-9f.xml",
+  "openvino_bin": "/home/ubuntu/projects/vb-action/out/RAVEL-VB-011-zoom3_export_20261016_115842/ov/RAVEL-VB-011-9f.bin",
+  "source_modules": [
+    {
+      "path": ".venv/lib/python3.14/site-packages/torch/nn/modules/module.py",
+      "sha256": "56a1fa39f332238e3bad87f431903a875965abef92547afee6356c1390f2b713"
+    },
+    {
+      "path": "tape_vb6/model_v45.py",
+      "sha256": "9b136afc752df4a9f7050a467dff6178cc73db01d50da4f9b0d0e15302262ef3"
+    }
+  ],
   "openvino_max_difference": {
-    "logits": 4.5299530029296875e-06,
-    "boxes": 8.642673492431641e-07,
-    "ball_grid": 1.5735626220703125e-05,
-    "ball_size": 2.2649765014648438e-06
+    "logits": 2.6226043701171875e-06,
+    "boxes": 9.238719940185547e-07,
+    "ball_grid": 9.059906005859375e-06,
+    "ball_size": 2.2351741790771484e-06
   }
 }

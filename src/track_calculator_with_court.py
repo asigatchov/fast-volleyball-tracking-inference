@@ -205,6 +205,12 @@ class TrackCalculatorConfig:
     player_score_threshold: float = DEFAULT_PLAYER_SCORE_THRESHOLD
     ball_score_threshold: float = DEFAULT_BALL_SCORE_THRESHOLD
     use_player_ball: bool = True
+    # A window of the detections (inclusive): the hot processing of a video still
+    # being detected runs the calculator over the new frames only.
+    frame_start: Optional[int] = None
+    frame_end: Optional[int] = None
+    # Where the track files go; by default <output_dir>/<video>/tracks.
+    tracks_dir: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1622,6 +1628,8 @@ class TrackCalculatorWithCourt:
             ball_score_threshold=self.config.ball_score_threshold,
             source_width=self._resolved_video_width(),
             source_height=self._resolved_video_height(),
+            frame_start=self.config.frame_start,
+            frame_end=self.config.frame_end,
         )
         self._build_contact_detector()
 
@@ -2388,8 +2396,9 @@ class TrackCalculatorWithCourt:
         return selected
 
     def _save_tracks_to_json(self) -> list[TrackAnalysisRecord]:
-        video_basename = self._source_basename()
-        tracks_dir = os.path.join(self.config.output_dir, video_basename, "tracks")
+        tracks_dir = self.config.tracks_dir or os.path.join(
+            self.config.output_dir, self._source_basename(), "tracks"
+        )
         os.makedirs(tracks_dir, exist_ok=True)
         for file_name in os.listdir(tracks_dir):
             if file_name.startswith("track_") and file_name.endswith(".json"):
@@ -2537,6 +2546,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Source video height override. If omitted, uses size from court JSON first.",
     )
     parser.add_argument("--beach", action="store_true", help="Use beach volleyball court dimensions")
+    parser.add_argument("--frame_start", type=int, default=None, help="Use the detections from this frame on")
+    parser.add_argument("--frame_end", type=int, default=None, help="Use the detections up to this frame")
+    parser.add_argument("--tracks_dir", type=str, default=None, help="Write the track files here")
     parser.add_argument("--output_dir", type=str, default="output", help="Root output directory for JSON")
     parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help="Frames per second")
     parser.add_argument("--max_distance", type=float, default=DEFAULT_MAX_DISTANCE, help="Max tracking distance")
@@ -2591,6 +2603,9 @@ def main() -> None:
         player_score_threshold=args.player_score_threshold,
         ball_score_threshold=args.ball_score_threshold,
         use_player_ball=not args.no_ball_fill,
+        frame_start=args.frame_start,
+        frame_end=args.frame_end,
+        tracks_dir=args.tracks_dir,
     )
     calculator = TrackCalculatorWithCourt(config)
     calculator.run()

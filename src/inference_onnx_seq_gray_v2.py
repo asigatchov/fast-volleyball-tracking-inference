@@ -20,10 +20,28 @@ from constants import (
 )
 from models import BallTrack
 
-os.environ["LD_LIBRARY_PATH"] = "/opt/apps/venv/lib/python3.12/site-packages/nvidia/cublas/lib:" + os.environ.get(
-    "LD_LIBRARY_PATH", ""
-)
-ort.preload_dlls()
+def _preload_cuda_libs() -> None:
+    """Expose the CUDA/cuDNN libraries of an ``onnxruntime-gpu`` install.
+
+    The nvidia-* wheels drop them into ``site-packages/nvidia/<pkg>/lib``. On a
+    CPU-only install there is no such directory and this is a no-op. The path is
+    resolved for the running interpreter instead of being hardcoded, so the same
+    venv works under any Python version (the python:3.14 GPU image included).
+    """
+    import site
+
+    libs = [
+        str(lib_dir)
+        for site_dir in {*site.getsitepackages(), site.getusersitepackages()}
+        for lib_dir in sorted(Path(site_dir).glob("nvidia/*/lib"))
+        if lib_dir.is_dir()
+    ]
+    if libs:
+        os.environ["LD_LIBRARY_PATH"] = ":".join([*libs, os.environ.get("LD_LIBRARY_PATH", "")])
+    ort.preload_dlls()
+
+
+_preload_cuda_libs()
 
 LOG = logging.getLogger(__name__)
 
@@ -123,6 +141,7 @@ def load_onnx_model(model_path):
     session = ort.InferenceSession(
         model_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
     )
+    LOG.info("ONNX Runtime %s, providers: %s", ort.__version__, session.get_providers())
     input_names = [inp.name for inp in session.get_inputs()]
     output_names = [out.name for out in session.get_outputs()]
     input_shape = session.get_inputs()[0].shape

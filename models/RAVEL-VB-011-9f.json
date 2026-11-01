@@ -8,9 +8,9 @@
     "player",
     "ball"
   ],
-  "checkpoint": "/home/ubuntu/projects/vb-action/models/tape_vb6_beach_v45_grid_s16_step2_9f_40ep/best_v45.pt",
-  "checkpoint_source": "/home/ubuntu/projects/vb-action/models/tape_vb6_beach_v45_grid_s16_step2_9f_40ep/best_v45.pt",
-  "checkpoint_epoch": 34,
+  "checkpoint": "/home/ubuntu/projects/vb-action/models/tape_vb6_beach_v45_grid_s16_step2_9f_zoom3_30ep_20261016_074205/best_v45.pt",
+  "checkpoint_source": "/home/ubuntu/projects/vb-action/models/tape_vb6_beach_v45_grid_s16_step2_9f_zoom3_30ep_20261016_074205/best_v45.pt",
+  "checkpoint_epoch": 30,
   "architecture_version": 45,
   "checkpoint_format": "tape-vb6-grid-v45",
   "config": {
@@ -50,7 +50,7 @@
   ],
   "weights": "FP32",
   "opset": 17,
-  "onnx_path": "/home/ubuntu/projects/vb-action/out/ravel_onnx/RAVEL-VB-011-9f.onnx",
+  "onnx_path": "/home/ubuntu/projects/vb-action/out/RAVEL-VB-011-zoom3_export_20261016_115842/onnx/RAVEL-VB-011-9f.onnx",
   "parameters": 1271802,
   "source_modules": [
     {
@@ -63,9 +63,9 @@
     }
   ],
   "onnxruntime_max_difference": {
-    "logits": 4.0531158447265625e-06,
-    "boxes": 7.897615432739258e-07,
-    "ball_grid": 1.33514404296875e-05,
-    "ball_size": 2.9802322387695312e-06
+    "logits": 4.5299530029296875e-06,
+    "boxes": 1.0132789611816406e-06,
+    "ball_grid": 8.58306884765625e-06,
+    "ball_size": 2.86102294921875e-06
   }
 }

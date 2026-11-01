@@ -9,13 +9,31 @@ v45) и длина клипа берутся из sidecar ``.json``.
 
     uv run python src/inference_player_ball_openvino.py video.mp4 \
         --model ov/RAVEL-VB-012-9f.xml --output ../uploads/mix/
+
+Релиз с головой действия (RAVEL-VB-013: ``ov/RAVEL-VB-013-9f.xml`` и та же сеть
+в ``models/RAVEL-VB-013-9f.onnx`` -- игроки + касание, 9 кадров 640x360) отдаёт ещё ``action_logits`` [B, T, K, C]:
+log-вероятности «этот игрок на этом кадре совершает действие такого типа»,
+последний канал -- «нет действия»; имена каналов -- ``action_names`` sidecar
+(у модели касания ``["Touch", "none"]``). Игрок, у которого лучшее действие не
+слабее ``--action-threshold``, получает поля ``action`` и ``action_score``; в
+JSONL они идут в словаре ``extra`` строки игрока. Касание держится несколько
+кадров вокруг удара (пик на кадре касания), так что событие -- это пик
+``action_score`` вдоль трека. Донесённые гистерезисом рамки (``interpolated``)
+действия не несут.
+
+    uv run python src/inference_player_ball_openvino.py video.mp4 \
+        --model ov/RAVEL-VB-013-9f.xml --action-threshold 0.5 --output out.jsonl
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
+import sys
 import time
+from urllib.parse import urlparse
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
@@ -26,7 +44,15 @@ import openvino as ov
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
+try:
+    from .predictions_io import FIELDS, FORMAT_V1, FORMAT_V3, dump_line, expand_frame, frame_record, iter_records
+except ImportError:
+    from predictions_io import FIELDS, FORMAT_V1, FORMAT_V3, dump_line, expand_frame, frame_record, iter_records
+
 ROOT = Path(__file__).resolve().parent.parent
+# A JSONL run leaves a checkpoint every this many clips (about 30 s of video at the
+# defaults): after a crash the detector redoes at most that much.
+CHECKPOINT_EVERY_CLIPS = 50
 DEFAULT_MODEL = ROOT / "ov" / "RAVEL-VB-012-9f.xml"
 
 # Точки голов -- как в ``infer_tape_vb6_v31``: пики карты ``body_point_logits``
@@ -46,6 +72,10 @@ ZONE_ABOVE = 0.08
 ZONE_BELOW = 0.45
 MATCHED_COLOUR = (0, 220, 0)
 LOOSE_COLOUR = (0, 0, 255)
+# Поля действия в записи игрока; донесённая гистерезисом рамка их теряет.
+ACTION_FIELDS = ("action", "action_score")
+ACTION_THRESHOLD = 0.5
+ACTION_COLOUR = (0, 255, 255)
 
 
 def _box_iou(left: list[float], right: list[float]) -> float:
@@ -178,8 +208,15 @@ def decode_batch(
     max_players: int = 16,
     ball_threshold: float | None = None,
     head_threshold: float = HEAD_THRESHOLD,
+    action_names: list[str] | None = None,
+    action_threshold: float = ACTION_THRESHOLD,
 ) -> list[list[dict]]:
     """Decode the tensor ABI exported with the RAVEL-VB OpenVINO model.
+
+    ``action_names`` -- имена каналов ``action_logits`` (последний -- «нет
+    действия»); работает, только если модель отдаёт ``action_logits``.
+    Игрок получает ``action`` / ``action_score``, когда лучшее действие не
+    слабее ``action_threshold``.
 
     ``ball_threshold`` -- порог мяча; ``None`` оставляет прежнее поведение,
     когда мяч отсекается тем же ``score_threshold``, что и игроки.
@@ -188,6 +225,13 @@ def decode_batch(
     """
     if ball_threshold is None:
         ball_threshold = score_threshold
+    action_probabilities = None
+    if "action_logits" in outputs:
+        # Каналы -- log-вероятности, в сумме по каналам единица: exp даёт их сами.
+        action_probabilities = np.exp(outputs["action_logits"].astype(np.float64))
+        channels = action_probabilities.shape[-1]
+        if action_names is None or len(action_names) != channels:
+            action_names = [*(f"action{index}" for index in range(channels - 1)), "none"]
     results: list[list[dict]] = []
     batch_size, frame_count, query_count = outputs["logits"].shape[:3]
     for batch_index in range(batch_size):
@@ -255,6 +299,12 @@ def decode_batch(
                         record["head_point_norm"] = outputs["head_point_norm"][
                             batch_index, frame_slot, query_index
                         ].tolist()
+                    if action_probabilities is not None:
+                        row = action_probabilities[batch_index, frame_slot, query_index]
+                        best = int(row[:-1].argmax())
+                        if float(row[best]) >= action_threshold:
+                            record["action"] = action_names[best]
+                            record["action_score"] = round(float(row[best]), 3)
                     if include_features:
                         for key in (
                             "head_points",
@@ -354,6 +404,17 @@ class PlayerHysteresis:
         self.tracks: dict[int, dict] = {}
         self.next_track_id = 0
 
+    def state(self) -> dict:
+        """What a resumed run needs to go on with the same track ids."""
+        return {
+            "next_track_id": self.next_track_id,
+            "tracks": [[track_id, state] for track_id, state in self.tracks.items()],
+        }
+
+    def restore(self, state: dict) -> None:
+        self.next_track_id = int(state["next_track_id"])
+        self.tracks = {int(track_id): track for track_id, track in state["tracks"]}
+
     @staticmethod
     def _center_distance(left: list[float], right: list[float]) -> float:
         left_x, left_y = (left[0] + left[2]) / 2, (left[1] + left[3]) / 2
@@ -405,6 +466,9 @@ class PlayerHysteresis:
                 del self.tracks[track_id]
                 continue
             prediction = dict(state["prediction"])
+            # Действие было на том кадре, который рамку донёс, а не на этом.
+            for key in ACTION_FIELDS:
+                prediction.pop(key, None)
             prediction["frame_index"] = frame_index
             prediction["track_id"] = track_id
             prediction["interpolated"] = True
@@ -426,6 +490,159 @@ class PlayerHysteresis:
             self.tracks[track_id] = {"prediction": candidate, "missing": 0}
             output.append(dict(candidate))
         return output
+
+
+# Limited (TV) range luma -> the full range OpenCV's YUV->BGR conversion yields; a grey model
+# fed the Y plane straight from the decoder must see the same scale as the BGR->grey path.
+_TV_TO_FULL_LUT = np.clip((np.arange(256) - 16) * 255.0 / 219.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+class YuvFrame:
+    """A decoded 4:2:0 frame (``i420`` planar or ``nv12`` from NVDEC): the Y plane for grey
+    models, BGR made only when asked for."""
+
+    __slots__ = ("buffer", "width", "height", "limited_range", "layout")
+
+    def __init__(self, buffer: np.ndarray, width: int, height: int, limited_range: bool, layout: str = "i420") -> None:
+        self.buffer = buffer
+        self.width = width
+        self.height = height
+        self.limited_range = limited_range
+        self.layout = layout
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (self.height, self.width, 3)
+
+    @property
+    def y(self) -> np.ndarray:
+        return self.buffer[: self.width * self.height].reshape(self.height, self.width)
+
+    def bgr(self) -> np.ndarray:
+        code = cv2.COLOR_YUV2BGR_NV12 if self.layout == "nv12" else cv2.COLOR_YUV2BGR_I420
+        return cv2.cvtColor(self.buffer.reshape(self.height * 3 // 2, self.width), code)
+
+
+def to_bgr(frame: "np.ndarray | YuvFrame") -> np.ndarray:
+    return frame.bgr() if isinstance(frame, YuvFrame) else frame
+
+
+def _color_range(source: str) -> str:
+    """``tv`` / ``pc`` / ``unknown`` as ffprobe reports the first video stream."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=color_range",
+             "-of", "csv=p=0", source],
+            capture_output=True, text=True, timeout=60, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return out or "unknown"
+
+
+class FfmpegYuvSource:
+    """Frames decoded by an ffmpeg process as yuv420p, read over a pipe.
+
+    OpenCV's ``read()`` converts every full-size frame to BGR; this hands over the raw
+    planes and leaves the conversion to the few places that need colour (``YuvFrame.bgr``).
+    The subset of ``cv2.VideoCapture`` the detector loop uses: ``isOpened``, ``get``,
+    ``grab``, ``read``, ``release``.
+
+    ``hwaccel="cuda"`` decodes on the NVIDIA card (NVDEC, ``-hwaccel cuda``) and downloads
+    the frames as ``nv12``; the CPU then only resizes the Y plane. Needs ``libnvcuvid`` from
+    the host driver: in Docker ``NVIDIA_DRIVER_CAPABILITIES`` must include ``video``.
+    """
+
+    def __init__(self, source: str, threads: int = 0, hwaccel: str = "none") -> None:
+        probe = cv2.VideoCapture(source)
+        self.fps = float(probe.get(cv2.CAP_PROP_FPS) or 0.0)
+        self.width = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.frame_count = int(probe.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        probe.release()
+        self.limited_range = _color_range(source) != "pc"
+        self.hwaccel = hwaccel if hwaccel and hwaccel != "none" else None
+        # NVDEC hands over nv12 (interleaved chroma); asking for yuv420p would add a conversion.
+        self.layout = "nv12" if self.hwaccel else "i420"
+        self._size = self.width * self.height * 3 // 2
+        self._process: subprocess.Popen | None = None
+        if self.width and self.height:
+            decode = ["-hwaccel", self.hwaccel] if self.hwaccel else ["-threads", str(threads)]
+            self._process = subprocess.Popen(
+                ["ffmpeg", "-v", "error", "-nostdin", *decode, "-i", source, "-map", "0:v:0",
+                 "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "nv12" if self.hwaccel else "yuv420p", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+            )
+
+    def isOpened(self) -> bool:
+        return self._process is not None
+
+    def get(self, prop: int) -> float:
+        return {
+            cv2.CAP_PROP_FPS: self.fps,
+            cv2.CAP_PROP_FRAME_WIDTH: float(self.width),
+            cv2.CAP_PROP_FRAME_HEIGHT: float(self.height),
+            cv2.CAP_PROP_FRAME_COUNT: float(self.frame_count),
+        }.get(prop, 0.0)
+
+    _returned_any = False
+
+    def _next(self) -> np.ndarray | None:
+        if self._process is None or self._process.stdout is None:
+            return None
+        buffer = np.empty(self._size, dtype=np.uint8)
+        view = memoryview(buffer)
+        filled = 0
+        while filled < self._size:
+            got = self._process.stdout.readinto(view[filled:])
+            if not got:
+                return None
+            filled += got
+        self._returned_any = True
+        return buffer
+
+    def grab(self) -> bool:
+        if self._next() is None:
+            self._check_failure()
+            return False
+        return True
+
+    def read(self) -> tuple[bool, YuvFrame | None]:
+        buffer = self._next()
+        if buffer is None:
+            self._check_failure()
+            return False, None
+        return True, YuvFrame(buffer, self.width, self.height, self.limited_range, self.layout)
+
+    def _check_failure(self) -> None:
+        """An ffmpeg that died before the first frame (no NVDEC, bad file) must not look like an empty video."""
+        if self._process is None or self._process.stderr is None:
+            return
+        code = self._process.wait()
+        message = self._process.stderr.read().decode("utf-8", "replace").strip()
+        if code and not self._returned_any:
+            raise RuntimeError(f"ffmpeg decoder failed (exit {code}): {message[-1500:]}")
+        if message:
+            print(f"ffmpeg: {message[-1500:]}", file=sys.stderr)
+
+    def release(self) -> None:
+        if self._process is not None:
+            for stream in (self._process.stdout, self._process.stderr):
+                if stream is not None:
+                    stream.close()
+            self._process.kill()
+            self._process.wait()
+            self._process = None
+
+
+def action_names_of(metadata: dict[str, Any]) -> list[str] | None:
+    """Имена каналов ``action_logits`` релиза, ``None`` у релиза без действия."""
+    if "action_logits" not in (metadata.get("output_names") or ()):
+        return None
+    names = metadata.get("action_names")
+    if not isinstance(names, list) or len(names) < 2:
+        raise ValueError("a release with action_logits must list action_names in its metadata")
+    return [str(name) for name in names]
 
 
 class RavelVBOpenVINO:
@@ -492,9 +709,13 @@ class RavelVBOpenVINO:
         else:
             self.ball_width = self.ball_height = 0.0
         self.outputs = {name: compiled.output(name) for name in output_names}
+        self.action_names = action_names_of(self.metadata)
 
-    def preprocess(self, bgr: np.ndarray) -> np.ndarray:
+    def preprocess(self, frame: "np.ndarray | YuvFrame") -> np.ndarray:
         """Кадр -> тензор модели: размер, число каналов и шкала [0, 1].
+
+        ``YuvFrame`` (reader ``ffmpeg``) с серой моделью: берётся плоскость Y без
+        конверсии в BGR, с переводом TV-диапазона в полный, как делает OpenCV.
 
         Уменьшение идёт через ``INTER_AREA`` -- тем же способом, каким нарезаны
         кадры обучающего датасета; при увеличении area не годится, и тогда
@@ -503,6 +724,16 @@ class RavelVBOpenVINO:
         """
         width = int(self.config["image_width"])
         height = int(self.config["image_height"])
+        if isinstance(frame, YuvFrame) and int(self.config["input_channels"]) == 1:
+            plane = frame.y
+            shrinking = width <= plane.shape[1] and height <= plane.shape[0]
+            grey = cv2.resize(
+                plane, (width, height), interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
+            )
+            if frame.limited_range:
+                grey = cv2.LUT(grey, _TV_TO_FULL_LUT)
+            return np.ascontiguousarray(grey[None].astype(np.float32) / 255.0)
+        bgr = to_bgr(frame)
         shrinking = width <= bgr.shape[1] and height <= bgr.shape[0]
         resized = cv2.resize(
             bgr,
@@ -548,6 +779,18 @@ def _draw_predictions(
         if class_name == "player":
             color = (0, 180, 255)
             players += 1
+            if item.get("action"):
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), ACTION_COLOUR, 5)
+                cv2.putText(
+                    canvas,
+                    f"{item['action']} {float(item['action_score']):.2f}",
+                    (x1, y2 + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    ACTION_COLOUR,
+                    2,
+                    cv2.LINE_AA,
+                )
         else:
             color = (255, 0, 255)
             balls += int(class_name == "ball")
@@ -645,15 +888,28 @@ def _draw_heads(canvas: np.ndarray, predictions: list[dict]) -> None:
     )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(
+    default_model: Path = DEFAULT_MODEL, default_device: str = "CPU"
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Detect and track volleyball players and the ball with RAVEL-VB."
     )
     parser.add_argument("video", help="input video")
-    parser.add_argument("--model", default=str(DEFAULT_MODEL))
+    parser.add_argument("--model", default=str(default_model))
     parser.add_argument(
         "--output",
-        help="write predictions to this JSON file or directory",
+        help=(
+            "write predictions to this file or directory: a .jsonl is written "
+            "frame by frame as the video goes, a .json once at the end"
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "with a .jsonl output: go on from the last checkpoint of an unfinished "
+            "run with the same settings; a finished one is left as it is"
+        ),
     )
     parser.add_argument("--output-video", help="write annotated video to this file")
     parser.add_argument(
@@ -693,6 +949,16 @@ def parse_args() -> argparse.Namespace:
             "ни на что не влияет"
         ),
     )
+    parser.add_argument(
+        "--action-threshold",
+        type=float,
+        default=ACTION_THRESHOLD,
+        help=(
+            "порог действия (касания) игрока по action_logits; у релизов без "
+            "головы действия ни на что не влияет. На проверке касаний портала "
+            "сравнивали при 0.7"
+        ),
+    )
     parser.add_argument("--nms-iou", type=float, default=0.5)
     parser.add_argument("--close-threshold", type=float, default=0.20)
     parser.add_argument("--hysteresis-frames", type=int, default=2)
@@ -705,10 +971,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-runs", type=int, default=3)
     parser.add_argument("--num-threads", type=int, default=0)
     parser.add_argument(
+        "--reader",
+        choices=("opencv", "ffmpeg"),
+        default=os.getenv("INFERENCE_READER", "opencv"),
+        help="opencv: cv2.VideoCapture, every frame converted to BGR; "
+        "ffmpeg: yuv420p over a pipe, the grey model reads the Y plane (no conversion)",
+    )
+    parser.add_argument(
+        "--decode-threads", type=int, default=int(os.getenv("INFERENCE_DECODE_THREADS", "0")),
+        help="ffmpeg decoder threads for --reader ffmpeg (0: auto)",
+    )
+    parser.add_argument(
+        "--decode-hwaccel",
+        choices=("none", "cuda"),
+        default=os.getenv("INFERENCE_DECODE_HWACCEL", "none"),
+        help="hardware decoder for --reader ffmpeg: cuda = NVDEC (needs the video capability of the NVIDIA driver)",
+    )
+    parser.add_argument(
         "--device",
         choices=("CPU", "GPU", "AUTO"),
-        default="CPU",
-        help="OpenVINO device used for inference",
+        default=default_device,
+        help="inference device; the ONNX runner reads GPU as CUDA",
     )
     parser.add_argument(
         "--performance-hint",
@@ -718,8 +1001,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def main(
+    runtime: type | None = None,
+    default_model: Path = DEFAULT_MODEL,
+    default_device: str = "CPU",
+) -> None:
+    """Run the detector; ``runtime`` is the class that executes the model.
+
+    ``inference_player_ball_onnx.py`` passes its ONNX Runtime class here, so both
+    runtimes share the arguments, the decoding and the output format.
+    """
+    runtime = runtime or RavelVBOpenVINO
+    args = parse_args(default_model, default_device)
     if args.stride < 1:
         raise ValueError("--stride must be >= 1")
     if args.frame_step < 1:
@@ -730,6 +1023,8 @@ def main() -> None:
         raise ValueError("--ball-threshold must be in [0, 1]")
     if not 0 <= args.head_threshold <= 1:
         raise ValueError("--head-threshold must be in [0, 1]")
+    if not 0 <= args.action_threshold <= 1:
+        raise ValueError("--action-threshold must be in [0, 1]")
     if not 0 <= args.close_threshold <= 1:
         raise ValueError("--close-threshold must be in [0, 1]")
     if (
@@ -741,7 +1036,10 @@ def main() -> None:
         raise ValueError("frame counts and thread count must be non-negative")
 
     model_path = Path(args.model).expanduser().resolve()
-    video_path = Path(args.video).expanduser().resolve()
+    # An http(s) URL is read by OpenCV's FFmpeg straight from the network (an outside node).
+    video_is_url = urlparse(args.video).scheme in {"http", "https"}
+    video_path = Path(urlparse(args.video).path) if video_is_url else Path(args.video).expanduser().resolve()
+    video_source = args.video if video_is_url else str(video_path)
     output_path = None
     if args.output:
         output_arg = args.output
@@ -755,11 +1053,41 @@ def main() -> None:
         if args.output_video
         else None
     )
-    if not video_path.is_file():
+    if not video_is_url and not video_path.is_file():
         raise FileNotFoundError(f"video not found: {video_path}")
     if not model_path.is_file():
-        raise FileNotFoundError(f"OpenVINO model not found: {model_path}")
-    model = RavelVBOpenVINO(
+        raise FileNotFoundError(f"model not found: {model_path}")
+    settings = {
+        "model": str(model_path),
+        "video": video_source,
+        "stride": args.stride,
+        "frame_step": args.frame_step,
+        "score_threshold": args.score_threshold,
+        "ball_threshold": args.ball_threshold,
+        "head_threshold": args.head_threshold,
+        "close_threshold": None if args.no_player_hysteresis else args.close_threshold,
+        "hysteresis_frames": 0 if args.no_player_hysteresis else args.hysteresis_frames,
+        "include_features": bool(args.include_features),
+    }
+    # Только у релиза с действием: прежние незаконченные прогоны других моделей
+    # продолжаются по --resume, как раньше.
+    if _metadata_has_action(model_path):
+        settings["action_threshold"] = args.action_threshold
+    # The detector streams into a plain .jsonl only; it is packed once the processing is over.
+    streaming = output_path is not None and output_path.name.endswith(".jsonl")
+    if args.resume and not streaming:
+        raise ValueError("--resume needs a .jsonl --output")
+    resume_from: dict | None = None
+    resume_offset = 0
+    if args.resume and output_path.is_file():
+        state, resume_from, resume_offset = _resume_point(output_path, settings)
+        if state == "complete":
+            print(json.dumps({"output": str(output_path), "complete": True}, ensure_ascii=False))
+            return
+        if state == "fresh":
+            print(f"{output_path}: no checkpoint of the same settings, starting over", file=sys.stderr)
+
+    model = runtime(
         model_path, args.num_threads, args.performance_hint, args.device
     )
     config = model.config
@@ -779,9 +1107,13 @@ def main() -> None:
     for _ in range(args.warmup_runs):
         model.infer(warmup)
 
-    capture = cv2.VideoCapture(str(video_path))
+    capture = (
+        FfmpegYuvSource(video_source, args.decode_threads, args.decode_hwaccel)
+        if args.reader == "ffmpeg"
+        else cv2.VideoCapture(video_source)
+    )
     if not capture.isOpened():
-        raise ValueError(f"cannot open video: {video_path}")
+        raise ValueError(f"cannot open video: {video_source}")
     fps = float(capture.get(cv2.CAP_PROP_FPS)) or 30.0
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -789,8 +1121,11 @@ def main() -> None:
     frames: deque[np.ndarray] = deque(maxlen=clip_length)
     indices: deque[int] = deque(maxlen=clip_length)
     raw_by_frame: dict[int, list[dict]] = defaultdict(list)
+    # Only drawing needs the predictions of past frames; a JSONL run keeps nothing else.
+    keep_frames = args.show or output_video_path is not None
     predictions_by_frame: dict[int, list[dict]] = defaultdict(list)
     predictions: list[dict] = []
+    written_predictions = 0
     hysteresis = (
         None
         if args.no_player_hysteresis
@@ -809,11 +1144,49 @@ def main() -> None:
     last_clip_start: int | None = None
     inference_runs = 0
     model_elapsed = 0.0
+    earlier_pipeline_seconds = 0.0
     candidate_threshold = (
         args.score_threshold
         if args.no_player_hysteresis
         else args.close_threshold
     )
+
+    output_handle = None
+    if streaming:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if resume_from is not None:
+            # The lines after the checkpoint are redone: the run goes on from there.
+            output_handle = open(output_path, "r+b")
+            output_handle.truncate(resume_offset)
+            output_handle.seek(resume_offset)
+            next_finalize_frame = int(resume_from["next_frame"])
+            last_clip_start = resume_from["last_clip_start"]
+            shown = next_finalize_frame // args.frame_step
+            inference_runs = int(resume_from["inference_runs"])
+            model_elapsed = float(resume_from["model_seconds"])
+            earlier_pipeline_seconds = float(resume_from["pipeline_seconds"])
+            written_predictions = int(resume_from["predictions"])
+            for frame, items in resume_from["raw_pending"]:
+                raw_by_frame[int(frame)] = items
+            if hysteresis is not None and resume_from.get("hysteresis") is not None:
+                hysteresis.restore(resume_from["hysteresis"])
+            if output_video_path is not None:
+                for frame, items in _written_frames(output_path):
+                    predictions_by_frame[frame] = items
+        else:
+            output_handle = open(output_path, "wb")
+            header = {
+                "type": "header",
+                "format": FORMAT_V3,
+                **settings,
+                "source_size": {"width": width, "height": height},
+                "fps": fps,
+                "clip_length": clip_length,
+                "reported_frames": reported_total,
+                "fields": FIELDS,
+            }
+            output_handle.write(dump_line(header).encode("utf-8"))
+            _sync(output_handle)
 
     def infer_clip(
         clip_frames: list[np.ndarray],
@@ -833,6 +1206,8 @@ def main() -> None:
             args.include_features,
             ball_threshold=args.ball_threshold,
             head_threshold=args.head_threshold,
+            action_names=getattr(model, "action_names", None),
+            action_threshold=args.action_threshold,
         )[0]
         for item in decoded:
             slot = int(item.pop("frame_slot"))
@@ -885,7 +1260,7 @@ def main() -> None:
 
     def finalize_frames(end_frame: int) -> None:
         """Finalize frames that cannot be affected by a later inference clip."""
-        nonlocal next_finalize_frame, show_active, show_window_open
+        nonlocal next_finalize_frame, show_active, show_window_open, written_predictions
         while next_finalize_frame < end_frame:
             current_frame = next_finalize_frame
             if current_frame % args.frame_step:
@@ -904,6 +1279,7 @@ def main() -> None:
                     if item["class_name"] != "player"
                     or float(item["score"]) >= args.score_threshold
                 ]
+            frame_items: list[dict] = []
             for filtered_item in filtered:
                 item = dict(filtered_item)
                 x1, y1, x2, y2 = item.pop("bbox_xyxy_norm")
@@ -915,22 +1291,52 @@ def main() -> None:
                     round(x2 * width, 2),
                     round(y2 * height, 2),
                 ]
-                predictions.append(item)
-                predictions_by_frame[current_frame].append(item)
+                frame_items.append(item)
+            written_predictions += len(frame_items)
+            if output_handle is not None:
+                output_handle.write(dump_line(frame_record(current_frame, frame_items)).encode("utf-8"))
+            else:
+                predictions.extend(frame_items)
+            if keep_frames:
+                predictions_by_frame[current_frame] = frame_items
 
             _show_frame(current_frame)
+            if keep_frames and output_video_path is None:
+                predictions_by_frame.pop(current_frame - args.frame_step, None)
             next_finalize_frame += 1
+
+    def write_checkpoint() -> None:
+        """State at a clip boundary: a resumed run decodes again from ``next_frame``."""
+        checkpoint = {
+            "type": "checkpoint",
+            "next_frame": next_finalize_frame,
+            "last_clip_start": last_clip_start,
+            "inference_runs": inference_runs,
+            "model_seconds": round(model_elapsed, 6),
+            "pipeline_seconds": round(earlier_pipeline_seconds + time.perf_counter() - pipeline_started, 6),
+            "predictions": written_predictions,
+            "hysteresis": hysteresis.state() if hysteresis is not None else None,
+            # Predictions of the next frames from the overlap of the last clip.
+            "raw_pending": [[frame, items] for frame, items in sorted(raw_by_frame.items())],
+        }
+        output_handle.write(dump_line(checkpoint).encode("utf-8"))
+        _sync(output_handle)
 
     pipeline_started = time.perf_counter()
     with tqdm(
         total=reported_total or None, desc="RAVEL-VB", unit="frame"
     ) as progress:
+        if next_finalize_frame:
+            # Resumed: frames before the checkpoint are only decoded (seeking is not frame-accurate).
+            while frame_index < next_finalize_frame and capture.grab():
+                frame_index += 1
+            progress.update(frame_index)
         while True:
             ok, bgr = capture.read()
             if not ok:
                 break
             if show_active:
-                show_frames[frame_index] = bgr.copy()
+                show_frames[frame_index] = to_bgr(bgr).copy()
             # ``--frame-step`` выбрасывает кадры до сборки клипа: сеть видит те
             # же девять слотов, растянутые на большее время, а у невыбранного
             # кадра предсказаний нет вовсе.
@@ -946,6 +1352,11 @@ def main() -> None:
                 infer_clip(list(frames), current_indices, clip_length)
                 last_clip_start = current_indices[0]
                 finalize_frames(last_clip_start + args.stride * args.frame_step)
+                if output_handle is not None:
+                    if inference_runs % CHECKPOINT_EVERY_CLIPS == 0:
+                        write_checkpoint()
+                    else:
+                        output_handle.flush()
             frame_index += 1
             progress.update(1)
     total = frame_index
@@ -972,7 +1383,7 @@ def main() -> None:
     finalize_frames(total)
     if args.show:
         cv2.destroyAllWindows()
-    pipeline_elapsed = time.perf_counter() - pipeline_started
+    pipeline_elapsed = earlier_pipeline_seconds + time.perf_counter() - pipeline_started
     benchmark = {
         "processed_frames": total,
         "inference_runs": inference_runs,
@@ -988,10 +1399,24 @@ def main() -> None:
             total / max(pipeline_elapsed, 1e-9), 3
         ),
         "device": model.device,
+        "reader": args.reader,
+        "decode_hwaccel": args.decode_hwaccel if args.reader == "ffmpeg" else None,
     }
+    if output_handle is not None:
+        # The explicit flag for the readers: the video is over, nothing more will come.
+        end = {
+            "type": "end",
+            "last_frame": total - 1,
+            "processed_frames": total,
+            "predictions": written_predictions,
+            "benchmark": benchmark,
+        }
+        output_handle.write(dump_line(end).encode("utf-8"))
+        _sync(output_handle)
+        output_handle.close()
 
     if output_video_path is not None:
-        render_capture = cv2.VideoCapture(str(video_path))
+        render_capture = cv2.VideoCapture(video_source)
         if not render_capture.isOpened():
             raise ValueError("cannot open the input video for rendering")
         writer = None
@@ -1023,28 +1448,25 @@ def main() -> None:
                 writer.release()
             render_capture.release()
 
-    payload = {
-        "format": "ravel-vb-predictions-v1",
-        "model": str(model_path),
-        "video": str(video_path),
-        "source_size": {"width": width, "height": height},
-        "fps": fps,
-        "clip_length": clip_length,
-        "stride": args.stride,
-        "frame_step": args.frame_step,
-        "score_threshold": args.score_threshold,
-        "ball_threshold": args.ball_threshold,
-        "head_threshold": args.head_threshold,
-        "close_threshold": (
-            None if args.no_player_hysteresis else args.close_threshold
-        ),
-        "hysteresis_frames": (
-            0 if args.no_player_hysteresis else args.hysteresis_frames
-        ),
-        "benchmark": benchmark,
-        "predictions": predictions,
-    }
-    if output_path is not None:
+    if output_path is not None and not streaming:
+        payload = {
+            "format": FORMAT_V1,
+            "model": str(model_path),
+            "video": video_source,
+            "source_size": {"width": width, "height": height},
+            "fps": fps,
+            "clip_length": clip_length,
+            "stride": args.stride,
+            "frame_step": args.frame_step,
+            "score_threshold": args.score_threshold,
+            "ball_threshold": args.ball_threshold,
+            "head_threshold": args.head_threshold,
+            "action_threshold": settings.get("action_threshold"),
+            "close_threshold": settings["close_threshold"],
+            "hysteresis_frames": settings["hysteresis_frames"],
+            "benchmark": benchmark,
+            "predictions": predictions,
+        }
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1056,12 +1478,55 @@ def main() -> None:
                 "output_video": (
                     str(output_video_path) if output_video_path else None
                 ),
-                "predictions": len(predictions),
+                "predictions": written_predictions,
                 "benchmark": benchmark,
             },
             ensure_ascii=False,
         )
     )
+
+
+def _metadata_has_action(model_path: Path) -> bool:
+    metadata_path = model_path.with_suffix(".json")
+    if not metadata_path.is_file():
+        return False
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    return "action_logits" in (metadata.get("output_names") or ())
+
+
+def _sync(handle: Any) -> None:
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _resume_point(path: Path, settings: dict) -> tuple[str, dict | None, int]:
+    """``("complete" | "resume" | "fresh", last checkpoint, byte offset after it)``.
+
+    A run of other settings (model, video, sampling, thresholds) is not resumed.
+    """
+    header: dict | None = None
+    checkpoint: dict | None = None
+    offset = 0
+    for line_end, record in iter_records(path):
+        kind = record.get("type")
+        if kind == "header":
+            header = record if record.get("format") == FORMAT_V3 else None
+        elif kind == "checkpoint":
+            checkpoint, offset = record, line_end
+        elif kind == "end":
+            if header is not None and all(header.get(key) == value for key, value in settings.items()):
+                return "complete", None, 0
+    if header is None or any(header.get(key) != value for key, value in settings.items()):
+        return "fresh", None, 0
+    if checkpoint is None:
+        return "fresh", None, 0
+    return "resume", checkpoint, offset
+
+
+def _written_frames(path: Path):
+    for _, record in iter_records(path):
+        if record.get("type") == "frame":
+            yield int(record["frame_index"]), expand_frame(record)
 
 
 if __name__ == "__main__":
