@@ -29,12 +29,16 @@ The output directory is named after the source file either way:
 `beach-mixt_predictions.json` and `beach-mixt_predict_ball.csv` both write to
 `output/beach-mixt/tracks`.
 
-The players file is a `ravel-vb-predictions-v1` JSON (as produced by
-`src/infer_palyer_ball_openvino.py`): `predictions[]` with `class_id`,
-`score`, `track_id`, `frame_index` and `bbox_xyxy`. Boxes are rescaled if the
-prediction `source_size` differs from the video size used for the court, and
-detections whose feet fall far outside the court (spectators, referees) are
-dropped.
+The players file is what `src/inference_player_ball_openvino.py` (or its ONNX
+twin `src/inference_player_ball_onnx.py`) writes: the streamed
+`predictions.jsonl` / `predictions.jsonl.gz` (`ravel-vb-predictions-v3`, the
+pipeline's format) or the older single `ravel-vb-predictions-v1` JSON; both are
+read through `src/predictions_io.py`. Each player carries `score`, `track_id`,
+`frame_index` and `bbox_xyxy`. Boxes are rescaled if the prediction
+`source_size` differs from the video size used for the court, and detections
+whose feet fall far outside the court (spectators, referees) are dropped.
+`--player_score_threshold` (default 0.30) is the minimum score of a player box
+used here.
 
 ## The ball from the players model
 
@@ -211,3 +215,89 @@ exchanges between the sides, several contacts and a serve start argue for a
 rally; a start from a player inside the court with almost no contacts and no
 exchange argues for a technical return. Run with `--verbose` for a per-track
 breakdown.
+
+## Action type of a contact: `src/classify_contacts.py`
+
+The height-based `contact_type` above is geometry only. The pipeline
+(`src/celery_worker.py`: detector -> `track_calculator_with_court.py` ->
+`classify_contacts.py`) then labels every contact with a clip classifier: around
+the contact frame a window of frames is cropped at the player closest to the
+ball and classified as `Serve` / `Receive` / `Set` / `Attack` / `NoAction`. The
+result goes back into the contact as `action: {type, score, probabilities}`.
+
+```bash
+uv run src/classify_contacts.py video.mp4 \
+  --players_json_path ../uploads/mix/beach-mixt/predictions.jsonl.gz \
+  --tracks_dir ../uploads/mix/beach-mixt/tracks \
+  --model ov/action_clf_r2plus1d18_verified.xml
+```
+
+The classifier runs on OpenVINO (CPU). The worker picks the model by name
+(`_resolve_action_model_xml`); `ov/action_clf_r2plus1d18_verified.xml` is the
+script default.
+
+## Touches from the detector: RAVEL-VB-013 (players + touch)
+
+Everything above finds a touch **from the ball**: a break in its flight path
+with a player within reach. RAVEL-VB-013 finds it **from the players**: it is
+RAVEL-VB-012 (VB7 yolo26n, 640x360 RGB, 9-frame clip: players, ball, heads)
+with a touch head on top, so every player box of every frame gets the
+probability "this player touches the ball now". One release, two formats:
+
+| file | runtime | script |
+|---|---|---|
+| `ov/RAVEL-VB-013-9f.xml` | OpenVINO, FP32 | `src/inference_player_ball_openvino.py` |
+| `models/RAVEL-VB-013-9f.onnx` | ONNX Runtime (CUDA / CPU), FP32 | `src/inference_player_ball_onnx.py` |
+
+```bash
+uv run src/inference_player_ball_openvino.py video.mp4 \
+  --model ov/RAVEL-VB-013-9f.xml --action-threshold 0.5 \
+  --output ../uploads/mix/video/predictions.jsonl
+```
+
+**What it writes.** A player whose touch probability reaches
+`--action-threshold` (default 0.5) gets `"action": "Touch"` and
+`"action_score"`; in the JSONL they ride in the extra dict of the player row:
+
+```json
+{"type":"frame","frame_index":30,"players":[[3,0.952,1769.51,607.29,1964.16,1120.63,0,{"head_point_norm":[0.695,0.433],"action":"Touch","action_score":0.991}], ...],"ball":[0.423,1895.53,427.85,1952.29,484.61]}
+```
+
+Boxes the hysteresis carries over a gap (`interpolated`) never carry an
+action. Any other release writes exactly what it wrote before. Behind the
+fields are two model outputs: `action_logits` `[B, T, K, 2]` (log-probabilities
+of `Touch` / `none`, the names are `action_names` in the sidecar `.json`) and
+`action_actor_logits` `[B, T, K + 1]` (the players of a frame compete for the
+role of the one touching; the last channel is "nobody").
+
+**A touch is a peak, not a frame.** The probability rises over several frames
+around the contact. On `serve_0001` (contact at frame 30) the server is above
+0.5 on frames 18-33, peaking at 0.99 on frames 30-31. The event is the maximum
+of `action_score` along a `track_id`; take peaks at least ~0.5 s apart.
+
+**How good it is** (epoch 45 of
+`tape_vb7_yolo_v41mask_touch_640_9f_60ep_20261101_064742`):
+
+- validation of the training set: touch precision 0.66, recall 0.90; players
+  mAP75 0.90;
+- portal match 4bbc5a55 (СГЦ - Динамо, 636 portal touches, threshold 0.7,
+  +-6 frames): 451 matched (359 on the same player, 92 on another), the frame
+  is within 2 of the portal one in 82% of them (median 1). 185 portal touches are
+  missed, 258 touches are the model's only, and 123 of those lie 7-20 frames
+  after a real touch: a double peak, so merge peaks of one player closer than
+  ~20 frames. Outside rallies (warm-up) it fires too, about 360 events on that
+  match;
+- the touch training costs the detector a little: on a different camera
+  (pro-test of beach-test) detection mAP75 is 0.64 against 0.75 for the same
+  network without the touch head.
+
+**Limits.**
+- It was trained and checked on consecutive frames (`--frame-step 1`). The
+  pipeline runs the detector with `INFERENCE_FRAME_STEP=2` by default, which
+  doubles the time a clip spans. Touches at `--frame-step 2` are not checked.
+- The touch is not wired into the analysis yet: `player_contacts.py` still
+  finds contacts from the ball path and ignores `action`. Natural uses are
+  confirming a trajectory break with a model touch of the same player within a
+  few frames, choosing between near and far players when the reach cost is
+  ambiguous, and recovering touches where the ball was not seen.
+- The production detector is still RAVEL-VB-011 (`INFERENCE_MODEL_XML`).

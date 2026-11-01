@@ -6,7 +6,7 @@
 
 High-speed pipeline for volleyball ball detection, rally extraction, and automatic generation of 9:16 reels.
 
-[![src/ball_tracker.py](examples/ball-tracking.jpg)](https://www.youtube.com/watch?v=TBDrTMFMoFA)
+[![RAVEL-VB-013: players + touch](examples/player-touch.gif)](https://youtu.be/1ha7WU9sH2k)
 
 ## Pipeline
 1. `src/inference_onnx_seq_gray_v2.py` -> detects ball and writes `ball.csv` (and optional `predict.mp4`).
@@ -175,6 +175,10 @@ uv run src/inference_player_ball_openvino.py ./examples/gtu_20250316_002.mp4 \
 # RAVEL-VB-011: v45 dense grid, 1024x576 grayscale, players + ball, ~2.5x faster on CPU
 uv run src/inference_player_ball_openvino.py ./examples/gtu_20250316_002.mp4 \
   --model ./ov/RAVEL-VB-011-9f.xml --output ./demo-result/
+
+# RAVEL-VB-013: RAVEL-VB-012 + touch head, 640x360 RGB, players + ball + heads + who touches the ball
+uv run src/inference_player_ball_openvino.py ./examples/gtu_20250316_002.mp4 \
+  --model ./ov/RAVEL-VB-013-9f.xml --action-threshold 0.5 --output ./demo-result/
 ```
 - `--output` - JSON file or directory (a directory gets `<video>_predictions.json`).
 - `--output-video` - annotated video; `--show` - live window (`Esc`/`q` to stop).
@@ -182,11 +186,18 @@ uv run src/inference_player_ball_openvino.py ./examples/gtu_20250316_002.mp4 \
   player open/close thresholds and how many frames a lost player is held.
 - `--ball-threshold 0.35`, `--head-threshold 0.30` - separate thresholds for the
   ball and head points (heads come only from RAVEL-VB-012).
+- `--action-threshold 0.5` - only for a release with `action_logits` (RAVEL-VB-013,
+  `action_names` `["Touch", "none"]` in the sidecar): a player whose
+  touch probability reaches it gets `action` and `action_score` (in the JSONL they ride
+  in the player's extra dict). A touch lasts several frames around the contact, so the
+  event is the peak of `action_score` along a track; boxes held by the hysteresis
+  (`interpolated`) carry no action. The portal touch check used 0.7.
 - `--stride 9` - clip step; `--frame-step 2` feeds every second frame (faster, coarser).
 - `--device {CPU,GPU,AUTO}`, `--num-threads N`.
 - Input size, channels and clip length are read from the model's sidecar `.json`,
   so any release in `ov/` runs without extra flags. ONNX copies of the same
-  releases are in `models/RAVEL-VB-01{1,2}-9f.onnx`.
+  releases are in `models/RAVEL-VB-01{1,2,3}-9f.onnx`: one release number is one
+  network, whatever the format.
 
 ## Available ONNX models
 Benchmark setup:

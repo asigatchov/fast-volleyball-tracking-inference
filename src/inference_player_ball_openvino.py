@@ -9,6 +9,20 @@ v45) и длина клипа берутся из sidecar ``.json``.
 
     uv run python src/inference_player_ball_openvino.py video.mp4 \
         --model ov/RAVEL-VB-012-9f.xml --output ../uploads/mix/
+
+Релиз с головой действия (RAVEL-VB-013: ``ov/RAVEL-VB-013-9f.xml`` и та же сеть
+в ``models/RAVEL-VB-013-9f.onnx`` -- игроки + касание, 9 кадров 640x360) отдаёт ещё ``action_logits`` [B, T, K, C]:
+log-вероятности «этот игрок на этом кадре совершает действие такого типа»,
+последний канал -- «нет действия»; имена каналов -- ``action_names`` sidecar
+(у модели касания ``["Touch", "none"]``). Игрок, у которого лучшее действие не
+слабее ``--action-threshold``, получает поля ``action`` и ``action_score``; в
+JSONL они идут в словаре ``extra`` строки игрока. Касание держится несколько
+кадров вокруг удара (пик на кадре касания), так что событие -- это пик
+``action_score`` вдоль трека. Донесённые гистерезисом рамки (``interpolated``)
+действия не несут.
+
+    uv run python src/inference_player_ball_openvino.py video.mp4 \
+        --model ov/RAVEL-VB-013-9f.xml --action-threshold 0.5 --output out.jsonl
 """
 
 from __future__ import annotations
@@ -58,6 +72,10 @@ ZONE_ABOVE = 0.08
 ZONE_BELOW = 0.45
 MATCHED_COLOUR = (0, 220, 0)
 LOOSE_COLOUR = (0, 0, 255)
+# Поля действия в записи игрока; донесённая гистерезисом рамка их теряет.
+ACTION_FIELDS = ("action", "action_score")
+ACTION_THRESHOLD = 0.5
+ACTION_COLOUR = (0, 255, 255)
 
 
 def _box_iou(left: list[float], right: list[float]) -> float:
@@ -190,8 +208,15 @@ def decode_batch(
     max_players: int = 16,
     ball_threshold: float | None = None,
     head_threshold: float = HEAD_THRESHOLD,
+    action_names: list[str] | None = None,
+    action_threshold: float = ACTION_THRESHOLD,
 ) -> list[list[dict]]:
     """Decode the tensor ABI exported with the RAVEL-VB OpenVINO model.
+
+    ``action_names`` -- имена каналов ``action_logits`` (последний -- «нет
+    действия»); работает, только если модель отдаёт ``action_logits``.
+    Игрок получает ``action`` / ``action_score``, когда лучшее действие не
+    слабее ``action_threshold``.
 
     ``ball_threshold`` -- порог мяча; ``None`` оставляет прежнее поведение,
     когда мяч отсекается тем же ``score_threshold``, что и игроки.
@@ -200,6 +225,13 @@ def decode_batch(
     """
     if ball_threshold is None:
         ball_threshold = score_threshold
+    action_probabilities = None
+    if "action_logits" in outputs:
+        # Каналы -- log-вероятности, в сумме по каналам единица: exp даёт их сами.
+        action_probabilities = np.exp(outputs["action_logits"].astype(np.float64))
+        channels = action_probabilities.shape[-1]
+        if action_names is None or len(action_names) != channels:
+            action_names = [*(f"action{index}" for index in range(channels - 1)), "none"]
     results: list[list[dict]] = []
     batch_size, frame_count, query_count = outputs["logits"].shape[:3]
     for batch_index in range(batch_size):
@@ -267,6 +299,12 @@ def decode_batch(
                         record["head_point_norm"] = outputs["head_point_norm"][
                             batch_index, frame_slot, query_index
                         ].tolist()
+                    if action_probabilities is not None:
+                        row = action_probabilities[batch_index, frame_slot, query_index]
+                        best = int(row[:-1].argmax())
+                        if float(row[best]) >= action_threshold:
+                            record["action"] = action_names[best]
+                            record["action_score"] = round(float(row[best]), 3)
                     if include_features:
                         for key in (
                             "head_points",
@@ -428,6 +466,9 @@ class PlayerHysteresis:
                 del self.tracks[track_id]
                 continue
             prediction = dict(state["prediction"])
+            # Действие было на том кадре, который рамку донёс, а не на этом.
+            for key in ACTION_FIELDS:
+                prediction.pop(key, None)
             prediction["frame_index"] = frame_index
             prediction["track_id"] = track_id
             prediction["interpolated"] = True
@@ -594,6 +635,16 @@ class FfmpegYuvSource:
             self._process = None
 
 
+def action_names_of(metadata: dict[str, Any]) -> list[str] | None:
+    """Имена каналов ``action_logits`` релиза, ``None`` у релиза без действия."""
+    if "action_logits" not in (metadata.get("output_names") or ()):
+        return None
+    names = metadata.get("action_names")
+    if not isinstance(names, list) or len(names) < 2:
+        raise ValueError("a release with action_logits must list action_names in its metadata")
+    return [str(name) for name in names]
+
+
 class RavelVBOpenVINO:
     def __init__(
         self,
@@ -658,6 +709,7 @@ class RavelVBOpenVINO:
         else:
             self.ball_width = self.ball_height = 0.0
         self.outputs = {name: compiled.output(name) for name in output_names}
+        self.action_names = action_names_of(self.metadata)
 
     def preprocess(self, frame: "np.ndarray | YuvFrame") -> np.ndarray:
         """Кадр -> тензор модели: размер, число каналов и шкала [0, 1].
@@ -727,6 +779,18 @@ def _draw_predictions(
         if class_name == "player":
             color = (0, 180, 255)
             players += 1
+            if item.get("action"):
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), ACTION_COLOUR, 5)
+                cv2.putText(
+                    canvas,
+                    f"{item['action']} {float(item['action_score']):.2f}",
+                    (x1, y2 + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    ACTION_COLOUR,
+                    2,
+                    cv2.LINE_AA,
+                )
         else:
             color = (255, 0, 255)
             balls += int(class_name == "ball")
@@ -885,6 +949,16 @@ def parse_args(
             "ни на что не влияет"
         ),
     )
+    parser.add_argument(
+        "--action-threshold",
+        type=float,
+        default=ACTION_THRESHOLD,
+        help=(
+            "порог действия (касания) игрока по action_logits; у релизов без "
+            "головы действия ни на что не влияет. На проверке касаний портала "
+            "сравнивали при 0.7"
+        ),
+    )
     parser.add_argument("--nms-iou", type=float, default=0.5)
     parser.add_argument("--close-threshold", type=float, default=0.20)
     parser.add_argument("--hysteresis-frames", type=int, default=2)
@@ -949,6 +1023,8 @@ def main(
         raise ValueError("--ball-threshold must be in [0, 1]")
     if not 0 <= args.head_threshold <= 1:
         raise ValueError("--head-threshold must be in [0, 1]")
+    if not 0 <= args.action_threshold <= 1:
+        raise ValueError("--action-threshold must be in [0, 1]")
     if not 0 <= args.close_threshold <= 1:
         raise ValueError("--close-threshold must be in [0, 1]")
     if (
@@ -993,6 +1069,10 @@ def main(
         "hysteresis_frames": 0 if args.no_player_hysteresis else args.hysteresis_frames,
         "include_features": bool(args.include_features),
     }
+    # Только у релиза с действием: прежние незаконченные прогоны других моделей
+    # продолжаются по --resume, как раньше.
+    if _metadata_has_action(model_path):
+        settings["action_threshold"] = args.action_threshold
     # The detector streams into a plain .jsonl only; it is packed once the processing is over.
     streaming = output_path is not None and output_path.name.endswith(".jsonl")
     if args.resume and not streaming:
@@ -1126,6 +1206,8 @@ def main(
             args.include_features,
             ball_threshold=args.ball_threshold,
             head_threshold=args.head_threshold,
+            action_names=getattr(model, "action_names", None),
+            action_threshold=args.action_threshold,
         )[0]
         for item in decoded:
             slot = int(item.pop("frame_slot"))
@@ -1379,6 +1461,7 @@ def main(
             "score_threshold": args.score_threshold,
             "ball_threshold": args.ball_threshold,
             "head_threshold": args.head_threshold,
+            "action_threshold": settings.get("action_threshold"),
             "close_threshold": settings["close_threshold"],
             "hysteresis_frames": settings["hysteresis_frames"],
             "benchmark": benchmark,
@@ -1401,6 +1484,14 @@ def main(
             ensure_ascii=False,
         )
     )
+
+
+def _metadata_has_action(model_path: Path) -> bool:
+    metadata_path = model_path.with_suffix(".json")
+    if not metadata_path.is_file():
+        return False
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    return "action_logits" in (metadata.get("output_names") or ())
 
 
 def _sync(handle: Any) -> None:

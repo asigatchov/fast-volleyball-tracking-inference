@@ -9,6 +9,9 @@ with its sidecar ``.json`` (same tensor names as the OpenVINO release):
     uv run python src/inference_player_ball_onnx.py video.mp4 \\
         --model models/RAVEL-VB-011-9f.onnx --device GPU --output ../uploads/mix/
 
+Игроки + касание: ``--model models/RAVEL-VB-013-9f.onnx`` (поля ``action`` /
+``action_score`` у игроков, порог ``--action-threshold``).
+
 ``--device GPU`` runs on ``CUDAExecutionProvider``, ``CPU`` on the CPU, ``AUTO``
 on CUDA when it is available. A GPU request that onnxruntime cannot satisfy is
 an error, not a silent fallback to the CPU.
@@ -35,9 +38,9 @@ import numpy as np
 import onnxruntime as ort
 
 try:
-    from .inference_player_ball_openvino import RavelVBOpenVINO, main
+    from .inference_player_ball_openvino import RavelVBOpenVINO, action_names_of, main
 except ImportError:
-    from inference_player_ball_openvino import RavelVBOpenVINO, main
+    from inference_player_ball_openvino import RavelVBOpenVINO, action_names_of, main
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = ROOT / "models" / "RAVEL-VB-011-9f.onnx"
@@ -153,6 +156,7 @@ class RavelVBOnnx(RavelVBOpenVINO):
         else:
             self.ball_width = self.ball_height = 0.0
         self.output_names = list(output_names)
+        self.action_names = action_names_of(self.metadata)
 
     def infer(self, clip: np.ndarray) -> tuple[dict[str, np.ndarray], float]:
         started = time.perf_counter()
