@@ -207,8 +207,15 @@ class RallyViewer:
         fps: Optional[float] = None,
         court_keypoints: Sequence[Optional[tuple[float, float]]] = (),
         output_dir: Optional[str] = None,
+        trail_frames: int = 0,
+        layout: str = "inset",
     ) -> None:
+        # "inset": court schema over the top-left of the frame (1/3 of its height);
+        # "side": schema as a separate panel left of the frame.
+        self._layout = layout
         self._tracks = list(tracks)
+        # >0: draw only the last N frames of the ball path (no future path).
+        self._trail_frames = max(0, int(trail_frames))
         self._players = players
         self._court_keypoints = tuple(court_keypoints)
         self._output_dir = output_dir
@@ -290,10 +297,27 @@ class RallyViewer:
         self._draw_active_contact(frame, scale_x, scale_y)
 
         if self._show_box_view:
-            box_view = np.zeros_like(frame)
-            self._draw_top_down_view(box_view)
-            frame = np.hstack((box_view, frame))
+            if self._layout == "side":
+                box_view = np.zeros_like(frame)
+                self._draw_top_down_view(box_view)
+                frame = np.hstack((box_view, frame))
+            else:
+                self._draw_inset(frame)
         return self._compose(frame)
+
+    def _draw_inset(self, frame: np.ndarray) -> None:
+        """Court schema in the top-left corner, 1/3 of the frame height."""
+        panel_height = max(120, frame.shape[0] // 3)
+        length = max(self.track.court_length_m, 1.0) + 4.0
+        width_m = max(self.track.court_width_m, 1.0) + 4.0
+        # Same geometry as _court_to_top_down: keep the court aspect, plus its margins.
+        panel_width = int((panel_height - 70) * width_m / length) + 80
+        panel_width = min(panel_width, frame.shape[1])
+        roi = frame[:panel_height, :panel_width]
+        panel = (roi.astype(np.float32) * 0.3).astype(np.uint8)
+        self._draw_top_down_view(panel)
+        cv2.rectangle(panel, (0, 0), (panel_width - 1, panel_height - 1), GREY, 1)
+        frame[:panel_height, :panel_width] = panel
 
     def _court_to_top_down(
         self,
@@ -535,7 +559,12 @@ class RallyViewer:
         track = self.track
         previous: Optional[tuple[int, int]] = None
         previous_frame: Optional[int] = None
+        trail = self._trail_frames
         for number in sorted(track.observations):
+            if trail and not (self._frame - trail < number <= self._frame):
+                previous = None
+                previous_frame = None
+                continue
             observation = track.observations[number]
             point = (int(observation["x"] * scale_x), int(observation["y"] * scale_y))
             if previous is not None and number - (previous_frame or number) <= 8:
@@ -545,6 +574,8 @@ class RallyViewer:
             previous_frame = number
 
         for contact in track.contacts:
+            if trail and not (self._frame - trail < int(contact["frame"]) <= self._frame):
+                continue
             observation = track.observations.get(int(contact["frame"]))
             if observation is None:
                 continue
@@ -885,6 +916,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--track", type=int, default=0, help="Index of the track to start from")
     parser.add_argument(
+        "--track_id",
+        type=int,
+        default=None,
+        help="track_id of the track to start from (track_0001.json -> 1); overrides --track",
+    )
+    parser.add_argument(
+        "--trail",
+        type=int,
+        default=0,
+        help="Draw only the last N frames of the ball path (0 = whole path, past and future)",
+    )
+    parser.add_argument(
+        "--layout",
+        choices=("inset", "side"),
+        default="inset",
+        help="inset: court schema in the top-left corner of the frame; side: schema panel beside it",
+    )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Write the selected track video to --output_dir and exit (no GUI)",
+    )
+    parser.add_argument(
         "--snapshot",
         type=str,
         default=None,
@@ -917,9 +971,22 @@ def main() -> None:
     if not keypoints and court.geometry is not None:
         keypoints = court.geometry.keypoints
 
-    viewer = RallyViewer(tracks, args.video_file, players, args.fps, keypoints, args.output_dir)
+    viewer = RallyViewer(
+        tracks, args.video_file, players, args.fps, keypoints, args.output_dir, args.trail, args.layout
+    )
     try:
-        viewer.select(args.track)
+        start = args.track
+        if args.track_id is not None:
+            ids = [view.track_id for view in tracks]
+            if args.track_id not in ids:
+                raise SystemExit(f"track_id {args.track_id} not found in {args.tracks_dir}")
+            start = ids.index(args.track_id)
+        viewer.select(start)
+        if args.save:
+            if not args.output_dir:
+                raise SystemExit("--save needs --output_dir")
+            viewer.save_selected_rally()
+            return
         if args.snapshot:
             cv2.imwrite(args.snapshot, viewer.render())
             LOG.info("Snapshot written to %s", args.snapshot)

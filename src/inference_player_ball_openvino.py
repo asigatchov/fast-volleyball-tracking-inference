@@ -28,6 +28,7 @@ JSONL они идут в словаре ``extra`` строки игрока. К�
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import os
 import subprocess
@@ -73,9 +74,20 @@ ZONE_BELOW = 0.45
 MATCHED_COLOUR = (0, 220, 0)
 LOOSE_COLOUR = (0, 0, 255)
 # Поля действия в записи игрока; донесённая гистерезисом рамка их теряет.
-ACTION_FIELDS = ("action", "action_score")
+# ``TOUCH_KEY`` -- вероятность лучшего действия игрока при любом пороге, только
+# для ленты касаний на видео; в JSONL не пишется (снимается в finalize).
+TOUCH_KEY = "_touch_p"
+ACTION_FIELDS = ("action", "action_score", TOUCH_KEY)
 ACTION_THRESHOLD = 0.5
-ACTION_COLOUR = (0, 255, 255)
+# Цвета действий -- как у ``vb-action/infer_tape_vb6_v50.py`` (draw_actions);
+# касание модели касаний -- красное, неизвестное имя -- белое.
+ACTION_COLOURS = {
+    "Touch": (0, 0, 255),
+    "Serve": (255, 255, 0),
+    "Receive": (80, 220, 80),
+    "Set": (255, 160, 40),
+    "Attack": (60, 60, 255),
+}
 
 
 def _box_iou(left: list[float], right: list[float]) -> float:
@@ -302,6 +314,7 @@ def decode_batch(
                     if action_probabilities is not None:
                         row = action_probabilities[batch_index, frame_slot, query_index]
                         best = int(row[:-1].argmax())
+                        record[TOUCH_KEY] = float(row[best])
                         if float(row[best]) >= action_threshold:
                             record["action"] = action_names[best]
                             record["action_score"] = round(float(row[best]), 3)
@@ -768,6 +781,7 @@ def _draw_predictions(
     frame_index: int,
     fps: float,
     predictions: list[dict],
+    touch: "TouchOverlay | None" = None,
 ) -> np.ndarray:
     canvas = frame.copy()
     players = balls = 0
@@ -779,18 +793,6 @@ def _draw_predictions(
         if class_name == "player":
             color = (0, 180, 255)
             players += 1
-            if item.get("action"):
-                cv2.rectangle(canvas, (x1, y1), (x2, y2), ACTION_COLOUR, 5)
-                cv2.putText(
-                    canvas,
-                    f"{item['action']} {float(item['action_score']):.2f}",
-                    (x1, y2 + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    ACTION_COLOUR,
-                    2,
-                    cv2.LINE_AA,
-                )
         else:
             color = (255, 0, 255)
             balls += int(class_name == "ball")
@@ -823,7 +825,158 @@ def _draw_predictions(
         cv2.LINE_AA,
     )
     _draw_heads(canvas, predictions)
+    _draw_actions(canvas, predictions)
+    if touch is not None:
+        touch.draw(canvas, frame_index, predictions)
     return canvas
+
+
+def find_touch_events(
+    curve: np.ndarray, threshold: float, smooth: int, min_gap: int
+) -> list[tuple[int, float]]:
+    """Пики сглаженной вероятности касания: ``find_events`` из vb-action.
+
+    ``curve[i]`` -- самая сильная вероятность касания среди игроков кадра.
+    Сглаживание окном ``smooth`` кадров, жадный выбор от сильного пика к
+    слабому, два события не ближе ``min_gap`` кадров. Возвращает
+    ``[(кадр, сглаженная вероятность)]`` по возрастанию кадра.
+    """
+    if not len(curve):
+        return []
+    kernel = np.ones(max(smooth, 1), np.float32) / max(smooth, 1)
+    peak = np.convolve(curve.astype(np.float32), kernel, mode="same")
+    events: list[tuple[int, float]] = []
+    for index in np.argsort(-peak, kind="stable"):
+        if peak[index] < threshold:
+            break
+        if any(abs(int(index) - frame) < min_gap for frame, _ in events):
+            continue
+        events.append((int(index), float(peak[index])))
+    return sorted(events)
+
+
+class TouchOverlay:
+    """Лента касаний внизу кадра и исполнитель события, как в vb-action ``infer_touch.py``.
+
+    * лента -- вероятность касания по времени +-``strip_seconds``, серая линия
+      -- порог, красные риски -- события (пики), белая черта -- текущий кадр;
+    * исполнитель события +-``hold`` кадров -- красная рамка ``TOUCH #n``,
+      на самом кадре события весь кадр обведён красным.
+    """
+
+    COLOUR = (40, 40, 255)
+    CURVE = (255, 160, 40)
+
+    def __init__(
+        self,
+        curve: np.ndarray,
+        events: list[tuple[int, float]],
+        boxes: dict[int, list[float]],
+        fps: float,
+        threshold: float,
+        strip_seconds: float,
+        hold: int,
+    ) -> None:
+        self.curve = curve
+        self.events = events
+        self.boxes = boxes
+        self.fps = fps
+        self.threshold = threshold
+        self.half = max(int(strip_seconds * fps), 1)
+        self.hold = hold
+        self.event_frames = [frame for frame, _ in events]
+
+    def draw(self, canvas: np.ndarray, index: int, predictions: list[dict]) -> None:
+        height, width = canvas.shape[:2]
+        number = bisect.bisect_right(self.event_frames, index)
+        # Исполнитель ближайшего события: рамка кадра, больше всех совпавшая с рамкой события.
+        players = [item for item in predictions if item["class_name"] == "player"]
+        for position in range(max(number - 2, 0), min(number + 2, len(self.events))):
+            frame, score = self.events[position]
+            box = self.boxes.get(frame)
+            if abs(frame - index) > self.hold or box is None or not players:
+                continue
+            overlap = [_box_iou(item["bbox_xyxy"], box) for item in players]
+            best = int(np.argmax(overlap))
+            if overlap[best] < 0.3:
+                continue
+            x1, y1, x2, y2 = [int(round(v)) for v in players[best]["bbox_xyxy"]]
+            thick = max(int(round(height / 200)), 4)
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), self.COLOUR, thick)
+            _outlined(canvas, f"TOUCH #{position + 1} {score:.2f}", (x1, max(y1 - 10, 60)),
+                      height / 1000, self.COLOUR)
+            if frame == index:
+                cv2.rectangle(canvas, (0, 0), (width - 1, height - 1), self.COLOUR, thick * 3)
+        self._strip(canvas, index)
+        _outlined(canvas, f"touches {number}", (10, 80), height / 1300, (255, 255, 255))
+
+    def _strip(self, canvas: np.ndarray, index: int) -> None:
+        height, width = canvas.shape[:2]
+        strip_h = max(int(height * 0.1), 50)
+        top = height - strip_h
+        region = canvas[top:]
+        region[:] = (region.astype(np.float32) * 0.45).astype(np.uint8)
+        first, last = index - self.half, index + self.half
+
+        def x_of(i: int) -> int:
+            return int((i - first) / max(last - first, 1) * (width - 1))
+
+        def y_of(p: float) -> int:
+            return int(height - 6 - p * (strip_h - 14))
+
+        line = max(int(round(height / 500)), 1)
+        cv2.line(canvas, (0, y_of(self.threshold)), (width, y_of(self.threshold)), (110, 110, 110), line)
+        lo, hi = max(first, 0), min(last, len(self.curve) - 1)
+        if hi > lo:
+            xs = ((np.arange(lo, hi + 1) - first) / max(last - first, 1) * (width - 1)).astype(np.int32)
+            ys = (height - 6 - self.curve[lo:hi + 1] * (strip_h - 14)).astype(np.int32)
+            cv2.polylines(canvas, [np.stack([xs, ys], 1)], False, self.CURVE, line + 1, cv2.LINE_AA)
+        start = bisect.bisect_left(self.event_frames, first)
+        stop = bisect.bisect_right(self.event_frames, last)
+        for frame in self.event_frames[start:stop]:
+            cv2.line(canvas, (x_of(frame), top + 4), (x_of(frame), height - 4), self.COLOUR, line + 1)
+        cv2.line(canvas, (x_of(index), top), (x_of(index), height), (255, 255, 255), line)
+        _outlined(canvas, "touch p", (8, top + 22), height / 2000, self.CURVE)
+
+
+def _outlined(canvas: np.ndarray, text: str, origin: tuple[int, int], scale: float,
+              colour: tuple[int, int, int]) -> None:
+    scale = max(scale, 0.5)
+    thickness = max(int(round(scale * 2)), 1)
+    cv2.putText(canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+    cv2.putText(canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, colour, thickness, cv2.LINE_AA)
+
+
+def _draw_actions(canvas: np.ndarray, predictions: list[dict]) -> None:
+    """Игрок с действием -- поверх обычных рамок, как ``draw_actions`` vb-action.
+
+    Толстая рамка цвета действия, под ней плашка «Touch 0.93», а справа в
+    шапке -- список действий кадра.
+    """
+    acting = [
+        item for item in predictions
+        if item["class_name"] == "player" and item.get("action")
+    ]
+    for item in acting:
+        x1, y1, x2, y2 = [int(round(value)) for value in item["bbox_xyxy"]]
+        colour = ACTION_COLOURS.get(item["action"], (255, 255, 255))
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), colour, 4)
+        label = f"{item['action']} {float(item['action_score']):.2f}"
+        (width, height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.rectangle(canvas, (x1, y2), (x1 + width + 8, y2 + height + 10), colour, -1)
+        cv2.putText(
+            canvas, label, (x1 + 4, y2 + height + 4), cv2.FONT_HERSHEY_SIMPLEX,
+            0.7, (0, 0, 0), 2, cv2.LINE_AA,
+        )
+    if acting:
+        summary = "  ".join(
+            f"{item['action']} {float(item['action_score']):.2f}" for item in acting
+        )
+        (width, _), _ = cv2.getTextSize(summary, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+        cv2.putText(
+            canvas, summary, (max(canvas.shape[1] - width - 12, 10), 24),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 255, 255), 2, cv2.LINE_AA,
+        )
 
 
 def _draw_heads(canvas: np.ndarray, predictions: list[dict]) -> None:
@@ -958,6 +1111,22 @@ def parse_args(
             "головы действия ни на что не влияет. На проверке касаний портала "
             "сравнивали при 0.7"
         ),
+    )
+    parser.add_argument(
+        "--strip-seconds", type=float, default=4.0,
+        help="лента касаний на видео: секунд в каждую сторону от кадра",
+    )
+    parser.add_argument(
+        "--touch-smooth", type=int, default=5,
+        help="событие касания -- пик сглаженной этим окном (кадров) вероятности",
+    )
+    parser.add_argument(
+        "--touch-min-gap", type=int, default=10,
+        help="два события касания не ближе стольких кадров",
+    )
+    parser.add_argument(
+        "--touch-hold", type=int, default=6,
+        help="столько кадров вокруг события исполнитель обведён TOUCH",
     )
     parser.add_argument("--nms-iou", type=float, default=0.5)
     parser.add_argument("--close-threshold", type=float, default=0.20)
@@ -1124,6 +1293,9 @@ def main(
     # Only drawing needs the predictions of past frames; a JSONL run keeps nothing else.
     keep_frames = args.show or output_video_path is not None
     predictions_by_frame: dict[int, list[dict]] = defaultdict(list)
+    # Касание для ленты на видео: (лучшая вероятность кадра, рамка этого игрока).
+    has_action = getattr(model, "action_names", None) is not None
+    touch_by_frame: dict[int, tuple[float, list[float] | None]] = {}
     predictions: list[dict] = []
     written_predictions = 0
     hysteresis = (
@@ -1280,8 +1452,10 @@ def main(
                     or float(item["score"]) >= args.score_threshold
                 ]
             frame_items: list[dict] = []
+            best_touch: tuple[float, list[float]] | None = None
             for filtered_item in filtered:
                 item = dict(filtered_item)
+                touch_p = item.pop(TOUCH_KEY, None)
                 x1, y1, x2, y2 = item.pop("bbox_xyxy_norm")
                 item["frame_index"] = current_frame
                 item["time_sec"] = round(current_frame / fps, 4)
@@ -1291,7 +1465,11 @@ def main(
                     round(x2 * width, 2),
                     round(y2 * height, 2),
                 ]
+                if touch_p is not None and (best_touch is None or touch_p > best_touch[0]):
+                    best_touch = (touch_p, item["bbox_xyxy"])
                 frame_items.append(item)
+            if keep_frames and has_action:
+                touch_by_frame[current_frame] = best_touch or (0.0, None)
             written_predictions += len(frame_items)
             if output_handle is not None:
                 output_handle.write(dump_line(frame_record(current_frame, frame_items)).encode("utf-8"))
@@ -1415,6 +1593,36 @@ def main(
         _sync(output_handle)
         output_handle.close()
 
+    touch_overlay = None
+    if output_video_path is not None and has_action:
+        # Кадр, которого сеть не видела (--frame-step), несёт значение предыдущего.
+        curve = np.zeros(total, np.float32)
+        last_value = 0.0
+        for index in range(total):
+            if index in touch_by_frame:
+                last_value = touch_by_frame[index][0]
+            curve[index] = last_value
+        touch_events = find_touch_events(
+            curve, args.action_threshold, args.touch_smooth, args.touch_min_gap
+        )
+        touch_overlay = TouchOverlay(
+            curve,
+            touch_events,
+            {frame: touch_by_frame.get(frame, (0.0, None))[1] for frame, _ in touch_events},
+            fps,
+            args.action_threshold,
+            args.strip_seconds,
+            args.touch_hold,
+        )
+        print(
+            json.dumps(
+                {"touch_events": [
+                    {"frame": frame, "time_sec": round(frame / fps, 3), "score": round(score, 3)}
+                    for frame, score in touch_events
+                ]},
+                ensure_ascii=False,
+            )
+        )
     if output_video_path is not None:
         render_capture = cv2.VideoCapture(video_source)
         if not render_capture.isOpened():
@@ -1438,7 +1646,7 @@ def main(
                 if not ok:
                     break
                 rendered = _draw_predictions(
-                    bgr, render_index, fps, records_for(render_index)
+                    bgr, render_index, fps, records_for(render_index), touch_overlay
                 )
                 if writer is not None:
                     writer.write(rendered)
