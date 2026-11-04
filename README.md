@@ -228,6 +228,13 @@ same cores with video decode - roughly 10% off for `VballNetGridV3` on this mach
 Earlier checkpoints and their OpenVINO IR counterparts live in `old_models/onnx/` and
 `old_models/ov/`; they are kept for reference and are not benchmarked here.
 
+## License
+
+This project is licensed under the [MIT License](LICENSE), copyright (c) 2025
+Alexander Sigatchov. The same MIT License also applies to the ONNX model weights
+in `models/` (`*.onnx`) and the OpenVINO IR models and weights in `ov/`
+(`*.xml` and `*.bin`) distributed with this project.
+
 ## Notes
 - `onnxruntime` can run on CPU if CUDA provider is unavailable.
 - All scripts support `--help` and can be launched through `uv run`.
