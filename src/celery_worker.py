@@ -15,13 +15,13 @@ try:
     from .hot_tracks import HotTracks
     from .jersey_numbers import NumberReader
     from .player_reid import VECTORS_FILE, ReidEncoder, assign_players
-    from .make_reels import crop_and_save_track_payload, crop_and_save_track_payloads
+    from .make_reels import crop_and_save_track_payload, crop_and_save_track_payloads, parse_set_trail
     from .predictions_io import JSONL_NAME, find_predictions, iter_frames, pack, read_meta
 except ImportError:
     from hot_tracks import HotTracks
     from jersey_numbers import NumberReader
     from player_reid import VECTORS_FILE, ReidEncoder, assign_players
-    from make_reels import crop_and_save_track_payload, crop_and_save_track_payloads
+    from make_reels import crop_and_save_track_payload, crop_and_save_track_payloads, parse_set_trail
     from predictions_io import JSONL_NAME, find_predictions, iter_frames, pack, read_meta
 
 logger = logging.getLogger(__name__)
@@ -716,9 +716,9 @@ def make_reels_task(
             # "full": the whole frame with the ball arcs of the sets, else the vertical crop.
             full_frame = item.get("format") == "full"
             set_trails = [
-                (int(trail[0]), int(trail[1]))
-                for trail in item.get("set_trails") or []
-                if isinstance(trail, (list, tuple)) and len(trail) == 2
+                spec
+                for spec in (parse_set_trail(trail) for trail in item.get("set_trails") or [])
+                if spec is not None
             ] if full_frame else None
 
             file_name = f"{reel_id}.mp4"

@@ -205,21 +205,45 @@ def test_set_trails_keep_the_sets_inside_the_pieces_in_video_pixels() -> None:
 
     trails = make_reels.set_trail_points([track], [(10, 12), (40, 50)], (1920, 1080))
 
-    # The set at frame 40 is outside the piece 10..12: not in the pool.
-    assert trails == [(10, [(10, 480.0, 270.0), (12, 960.0, 540.0)])]
+    # The set at frame 40 is outside the piece 10..12: not in the pool. Without the player's box
+    # there is no spot of the heatmap.
+    assert [(t.frame, t.points, t.kind, t.spot) for t in trails] == [
+        (10, [(10, 480.0, 270.0), (12, 960.0, 540.0)], "set", None)
+    ]
+
+
+def test_set_trails_scale_the_setter_box_and_the_ball_of_the_api_to_the_video() -> None:
+    track = load_track_from_payload(proxy_track_payload())
+    spec = make_reels.parse_set_trail(
+        {"start": 10, "end": 12, "kind": "receive", "box": [0.5, 0.25, 0.75, 1.0], "ball": [0.1, 0.2]}
+    )
+
+    (trail,) = make_reels.set_trail_points([track], [spec], (1920, 1080))
+
+    assert trail.kind == "receive"
+    assert trail.box == (960.0, 270.0, 1440.0, 1080.0)
+    # The spot of the heatmap: under the feet, the bottom middle of the box.
+    assert trail.spot == (1200.0, 1080.0)
+    # The older payload: a pair of frames.
+    assert make_reels.parse_set_trail([3, 4]) == make_reels.SetTrailSpec(3, 4, "set")
+    assert make_reels.parse_set_trail({"end": 4}) is None
 
 
 def test_set_trails_draw_only_up_to_the_frame_and_keep_the_last_ten() -> None:
     points = [(frame, 10.0 + frame, 20.0) for frame in range(0, 5)]
     frame = np.zeros((100, 100, 3), dtype=np.uint8)
-    make_reels.draw_set_trails(frame, [(0, points)], 0)
-    # One point up to frame 0: no line yet.
+    trail = make_reels.SetTrail(0, points)
+    make_reels.draw_set_trails(frame, [trail], 0)
+    # One point up to frame 0: no line yet, the heatmap is off without a ball.
     assert not frame.any()
 
-    make_reels.draw_set_trails(frame, [(0, points)], 4)
+    make_reels.draw_set_trails(frame, [trail], 4)
     assert frame[20, 10:15].any()
 
-    trails = [(index, [(index, 50.0, 50.0), (index + 1, 60.0, 50.0)]) for index in range(12)]
+    trails = [
+        make_reels.SetTrail(index, [(index, 50.0, 50.0), (index + 1, 60.0, 50.0)], "receive" if index == 11 else "set")
+        for index in range(12)
+    ]
     drawn: list = []
     original = make_reels.cv2.polylines
     make_reels.cv2.polylines = lambda img, lines, *args, **kwargs: drawn.append(args[1]) or img
@@ -227,6 +251,25 @@ def test_set_trails_draw_only_up_to_the_frame_and_keep_the_last_ten() -> None:
         make_reels.draw_set_trails(np.zeros((100, 100, 3), dtype=np.uint8), trails, 20)
     finally:
         make_reels.cv2.polylines = original
-    # Ten arcs: the nine old ones and the two layers of the newest.
+    # Ten arcs: the nine old ones and the two layers of the newest, an underhand set in orange.
     assert len(drawn) == 11
-    assert drawn[-1] == make_reels.SET_TRAIL_NEWEST_COLOR
+    assert drawn[0] == make_reels.SET_TRAIL_COLORS["set"]
+    assert drawn[-1] == make_reels.SET_TRAIL_COLORS["receive"]
+
+
+def test_set_trails_pile_up_the_heat_under_the_feet() -> None:
+    trails = [
+        make_reels.SetTrail(0, [], "set", (40.0, 20.0, 60.0, 60.0), (50.0, 60.0)),
+        make_reels.SetTrail(5, [], "set", (40.0, 20.0, 60.0, 60.0), (50.0, 60.0)),
+    ]
+    one = make_reels.draw_set_trails(np.zeros((100, 100, 3), dtype=np.uint8), trails, 0, {})
+    # Blue under the feet, nothing at the head.
+    blue, green, red = one[60, 50]
+    assert blue > red and blue > 0
+    assert not one[20, 50].any()
+
+    cache: dict = {}
+    two = make_reels.draw_set_trails(np.zeros((100, 100, 3), dtype=np.uint8), trails, 5, cache)
+    # Two touches at the same spot: a denser blue.
+    assert two[60, 50, 0] > one[60, 50, 0]
+    assert cache["count"] == 2

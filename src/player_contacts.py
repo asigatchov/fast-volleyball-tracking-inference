@@ -39,6 +39,17 @@ DEFAULT_BALL_SCORE_THRESHOLD = 0.35
 MIN_PLAYER_BOX_HEIGHT_PX = 14.0
 MIN_PLAYER_BOX_WIDTH_PX = 6.0
 
+# Actor scores: a detector may write, per player box, the probability that this
+# player makes the action at that frame (TTNet-VB actor head: row extra
+# {"actor": p}). When the predictions carry them, the touch goes to the player
+# with the highest score around the contact instead of the closest box by the
+# ball size geometry, and the rally state machine gets no runners-up to swap
+# the side. Below ACTOR_MIN_SCORE the geometry decides as before.
+ACTOR_MIN_SCORE = float(os.environ.get("VB_ACTOR_MIN_SCORE", "0.3"))
+ACTOR_WINDOW_FRAMES = int(os.environ.get("VB_ACTOR_WINDOW_FRAMES", "4"))
+ACTOR_MAX_REACH_RATIO = float(os.environ.get("VB_ACTOR_MAX_REACH_RATIO", "2.5"))
+ACTOR_DISABLED = os.environ.get("VB_ACTOR_DISABLE", "").lower() in ("1", "true", "yes")
+
 # Court-space tolerance for keeping a detection as an on-court participant.
 ON_COURT_LENGTH_MARGIN_M = 3.5
 ON_COURT_WIDTH_MARGIN_M = 1.5
@@ -182,6 +193,7 @@ class PlayerBox:
     y1: float
     x2: float
     y2: float
+    actor: Optional[float] = None
 
     @property
     def width(self) -> float:
@@ -238,9 +250,10 @@ class Contact:
     ball_player_radius_ratio: Optional[float] = None
     inferred_player_height_cm: Optional[float] = None
     size_mismatch: float = 0.0
+    actor_score: Optional[float] = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "frame": int(self.frame),
             "player_track_id": int(self.player_track_id),
             "contact_type": self.contact_type,
@@ -277,6 +290,9 @@ class Contact:
             ),
             "size_mismatch": round(float(self.size_mismatch), 4),
         }
+        if self.actor_score is not None:
+            result["actor_score"] = round(float(self.actor_score), 4)
+        return result
 
 
 @dataclass(frozen=True)
@@ -405,7 +421,10 @@ class RallyContactStateMachine:
             self.ball_side, self.ball_side_probability = self._estimate_ball_side(
                 choice.best.frame
             )
-            selected, reason = self._select(options, contact_type)
+            if len(options) == 1 and options[0].actor_score is not None:
+                selected, reason = options[0], "actor_head"
+            else:
+                selected, reason = self._select(options, contact_type)
             self._advance(selected)
             resolved.append(selected)
             self.transitions.append(
@@ -606,6 +625,7 @@ class PlayerStore:
         self._loaded = False
         self._dropped_off_court = 0
         self._kept = 0
+        self._boxes_with_actor = 0
 
         if players_json_path:
             self._load(players_json_path, source_width, source_height)
@@ -635,7 +655,21 @@ class PlayerStore:
             "ball_score_threshold": self._ball_score_threshold,
             "source_size": list(self._source_size) if self._source_size else None,
             "source_fps": self._fps,
+            "boxes_with_actor_score": self._boxes_with_actor,
         }
+
+    @property
+    def has_actor_scores(self) -> bool:
+        return self._boxes_with_actor > 0 and not ACTOR_DISABLED
+
+    def actor_score(self, track_id: int, frame: int, window: int = ACTOR_WINDOW_FRAMES) -> Optional[float]:
+        """Max actor score of a track over ``frame +- window`` (None: no score there)."""
+        best: Optional[float] = None
+        for candidate in range(int(frame) - window, int(frame) + window + 1):
+            box = self._by_key.get((candidate, int(track_id)))
+            if box is not None and box.actor is not None and (best is None or box.actor > best):
+                best = box.actor
+        return best
 
     def ball_at(self, frame: int) -> Optional[BallSample]:
         return self._ball_by_frame.get(int(frame))
@@ -779,6 +813,8 @@ class PlayerStore:
             self._by_key[(box.frame, box.track_id)] = box
             self._court_position[(box.frame, box.track_id)] = (court_x, court_y)
             self._kept += 1
+            if box.actor is not None:
+                self._boxes_with_actor += 1
 
         self._by_frame = {
             frame: tuple(sorted(boxes, key=lambda item: -item.score))
@@ -930,6 +966,7 @@ class PlayerStore:
             y1=y1,
             x2=x2,
             y2=y2,
+            actor=self._as_float(item.get("actor")),
         )
 
     def _to_court_position(self, box: PlayerBox) -> Tuple[Optional[float], Optional[float]]:
@@ -1514,6 +1551,10 @@ class ContactDetector:
             return None
 
         radius = float(sample.radius_px or 0.0)
+        if self._store.has_actor_scores:
+            choice = self._attach_actor(sample, candidate, boxes, radius)
+            if choice is not None:
+                return choice
         scored: list[tuple[float, float, PlayerBox, float]] = []
         for box in boxes:
             reach_ratio, cost, depth = self._reach_metrics(box, sample.x, sample.y, radius)
@@ -1532,6 +1573,30 @@ class ContactDetector:
             if cost <= max(best_cost, 1e-6) * AMBIGUITY_COST_FACTOR
         ][:MAX_CONTACT_ALTERNATIVES]
         return ContactChoice(best=options[0], alternatives=tuple(options[1:]))
+
+    def _attach_actor(
+        self,
+        sample: BallSample,
+        candidate: dict[str, Any],
+        boxes: Sequence[PlayerBox],
+        radius: float,
+    ) -> Optional[ContactChoice]:
+        """The player the actor head scores highest around the contact, if confident enough."""
+        best: Optional[tuple[float, float, PlayerBox, float]] = None
+        for box in boxes:
+            score = self._store.actor_score(box.track_id, sample.frame)
+            if score is None or score < ACTOR_MIN_SCORE:
+                continue
+            reach_ratio, _, depth = self._reach_metrics(box, sample.x, sample.y, radius)
+            if reach_ratio > ACTOR_MAX_REACH_RATIO:
+                continue
+            if best is None or score > best[0]:
+                best = (score, reach_ratio, box, depth)
+        if best is None:
+            return None
+        score, reach_ratio, box, depth = best
+        contact = self._build_contact(sample, candidate, min(reach_ratio, MAX_REACH_RATIO), box, depth)
+        return ContactChoice(best=replace(contact, actor_score=float(score)), alternatives=())
 
     def _build_contact(
         self,

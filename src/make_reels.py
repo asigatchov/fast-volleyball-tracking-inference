@@ -7,7 +7,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -43,13 +43,63 @@ PLAYER_MARK_HOLD_FRAMES = 4
 PLAYER_MARK_MIN_OVERLAP = 0.3
 Box = Tuple[float, float, float, float]
 # The full-frame reel draws the ball arcs of the sets: the last SET_TRAIL_POOL started, the newest
-# yellow with a glow, the older ones grey and fainter with age (as the annotate page shows them).
+# with a glow, the older ones fainter with age (as the annotate page shows them). The color says
+# how the set was played: overhand ("set") yellow, underhand ("receive") orange.
 SET_TRAIL_POOL = 10
 SET_TRAIL_MAX_GAP_FRAMES = 10
 SET_TRAIL_NEWEST_COLOR = (21, 204, 250)
-SET_TRAIL_OLD_COLOR = (240, 232, 226)
-# A set: (its frame, the ball points (frame, x, y) up to the attack).
-SetTrail = Tuple[int, List[Tuple[int, float, float]]]
+SET_TRAIL_COLORS = {"set": SET_TRAIL_NEWEST_COLOR, "receive": (22, 115, 249)}
+# The feet of the player at every touch so far (where the ball was brought to), piled up into a
+# translucent blue heatmap.
+# A light blue: the hall walls behind the setter are often dark blue.
+SET_HEAT_COLOR = (255, 160, 60)
+SET_HEAT_MAX_ALPHA = 0.8
+# One set gives about half of the top opacity, three sets at a spot come close to it.
+SET_HEAT_GAIN = 0.7
+SET_HEAT_SIGMA = 1 / 32  # of the frame height
+SET_HEAT_SCALE = 4  # the map is built this many times smaller than the frame
+
+
+class SetTrail(NamedTuple):
+    """A touch: its frame, the ball points (frame, x, y) up to the next touch, how it was played,
+    the player's box and the spot of the heatmap, under the player's feet (video pixels)."""
+
+    frame: int
+    points: List[Tuple[int, float, float]]
+    kind: str = "set"
+    box: Optional[Box] = None
+    spot: Optional[Tuple[float, float]] = None
+
+
+class SetTrailSpec(NamedTuple):
+    """A set as the API sends it: frames, kind, and the box and ball relative to the frame (0..1)."""
+
+    start: int
+    end: int
+    kind: str = "set"
+    box: Optional[Box] = None
+    ball: Optional[Tuple[float, float]] = None
+
+
+def parse_set_trail(raw) -> Optional[SetTrailSpec]:
+    """``[start, end]`` (the older payload) or ``{"start", "end", "kind"?, "box"?, "ball"?}``."""
+    try:
+        if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            kind = raw[2] if len(raw) > 2 and isinstance(raw[2], str) else "set"
+            return SetTrailSpec(int(raw[0]), int(raw[1]), kind)
+        if isinstance(raw, dict):
+            box = raw.get("box")
+            ball = raw.get("ball")
+            return SetTrailSpec(
+                int(raw["start"]),
+                int(raw["end"]),
+                str(raw.get("kind") or "set"),
+                tuple(float(v) for v in box) if isinstance(box, (list, tuple)) and len(box) == 4 else None,
+                tuple(float(v) for v in ball) if isinstance(ball, (list, tuple)) and len(ball) == 2 else None,
+            )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return None
 
 
 try:
@@ -501,7 +551,7 @@ def draw_player_mark(frame: np.ndarray, box: Box, color: Tuple[int, int, int] = 
 
 def set_trail_points(
     tracks: List[Dict],
-    windows: List[Tuple[int, int]],
+    windows: Sequence[Union[Tuple[int, int], SetTrailSpec]],
     frame_size: Tuple[int, int],
 ) -> List[SetTrail]:
     """The ball points of each set window, in the pixels of the video.
@@ -509,29 +559,107 @@ def set_trail_points(
     The points come from the ball tracks of the reel's pieces; a set outside of every piece is
     left out, so the pool counts only the sets the reel shows.
     """
+    width, height = frame_size
     positions: Dict[int, Tuple[float, float]] = {}
     for track in tracks:
         for x, y, frame in scale_track_to_video(track, *frame_size)["positions"]:
             if x >= 0 and y >= 0:
                 positions[frame] = (x, y)
     frames = sorted(positions)
+    specs = [window if isinstance(window, SetTrailSpec) else SetTrailSpec(*window) for window in windows]
     trails: List[SetTrail] = []
-    for start, end in sorted(windows):
-        if not any(track["start_frame"] <= start <= track["last_frame"] for track in tracks):
+    for spec in sorted(specs, key=lambda item: (item.start, item.end)):
+        if not any(track["start_frame"] <= spec.start <= track["last_frame"] for track in tracks):
             continue
-        trails.append((start, [(f, *positions[f]) for f in frames if start <= f <= end]))
+        points = [(f, *positions[f]) for f in frames if spec.start <= f <= spec.end]
+        box = (
+            (spec.box[0] * width, spec.box[1] * height, spec.box[2] * width, spec.box[3] * height)
+            if spec.box
+            else None
+        )
+        spot = ((box[0] + box[2]) / 2, box[3]) if box else None
+        trails.append(SetTrail(spec.start, points, spec.kind, box, spot))
     return trails
 
 
-def draw_set_trails(frame: np.ndarray, trails: List[SetTrail], frame_idx: int) -> np.ndarray:
-    """The arcs of the last sets up to ``frame_idx``; the arc of a set in flight ends at it."""
-    started = [trail for trail in trails if trail[0] <= frame_idx][-SET_TRAIL_POOL:]
+def _blend(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, paint, alpha: float) -> None:
+    """``paint(roi, (x1, y1))`` drawn at ``alpha`` inside the box only: a full-frame blend is slow."""
+    x1, y1 = max(x1, 0), max(y1, 0)
+    x2, y2 = min(x2, frame.shape[1] - 1), min(y2, frame.shape[0] - 1)
+    if x2 <= x1 or y2 <= y1:
+        return
+    roi = frame[y1:y2 + 1, x1:x2 + 1]
+    if alpha >= 1.0:
+        paint(roi, (x1, y1))
+        return
+    overlay = roi.copy()
+    paint(overlay, (x1, y1))
+    cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0, dst=roi)
+
+
+def set_heat_alpha(balls: List[Tuple[float, float]], frame_shape: Tuple[int, int]) -> Optional[np.ndarray]:
+    """The opacity (0..SET_HEAT_MAX_ALPHA, frame size) of the heatmap: a gaussian per touch
+    summed up, so the spots the player played from often are the denser blue."""
+    if not balls:
+        return None
+    height, width = frame_shape
+    small = (max(1, height // SET_HEAT_SCALE), max(1, width // SET_HEAT_SCALE))
+    density = np.zeros(small, dtype=np.float32)
+    for x, y in balls:
+        cx, cy = int(round(x / SET_HEAT_SCALE)), int(round(y / SET_HEAT_SCALE))
+        if 0 <= cx < small[1] and 0 <= cy < small[0]:
+            density[cy, cx] += 1.0
+    sigma = max(1.0, height * SET_HEAT_SIGMA / SET_HEAT_SCALE)
+    density = cv2.GaussianBlur(density, (0, 0), sigma) * (2 * math.pi * sigma * sigma)
+    alpha = SET_HEAT_MAX_ALPHA * (1.0 - np.exp(-SET_HEAT_GAIN * density))
+    return cv2.resize(alpha, (width, height), interpolation=cv2.INTER_LINEAR)
+
+
+def draw_set_heat(frame: np.ndarray, alpha: Optional[np.ndarray]) -> np.ndarray:
+    if alpha is None:
+        return frame
+    ys, xs = np.nonzero(alpha > 0.01)
+    if not len(xs):
+        return frame
+    y1, y2, x1, x2 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    roi = frame[y1:y2, x1:x2].astype(np.float32)
+    a = alpha[y1:y2, x1:x2, None]
+    frame[y1:y2, x1:x2] = (roi * (1.0 - a) + np.array(SET_HEAT_COLOR, dtype=np.float32) * a).astype(np.uint8)
+    return frame
+
+
+def draw_set_trails(
+    frame: np.ndarray,
+    trails: List[SetTrail],
+    frame_idx: int,
+    heat_cache: Optional[Dict] = None,
+) -> np.ndarray:
+    """The arcs of the last sets up to ``frame_idx``; the arc of a set in flight ends at it.
+
+    Under the arcs: the heatmap of the player's feet at all the touches so far. ``heat_cache``
+    keeps it between frames (it changes at a new touch only).
+    """
+    started_all = [trail for trail in trails if trail.frame <= frame_idx]
+    balls = [trail.spot for trail in started_all if trail.spot is not None]
+    if heat_cache is not None:
+        if heat_cache.get("count") != len(balls) or heat_cache.get("shape") != frame.shape[:2]:
+            heat_cache.update(count=len(balls), shape=frame.shape[:2], alpha=set_heat_alpha(balls, frame.shape[:2]))
+        draw_set_heat(frame, heat_cache["alpha"])
+    else:
+        draw_set_heat(frame, set_heat_alpha(balls, frame.shape[:2]))
+
+    started = started_all[-SET_TRAIL_POOL:]
     height = frame.shape[0]
-    for index, (_, points) in enumerate(started):
+    for index, trail in enumerate(started):
+        age = len(started) - 1 - index
+        newest = age == 0
+        color = SET_TRAIL_COLORS.get(trail.kind, SET_TRAIL_NEWEST_COLOR)
+        old_alpha = max(0.2, 0.7 - age * 0.06)
+
         # A gap in the track breaks the line.
         lines: List[List[Tuple[int, int]]] = []
         last_frame: Optional[int] = None
-        for f, x, y in points:
+        for f, x, y in trail.points:
             if f > frame_idx:
                 break
             if last_frame is None or f - last_frame > SET_TRAIL_MAX_GAP_FRAMES:
@@ -541,30 +669,18 @@ def draw_set_trails(frame: np.ndarray, trails: List[SetTrail], frame_idx: int) -
         polylines = [np.array(line, dtype=np.int32) for line in lines if len(line) > 1]
         if not polylines:
             continue
-        age = len(started) - 1 - index
-        newest = age == 0
         width = max(2, int(round(height / (220 if newest else 360))))
-        layers = (
-            [(SET_TRAIL_NEWEST_COLOR, width * 3, 0.35), (SET_TRAIL_NEWEST_COLOR, width, 1.0)]
-            if newest
-            else [(SET_TRAIL_OLD_COLOR, width, max(0.2, 0.7 - age * 0.06))]
-        )
-        # Blend inside the bounding box of the arc only: a full-frame blend per arc is slow.
+        layers = [(color, width * 3, 0.35), (color, width, 1.0)] if newest else [(color, width, old_alpha)]
         all_points = np.concatenate(polylines)
         pad = width * 3 + 2
-        x1, y1 = np.maximum(all_points.min(axis=0) - pad, 0)
-        x2, y2 = np.minimum(all_points.max(axis=0) + pad, (frame.shape[1] - 1, height - 1))
-        if x2 <= x1 or y2 <= y1:
-            continue
-        roi = frame[y1:y2 + 1, x1:x2 + 1]
-        shifted = [line - (x1, y1) for line in polylines]
-        for color, thickness, alpha in layers:
-            if alpha >= 1.0:
-                cv2.polylines(roi, shifted, False, color, thickness, cv2.LINE_AA)
-                continue
-            overlay = roi.copy()
-            cv2.polylines(overlay, shifted, False, color, thickness, cv2.LINE_AA)
-            cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0, dst=roi)
+        x1, y1 = all_points.min(axis=0) - pad
+        x2, y2 = all_points.max(axis=0) + pad
+        for layer_color, thickness, alpha in layers:
+
+            def paint(roi: np.ndarray, origin: Tuple[int, int], c=layer_color, t=thickness) -> None:
+                cv2.polylines(roi, [line - origin for line in polylines], False, c, t, cv2.LINE_AA)
+
+            _blend(frame, int(x1), int(y1), int(x2), int(y2), paint, alpha)
     return frame
 
 
@@ -585,12 +701,12 @@ def crop_and_save_track(
     highlights: Optional[List[Dict]] = None,
     predictions_path: Optional[str] = None,
     full_frame: bool = False,
-    set_trails: Optional[List[Tuple[int, int]]] = None,
+    set_trails: Optional[List[SetTrailSpec]] = None,
     trail_tracks: Optional[List[Dict]] = None,
 ) -> None:
     """``full_frame``: the whole frame instead of the vertical crop that follows the ball.
 
-    ``set_trails`` are the (set frame, attack frame) windows whose ball arcs are drawn, with the
+    ``set_trails`` are the sets (frames, kind, setter box, ball) whose ball arcs are drawn, with the
     points from ``trail_tracks`` (the tracks of all pieces of the reel, so the pool of arcs goes
     on from one piece to the next) or from ``track``.
     """
@@ -612,6 +728,7 @@ def crop_and_save_track(
     trails = (
         set_trail_points(trail_tracks or [track], set_trails, (frame_width, frame_height)) if set_trails else []
     )
+    heat_cache: Dict = {}
     track = scale_track_to_video(track, frame_width, frame_height)
     crop_width = frame_width if full_frame else min(int(frame_height * DEFAULT_CROP_ASPECT_RATIO), frame_width)
     crop_height = frame_height
@@ -661,7 +778,7 @@ def crop_and_save_track(
         if frame_idx in player_marks:
             draw_player_mark(frame, player_marks[frame_idx])
         if trails:
-            draw_set_trails(frame, trails, frame_idx)
+            draw_set_trails(frame, trails, frame_idx, heat_cache)
 
         center_x = int(x_smooth[i])
         if margin:
@@ -716,7 +833,7 @@ def crop_and_save_track_payload(
     fade_duration: float = BLACK_TRANSITION_SECONDS,
     predictions_path: Optional[str] = None,
     full_frame: bool = False,
-    set_trails: Optional[List[Tuple[int, int]]] = None,
+    set_trails: Optional[List[SetTrailSpec]] = None,
     trail_tracks: Optional[List[Dict]] = None,
 ) -> None:
     track = load_track_from_payload(track_payload)
@@ -757,7 +874,7 @@ def crop_and_save_track_payloads(
     fade_duration: float = BLACK_TRANSITION_SECONDS,
     predictions_path: Optional[str] = None,
     full_frame: bool = False,
-    set_trails: Optional[List[Tuple[int, int]]] = None,
+    set_trails: Optional[List[SetTrailSpec]] = None,
 ) -> None:
     if not track_payloads:
         raise ValueError("track_payloads must not be empty")
